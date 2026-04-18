@@ -1,0 +1,42 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Python worker runtime artifacts
+python_services/**/__pycache__/
+python_services/**/*.py[cod]
+python_services/tts/generated/
+python_services/stt/recordings/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+.venv/
+node_modules/
+dist/
+src-tauri/target/
+__pycache__/
+*.pyc
+python_services/**/__pycache__/
+python_services/tts/generated/
+python_services/stt/recordings/
+.DS_Store
+Thumbs.db

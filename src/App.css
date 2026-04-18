@@ -1,0 +1,356 @@
+@import "tailwindcss";
+
+:root {
+    font-family: Inter, Arial, sans-serif;
+    color: #525252;
+    background: transparent;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+    margin: 0;
+    min-width: 100%;
+    min-height: 100%;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+}
+
+body {
+    margin: 0;
+    overflow: hidden;
+}
+
+button,
+input {
+    font: inherit;
+}
+
+.overlay-shell {
+    width: 100%;
+    height: 100%;
+    padding: 14px;
+    background: transparent;
+    padding: 0;
+    margin: 0;
+    background: transparent;
+}
+
+.assistant-overlay {
+    width: 100%;
+    height: 100%;
+    background:
+        radial-gradient(circle at top, rgba(104, 49, 255, 0.18), transparent 15%),
+        rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(18px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.overlay-topbar {
+    min-height: 68px;
+    padding: 16px 18px 12px 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    user-select: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    pointer-events: auto;
+}
+
+.overlay-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.overlay-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 999px;
+    background: #6b8cff;
+    box-shadow: 0 0 16px #6b8cff;
+}
+
+.overlay-kicker {
+    margin: 0 0 4px 0;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    color: #7e9bff;
+}
+
+.overlay-brand h1 {
+    margin: 0;
+    font-size: 28px;
+    line-height: 1;
+}
+
+.overlay-controls {
+    display: flex;
+    gap: 8px;
+}
+
+.overlay-control {
+    min-width: 52px;
+    height: 34px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.06);
+    color: #738fff;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: 160ms ease;
+}
+
+.overlay-control:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.overlay-control.danger:hover {
+    background: rgba(255, 80, 80, 0.2);
+}
+
+.assistant-subtitle {
+    margin: 0;
+    color: rgba(87, 121, 255, 0.74);
+    font-size: 14px;
+}
+
+.assistant-model-label {
+    margin: 8px 0 0 0;
+    font-size: 12px;
+    color: rgba(85, 115, 236, 0.52);
+}
+
+.assistant-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: #7bfda0;
+    font-size: 14px;
+}
+
+.assistant-status.passive {
+    color: #75fcf0;
+}
+
+.assistant-status.armed,
+.assistant-status.listening {
+    color: #7ae7ff;
+}
+
+.assistant-status.thinking {
+    color: #fdd463;
+}
+
+.assistant-status.speaking {
+    color: #68f1a8;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background: #4cff88;
+    box-shadow: 0 0 14px #4cff88;
+}
+
+.status-dot.thinking {
+    background: #ffd166;
+    box-shadow: 0 0 14px #ffd166;
+}
+
+.status-dot.passive {
+    background: #4dd8d0;
+    box-shadow: 0 0 14px #4dd8d0;
+}
+
+.status-dot.armed {
+    background: #60e6ff;
+    box-shadow:
+        0 0 14px #60e6ff,
+        0 0 26px rgba(96, 230, 255, 0.42);
+}
+
+.status-dot.listening {
+    background: #4cc9f0;
+    box-shadow: 0 0 14px #4cc9f0;
+}
+
+.status-dot.speaking {
+    background: #ff7bcb;
+    box-shadow: 0 0 14px #ff7bcb;
+}
+
+.chat-area {
+    flex: 1;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    overflow: auto;
+}
+
+.message {
+    max-width: 84%;
+    padding: 14px 16px;
+    border-radius: 18px;
+    line-height: 1.5;
+    font-size: 15px;
+}
+
+.message.assistant {
+    align-self: flex-start;
+    background: rgba(126, 155, 255, 0.14);
+    border: 1px solid rgba(126, 155, 255, 0.2);
+}
+
+.message.user {
+    align-self: flex-end;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.input-panel {
+    padding: 12px 18px 18px 18px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.voice-session-feedback {
+    margin: 0 0 9px 0;
+    color: rgba(55, 56, 58, 0.68);
+    font-size: 12px;
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.voice-session-feedback.ignored {
+    color: rgba(216, 163, 38, 0.86);
+}
+
+.voice-session-feedback.armed,
+.voice-session-feedback.responding {
+    color: rgba(47, 174, 199, 0.9);
+}
+
+.input-area {
+    padding: 0;
+    display: flex;
+    gap: 10px;
+}
+
+.chat-input {
+    flex: 1;
+    height: 50px;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.04);
+    /*color: #1a1a1a;*/
+    padding: 0 16px;
+    font-size: 15px;
+    outline: none;
+}
+
+.action-button,
+.voice-button,
+.voice-auto-button,
+.voice-live-button {
+    height: 50px;
+    border: none;
+    border-radius: 8px;
+    padding: 0 18px;
+    font-size: 15px;
+    cursor: pointer;
+    color: white;
+    background: linear-gradient(135deg, #5f7cff 0%, #7e61ff 100%);
+}
+
+.voice-button {
+    min-width: 50px;
+    padding: 0;
+}
+
+.voice-button.recording {
+    background: linear-gradient(135deg, #ff4d6d 0%, #ff8a5c 100%);
+}
+
+.voice-auto-button {
+    min-width: 52px;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(55, 56, 63, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.voice-auto-button.active,
+.voice-live-button.active {
+    background: rgba(76, 201, 240, 0.2);
+    color: #3d4547;
+    border-color: rgba(76, 201, 240, 0.42);
+}
+
+.voice-live-button {
+    min-width: 54px;
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(54, 55, 59, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.action-button:disabled,
+.voice-button:disabled,
+.voice-auto-button:disabled,
+.voice-live-button:disabled,
+.chat-input:disabled {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+
+.window-drag-strip {
+    height: 22px;
+    flex: 0 0 22px;
+    cursor: move;
+    background: transparent;
+}
+
+.compact-mode {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 18px;
+}
+
+.compact-avatar-orb {
+    width: 52px;
+    height: 52px;
+    border-radius: 999px;
+    background: radial-gradient(circle at 30% 30%, #8aa2ff, #5f7cff 60%, #2d3f8f);
+    box-shadow: 0 0 24px rgba(95, 124, 255, 0.55);
+    flex: 0 0 52px;
+}
+
+.compact-info p {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+}
+
+.compact-info span {
+    display: block;
+    margin-top: 4px;
+    font-size: 13px;
+    color: rgba(68, 68, 71, 0.65);
+}
+
+.orb-stage {
+    padding: 20px 18px 8px 18px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
