@@ -1,0 +1,17 @@
+{
+    "python": {
+        "executable": ".venv/Scripts/python.exe"
+    },
+    "tts": {
+        "repo_id": "hexgrad/Kokoro-82M",
+        "voice": "if_sara",
+        "speed": 0.96,
+        "engine": "chatterbox_multilingual",
+        "device": "auto",
+        "audio_prompt_path": "",
+        "language_id": "it",
+        "cfg_weight": 0.45,
+        "exaggeration": 0.55,
+        "timeout_secs": 240
+    }
+}

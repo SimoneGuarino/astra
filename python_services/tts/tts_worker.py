@@ -6,9 +6,12 @@ import os
 import re
 import sys
 import traceback
+import unicodedata
 import warnings
 from dataclasses import dataclass
-from typing import Any
+from functools import lru_cache
+from typing import Any, Literal
+from python_services.config_loader import get_config
 
 warnings.filterwarnings(
     "ignore",
@@ -22,32 +25,88 @@ warnings.filterwarnings(
 )
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-from kokoro import KPipeline
 import numpy as np
 import soundfile as sf
 
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
+
+from kokoro import KPipeline
+
 
 SAMPLE_RATE = 24000
-KOKORO_REPO_ID = os.environ.get("ASTRA_TTS_REPO_ID", "hexgrad/Kokoro-82M")
-DEFAULT_VOICE = os.environ.get("ASTRA_TTS_VOICE", "if_sara")
-DEFAULT_SPEED = float(os.environ.get("ASTRA_TTS_SPEED", "0.96"))
+KOKORO_REPO_ID = os.environ.get(
+    "ASTRA_TTS_REPO_ID",
+    get_config("tts.repo_id", "hexgrad/Kokoro-82M"),
+)
+
+DEFAULT_VOICE = os.environ.get(
+    "ASTRA_TTS_VOICE",
+    get_config("tts.voice", "if_sara"),
+)
+
+DEFAULT_SPEED = float(os.environ.get(
+    "ASTRA_TTS_SPEED",
+    str(get_config("tts.speed", 0.96)),
+))
+
+DEFAULT_ENGINE = os.environ.get(
+    "ASTRA_TTS_ENGINE",
+    get_config("tts.engine", "auto"),
+).strip().lower()
+
+DEFAULT_DEVICE = os.environ.get(
+    "ASTRA_TTS_DEVICE",
+    get_config("tts.device", "auto"),
+).strip().lower()
+
+DEFAULT_AUDIO_PROMPT_PATH = os.environ.get(
+    "ASTRA_TTS_AUDIO_PROMPT_PATH",
+    get_config("tts.audio_prompt_path", ""),
+).strip()
+
+DEFAULT_LANGUAGE_ID = os.environ.get(
+    "ASTRA_TTS_LANGUAGE_ID",
+    get_config("tts.language_id", "it"),
+).strip().lower() or "it"
+
+DEFAULT_CFG_WEIGHT = float(os.environ.get(
+    "ASTRA_TTS_CFG_WEIGHT",
+    str(get_config("tts.cfg_weight", 0.45)),
+))
+
+DEFAULT_EXAGGERATION = float(os.environ.get(
+    "ASTRA_TTS_EXAGGERATION",
+    str(get_config("tts.exaggeration", 0.55)),
+))
+
+DEFAULT_TIMEOUT_SECS = int(os.environ.get(
+    "ASTRA_TTS_TIMEOUT_SECS",
+    str(get_config("tts.timeout_secs", 240)),
+))
+
+EngineName = Literal["auto", "kokoro", "chatterbox_multilingual", "chatterbox_turbo"]
+PronunciationMode = Literal["plain", "kokoro"]
 
 
 @dataclass(frozen=True)
 class VoiceProfile:
     acknowledgement_pause_ms: int = 90
     short_reply_pause_ms: int = 110
-    sentence_pause_ms: int = 140
-    long_sentence_pause_ms: int = 185
-    comma_pause_ms: int = 95
-    semicolon_pause_ms: int = 165
-    colon_pause_ms: int = 185
-    question_pause_ms: int = 240
-    exclamation_pause_ms: int = 215
-    list_item_pause_ms: int = 210
-    short_ack_speed: float = 0.93
-    short_reply_speed: float = 0.95
-    long_explanation_speed: float = 0.98
+    sentence_pause_ms: int = 130
+    long_sentence_pause_ms: int = 175
+    comma_pause_ms: int = 85
+    semicolon_pause_ms: int = 150
+    colon_pause_ms: int = 170
+    question_pause_ms: int = 220
+    exclamation_pause_ms: int = 185
+    list_item_pause_ms: int = 190
+    short_ack_speed: float = 0.94
+    short_reply_speed: float = 0.955
+    short_question_speed: float = 0.95
+    long_explanation_speed: float = 0.97
 
 
 @dataclass(frozen=True)
@@ -55,6 +114,7 @@ class SynthesisResult:
     output_path: str
     normalized_text: str
     sample_rate: int
+    engine: str
 
 
 class ItalianNumberNormalizer:
@@ -120,6 +180,7 @@ class ItalianNumberNormalizer:
 
 
 class TextPreprocessor:
+    _apostrophe_chars = "’`´ʻʼʽˈ"
     _code_block_pattern = re.compile(r"```.*?```", re.DOTALL)
     _inline_code_pattern = re.compile(r"`([^`]{1,80})`")
     _url_pattern = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
@@ -135,11 +196,11 @@ class TextPreprocessor:
         "|": " oppure ",
     }
     _acknowledgement_pattern = re.compile(
-        r"^(certo|ok|okay|va bene|perfetto|capito|chiaro|bene|sì|si|assolutamente)[.!]?$",
+        r"^(certo|ok|okay|va bene|perfetto|capito|chiaro|bene|sì|si|assolutamente|dimmi|eccomi|ci sono|un attimo)[.!]?$",
         re.IGNORECASE,
     )
     _conversational_prefix_pattern = re.compile(
-        r"^(certo|ok|okay|va bene|perfetto|capito|chiaro|bene|sì|si),\s+",
+        r"^(certo|ok|okay|va bene|perfetto|capito|chiaro|bene|sì|si|dimmi|eccomi|allora),\s+",
         re.IGNORECASE,
     )
     _letter_names = {
@@ -170,7 +231,6 @@ class TextPreprocessor:
         "Y": "ipsilon",
         "Z": "zeta",
     }
-
     _technical_terms = {
         "LLM": "elle elle emme",
         "TTS": "ti ti esse",
@@ -185,12 +245,22 @@ class TextPreprocessor:
         "GPU": "gi pi u",
         "RAM": "ram",
     }
+    _kokoro_pronunciation_overrides = [
+        (re.compile(r"(?i)\bè\b"), "[è](/ˈɛ/)"),
+        (re.compile(r"(?i)\bcioè\b"), "[cioè](/tʃoˈɛ/)"),
+        (re.compile(r"(?i)\bperché\b"), "[perché](/perˈke/)"),
+        (re.compile(r"(?i)\bpoiché\b"), "[poiché](/poiˈke/)"),
+        (re.compile(r"(?i)\bné\b"), "[né](/ˈne/)"),
+        (re.compile(r"(?i)\baffinché\b"), "[affinché](/affinˈke/)"),
+        (re.compile(r"(?i)\bgiacché\b"), "[giacché](/dʒakˈke/)"),
+    ]
 
     def __init__(self, profile: VoiceProfile | None = None) -> None:
         self.profile = profile or VoiceProfile()
         self.number_normalizer = ItalianNumberNormalizer()
 
-    def normalize(self, text: str) -> str:
+    def normalize(self, text: str, pronunciation_mode: PronunciationMode = "plain") -> str:
+        text = self._normalize_unicode(text)
         text = text.strip()
         if not text:
             return ""
@@ -217,6 +287,8 @@ class TextPreprocessor:
         text = self.number_normalizer.normalize(text)
         text = self._normalize_punctuation(text)
         text = self._shape_conversational_prefixes(text)
+        if pronunciation_mode == "kokoro":
+            text = self._apply_kokoro_pronunciation_overrides(text)
         text = re.sub(r"\s+", " ", text).strip()
 
         if text and text[-1] not in ".!?;:":
@@ -226,7 +298,6 @@ class TextPreprocessor:
 
     def pause_ms(self, normalized_text: str) -> int:
         stripped = normalized_text.rstrip()
-
         if not stripped:
             return 80
         if self._acknowledgement_pattern.match(stripped):
@@ -253,27 +324,45 @@ class TextPreprocessor:
         stripped = normalized_text.strip()
         if self._acknowledgement_pattern.match(stripped):
             return min(requested_speed, self.profile.short_ack_speed)
+        if stripped.endswith("?") and len(stripped) <= 72:
+            return min(requested_speed, self.profile.short_question_speed)
         if self._is_short_reply(stripped):
             return min(requested_speed, self.profile.short_reply_speed)
         if len(stripped) > 220:
             return max(requested_speed, self.profile.long_explanation_speed)
         return requested_speed
 
+    def _normalize_unicode(self, text: str) -> str:
+        text = unicodedata.normalize("NFC", text)
+        text = text.replace("\xa0", " ")
+        for ch in self._apostrophe_chars:
+            text = text.replace(ch, "'")
+        text = text.replace("“", '"').replace("”", '"')
+        return text
+
+    def _apply_kokoro_pronunciation_overrides(self, text: str) -> str:
+        for pattern, replacement in self._kokoro_pronunciation_overrides:
+            text = pattern.sub(replacement, text)
+        return text
+
     def _normalize_punctuation(self, text: str) -> str:
         text = text.replace("\u2026", "...")
+        text = text.replace("—", ", ")
+        text = text.replace("–", ", ")
         text = re.sub(r"\.{4,}", "...", text)
+        text = text.replace("...", ". ")
         text = re.sub(r"([!?]){2,}", r"\1", text)
+        text = re.sub(r"\(([^)]+)\)", r", \1,", text)
+        text = re.sub(r"\[([^\]]+)\]", r", \1,", text)
         text = re.sub(r"\s+([,.;:!?])", r"\1", text)
         text = re.sub(r"([,.;:!?])([^\s,.;:!?])", r"\1 \2", text)
         text = re.sub(r"\s+-\s+", ", ", text)
         text = re.sub(r"\s*/\s*", " o ", text)
+        text = re.sub(r",\s*,+", ", ", text)
         return text
 
     def _shape_conversational_prefixes(self, text: str) -> str:
-        return self._conversational_prefix_pattern.sub(
-            lambda match: f"{match.group(1).capitalize()}, ",
-            text,
-        )
+        return self._conversational_prefix_pattern.sub(lambda match: f"{match.group(1).capitalize()}, ", text)
 
     def _is_short_reply(self, text: str) -> bool:
         return len(text) <= 70 and len(re.findall(r"\w+", text)) <= 9
@@ -287,26 +376,68 @@ class TextPreprocessor:
         value = value.strip()
         if not value:
             return " "
-
         if len(value) <= 24 and re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
             return f" {value.replace('_', ' ')} "
-
         return " frammento tecnico "
 
 
-class TtsEngine:
-    def __init__(self) -> None:
-        self.pipeline = KPipeline(lang_code="i", repo_id=KOKORO_REPO_ID)
-        self.preprocessor = TextPreprocessor()
+def select_device(device: str) -> str:
+    requested = (device or "auto").strip().lower()
 
-    def synthesize(
-        self,
-        text: str,
-        output_path: str,
-        voice: str = DEFAULT_VOICE,
-        speed: float = DEFAULT_SPEED,
-    ) -> SynthesisResult:
-        normalized_text = self.preprocessor.normalize(text)
+    if requested not in {"auto", "cpu", "cuda"}:
+        return "cpu"
+
+    if requested == "cpu":
+        return "cpu"
+
+    if requested == "cuda":
+        if torch is not None and torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+
+    # auto
+    if torch is not None and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+@lru_cache(maxsize=1)
+def import_chatterbox_modules() -> tuple[Any, Any]:
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+    return ChatterboxMultilingualTTS, ChatterboxTurboTTS
+
+
+class BaseEngine:
+    engine_name: str
+    pronunciation_mode: PronunciationMode
+
+    def synthesize(self, text: str, output_path: str, voice: str, speed: float) -> SynthesisResult:
+        raise NotImplementedError
+
+
+class KokoroEngine(BaseEngine):
+    engine_name = "kokoro"
+    pronunciation_mode: PronunciationMode = "kokoro"
+
+    def __init__(self, preprocessor: TextPreprocessor) -> None:
+        self.pipeline = KPipeline(lang_code="i", repo_id=KOKORO_REPO_ID)
+        self.preprocessor = preprocessor
+
+    def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        normalized_text = self.preprocessor.normalize(text, pronunciation_mode=self.pronunciation_mode)
+        if normalized_text is None:
+            raise RuntimeError("TTS preprocessing returned None")
+
+        if isinstance(normalized_text, list):
+            normalized_text = " ".join(str(part).strip() for part in normalized_text if str(part).strip())
+
+        if not isinstance(normalized_text, str):
+            normalized_text = str(normalized_text)
+
+        normalized_text = normalized_text.strip()
+
         if not normalized_text:
             raise RuntimeError("No speakable text after preprocessing")
 
@@ -314,8 +445,8 @@ class TtsEngine:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
+        effective_speed = self.preprocessor.speaking_speed(normalized_text, speed)
         try:
-            effective_speed = self.preprocessor.speaking_speed(normalized_text, speed)
             generator = self.pipeline(normalized_text, voice=voice, speed=effective_speed)
         except TypeError:
             generator = self.pipeline(normalized_text, voice=voice)
@@ -329,30 +460,280 @@ class TtsEngine:
             raise RuntimeError("No audio generated")
 
         full_audio = np.concatenate(audio_chunks)
-        full_audio = self._normalize_audio(full_audio)
-
+        full_audio = normalize_audio(full_audio)
         pause_samples = int(SAMPLE_RATE * self.preprocessor.pause_ms(normalized_text) / 1000)
         if pause_samples > 0:
             full_audio = np.concatenate([full_audio, np.zeros(pause_samples, dtype=np.float32)])
 
         sf.write(output_path, full_audio, SAMPLE_RATE, subtype="PCM_16")
-
         return SynthesisResult(
             output_path=output_path,
             normalized_text=normalized_text,
             sample_rate=SAMPLE_RATE,
+            engine=self.engine_name,
         )
 
-    def _normalize_audio(self, audio: np.ndarray) -> np.ndarray:
-        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        if peak > 0.98:
-            return audio / peak * 0.98
-        return audio
+
+class ChatterboxMultilingualEngine(BaseEngine):
+    engine_name = "chatterbox_multilingual"
+    pronunciation_mode: PronunciationMode = "plain"
+
+    def __init__(self, preprocessor: TextPreprocessor, device: str) -> None:
+        ChatterboxMultilingualTTS, _ = import_chatterbox_modules()
+        self.model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+        self.preprocessor = preprocessor
+        self.device = device
+        self.sample_rate = int(getattr(self.model, "sr", SAMPLE_RATE))
+
+    def split_for_chatterbox(text: str, max_chars: int = 110) -> list[str]:
+        if text is None:
+            return []
+
+        if not isinstance(text, str):
+            text = str(text)
+
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return []
+
+        clauses = re.split(r"(?<=[\.\!\?\;\:])\s+|(?<=,)\s+", text)
+        parts: list[str] = []
+        current = ""
+
+        for clause in clauses:
+            if clause is None:
+                continue
+
+            clause = str(clause).strip()
+            if not clause:
+                continue
+
+            if len(clause) <= max_chars and not current:
+                parts.append(clause)
+                continue
+
+            if len(current) + len(clause) + 1 <= max_chars:
+                current = f"{current} {clause}".strip()
+                continue
+
+            if current:
+                parts.append(current)
+                current = ""
+
+            if len(clause) <= max_chars:
+                current = clause
+                continue
+
+            words = clause.split()
+            chunk = ""
+            for word in words:
+                candidate = f"{chunk} {word}".strip()
+                if len(candidate) <= max_chars:
+                    chunk = candidate
+                else:
+                    if chunk:
+                        parts.append(chunk)
+                    chunk = word
+
+            if chunk:
+                current = chunk
+
+        if current:
+            parts.append(current)
+
+        return [str(p).strip() for p in parts if isinstance(p, str) and p.strip()]
+
+    def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        normalized_text = self.preprocessor.normalize(text, pronunciation_mode=self.pronunciation_mode)
+        if not normalized_text:
+            raise RuntimeError("No speakable text after preprocessing")
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        generate_kwargs: dict[str, Any] = {
+            "language_id": DEFAULT_LANGUAGE_ID,
+            "cfg_weight": DEFAULT_CFG_WEIGHT,
+            "exaggeration": DEFAULT_EXAGGERATION,
+        }
+        if DEFAULT_AUDIO_PROMPT_PATH:
+            generate_kwargs["audio_prompt_path"] = DEFAULT_AUDIO_PROMPT_PATH
+
+
+
+        parts = self.split_for_chatterbox(normalized_text, max_chars=110)
+        if not parts:
+            raise RuntimeError("No speakable text after chatterbox split")
+        
+        audio_chunks: list[np.ndarray] = []
+        
+        for idx, part in enumerate(parts):
+            if not isinstance(part, str):
+                part = str(part)
+        
+            part = part.strip()
+            if not part:
+                continue
+            
+            wav = self.model.generate(part, **generate_kwargs)
+            chunk = tensor_to_numpy(wav)
+            chunk = normalize_audio(chunk)
+        
+            if chunk.size == 0:
+                continue
+            
+            audio_chunks.append(chunk)
+        
+            pause_ms = self.preprocessor.pause_ms(part)
+            if idx < len(parts) - 1 and pause_ms > 0:
+                pause_samples = int(self.sample_rate * pause_ms / 1000)
+                if pause_samples > 0:
+                    audio_chunks.append(np.zeros(pause_samples, dtype=np.float32))
+        
+        if not audio_chunks:
+            raise RuntimeError("No audio generated by chatterbox")
+        
+        full_audio = np.concatenate(audio_chunks)
+        
+        
+
+        #wav = self.model.generate(normalized_text, **generate_kwargs)
+        wav = self.model.generate(parts, **generate_kwargs)
+        full_audio = tensor_to_numpy(wav)
+        full_audio = normalize_audio(full_audio)
+
+        pause_samples = int(self.sample_rate * self.preprocessor.pause_ms(normalized_text) / 1000)
+        if pause_samples > 0:
+            full_audio = np.concatenate([full_audio, np.zeros(pause_samples, dtype=np.float32)])
+
+        sf.write(output_path, full_audio, self.sample_rate, subtype="PCM_16")
+        return SynthesisResult(
+            output_path=output_path,
+            normalized_text=normalized_text,
+            sample_rate=self.sample_rate,
+            engine=self.engine_name,
+        )
+
+
+class ChatterboxTurboEngine(BaseEngine):
+    engine_name = "chatterbox_turbo"
+    pronunciation_mode: PronunciationMode = "plain"
+
+    def __init__(self, preprocessor: TextPreprocessor, device: str) -> None:
+        _, ChatterboxTurboTTS = import_chatterbox_modules()
+        self.model = ChatterboxTurboTTS.from_pretrained(device=device)
+        self.preprocessor = preprocessor
+        self.device = device
+        self.sample_rate = int(getattr(self.model, "sr", SAMPLE_RATE))
+
+    def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        if not DEFAULT_AUDIO_PROMPT_PATH:
+            raise RuntimeError(
+                "Chatterbox Turbo requires ASTRA_TTS_AUDIO_PROMPT_PATH pointing to a short reference clip"
+            )
+
+        normalized_text = self.preprocessor.normalize(text, pronunciation_mode=self.pronunciation_mode)
+        if not normalized_text:
+            raise RuntimeError("No speakable text after preprocessing")
+
+        output_dir = os.path.dirname(output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        wav = self.model.generate(normalized_text, audio_prompt_path=DEFAULT_AUDIO_PROMPT_PATH)
+        full_audio = tensor_to_numpy(wav)
+        full_audio = normalize_audio(full_audio)
+        pause_samples = int(self.sample_rate * self.preprocessor.pause_ms(normalized_text) / 1000)
+        if pause_samples > 0:
+            full_audio = np.concatenate([full_audio, np.zeros(pause_samples, dtype=np.float32)])
+
+        sf.write(output_path, full_audio, self.sample_rate, subtype="PCM_16")
+        return SynthesisResult(
+            output_path=output_path,
+            normalized_text=normalized_text,
+            sample_rate=self.sample_rate,
+            engine=self.engine_name,
+        )
+
+
+def tensor_to_numpy(value: Any) -> np.ndarray:
+    if torch is not None and isinstance(value, torch.Tensor):
+        value = value.detach().cpu().float().numpy()
+    array = np.asarray(value, dtype=np.float32)
+    return np.squeeze(array)
+
+
+def normalize_audio(audio: np.ndarray) -> np.ndarray:
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 0.98:
+        return audio / peak * 0.98
+    return audio
+
+
+
+class TtsEngine:
+    def __init__(self) -> None:
+        self.preprocessor = TextPreprocessor()
+        self.device = select_device(DEFAULT_DEVICE)
+        print(
+            f"TTS device selection requested={DEFAULT_DEVICE} resolved={self.device} "
+            f"torch_cuda_available={torch.cuda.is_available() if torch is not None else False}",
+            file=sys.stderr,
+            flush=True,
+        )
+        self.engine_name = resolve_engine_name(DEFAULT_ENGINE)
+        self.engine = self._build_engine(self.engine_name)
+
+    def _build_engine(self, engine_name: EngineName) -> BaseEngine:
+        errors: list[str] = []
+        if engine_name == "auto":
+            for candidate in auto_engine_candidates():
+                try:
+                    return self._build_specific_engine(candidate)
+                except Exception as exc:
+                    errors.append(f"{candidate}: {type(exc).__name__}: {exc}")
+            raise RuntimeError("No TTS engine could be initialized. " + " | ".join(errors))
+        return self._build_specific_engine(engine_name)
+
+    def _build_specific_engine(self, engine_name: EngineName) -> BaseEngine:
+        if engine_name == "kokoro":
+            return KokoroEngine(self.preprocessor)
+        if engine_name == "chatterbox_multilingual":
+            return ChatterboxMultilingualEngine(self.preprocessor, self.device)
+        if engine_name == "chatterbox_turbo":
+            return ChatterboxTurboEngine(self.preprocessor, self.device)
+        raise RuntimeError(f"Unsupported TTS engine: {engine_name}")
+
+    def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        return self.engine.synthesize(text=text, output_path=output_path, voice=voice, speed=speed)
+
+
+def auto_engine_candidates() -> list[EngineName]:
+    candidates: list[EngineName] = []
+    if DEFAULT_AUDIO_PROMPT_PATH:
+        candidates.append("chatterbox_turbo")
+    candidates.append("chatterbox_multilingual")
+    candidates.append("kokoro")
+    return candidates
+
+
+def resolve_engine_name(value: str) -> EngineName:
+    normalized = (value or "auto").strip().lower()
+    if normalized in {"auto", "kokoro", "chatterbox_multilingual", "chatterbox_turbo"}:
+        return normalized  # type: ignore[return-value]
+    raise RuntimeError(
+        "ASTRA_TTS_ENGINE must be one of: auto, kokoro, chatterbox_multilingual, chatterbox_turbo"
+    )
 
 
 def run_server() -> None:
     engine = TtsEngine()
-    print("TTS worker ready", file=sys.stderr, flush=True)
+    print(
+        f"TTS worker ready engine={engine.engine.engine_name} device={engine.device}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -395,6 +776,7 @@ def handle_request(engine: TtsEngine, request: dict[str, Any]) -> dict[str, Any]
         "output_path": result.output_path,
         "normalized_text": result.normalized_text,
         "sample_rate": result.sample_rate,
+        "engine": result.engine,
     }
 
 

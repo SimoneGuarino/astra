@@ -58,7 +58,9 @@ export function Button({
             disabled={disabled}
             title={title}
         >
-            {loading ? "Caricamento..." : children}
+            {loading ? 
+                <span className={`block animate-spin h-4 w-4 border-2 border-t-transparent border-gray-400 rounded-full`} />
+             : children}
         </button>
     );
 }

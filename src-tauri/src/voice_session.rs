@@ -13,7 +13,7 @@ use crate::vad::{
     normalize_samples, rms, samples_duration_ms, AdaptiveEnergyVad, VadEvent, VadFrameSnapshot,
 };
 
-const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(45);
+const FOLLOW_UP_WINDOW: Duration = Duration::from_secs(18);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VoiceSessionMode {
@@ -336,17 +336,24 @@ impl VoiceSessionManager {
         let addressed = addressing_decision(&text, active_conversation);
 
         match addressed {
-            AddressingDecision::Ignored => {
-                state.turn_state = VoiceTurnState::Passive;
+            AddressingDecision::Ignored(reason) => {
+                state.turn_state = if active_conversation {
+                    VoiceTurnState::Armed
+                } else {
+                    VoiceTurnState::Passive
+                };
                 state.processing_stage = VoiceProcessingStage::None;
-                state.mode = VoiceSessionMode::Passive;
-                state.active_until = None;
+                if !active_conversation {
+                    state.mode = VoiceSessionMode::Passive;
+                    state.active_until = None;
+                }
+
                 TranscriptDecision::Ignore {
                     session_id: session_id.to_string(),
                     turn_id: turn_id.to_string(),
                     text,
-                    reason: "wake_word_required".to_string(),
-                    snapshot: state.snapshot("wake_word_required"),
+                    reason: reason.clone(),
+                    snapshot: state.snapshot(&reason),
                 }
             }
             AddressingDecision::WakeOnly => {
@@ -476,22 +483,39 @@ impl VoiceSessionState {
 
 #[derive(Debug, PartialEq, Eq)]
 enum AddressingDecision {
-    Ignored,
+    Ignored(String),
     WakeOnly,
     Respond(String),
 }
 
+#[derive(Debug, Clone)]
+struct TranscriptQuality {
+    normalized: String,
+    useful_token_count: usize,
+    useful_char_count: usize,
+    alphabetic_char_count: usize,
+    repeated_run_len: usize,
+}
+
 fn addressing_decision(text: &str, active_conversation: bool) -> AddressingDecision {
     let trimmed = text.trim();
+    let quality = transcript_quality(trimmed);
+
     if active_conversation {
-        return AddressingDecision::Respond(trimmed.to_string());
+        if is_transcript_useful_for_follow_up(&quality) {
+            return AddressingDecision::Respond(trimmed.to_string());
+        }
+        return AddressingDecision::Ignored("low_information_follow_up".to_string());
     }
 
-    let normalized = normalize_for_addressing(trimmed);
-    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let tokens = quality.normalized.split_whitespace().collect::<Vec<_>>();
     let Some(wake_match) = find_wake_match(&tokens) else {
-        return AddressingDecision::Ignored;
+        return AddressingDecision::Ignored("wake_word_required".to_string());
     };
+
+    if wake_match.start > 1 && !tokens[..wake_match.start].iter().all(|token| is_wake_filler(token)) {
+        return AddressingDecision::Ignored("wake_word_too_late".to_string());
+    }
 
     let response_text = tokens
         .iter()
@@ -513,10 +537,15 @@ fn addressing_decision(text: &str, active_conversation: bool) -> AddressingDecis
         .to_string();
 
     if response_text.is_empty() {
-        AddressingDecision::WakeOnly
-    } else {
-        AddressingDecision::Respond(response_text)
+        return AddressingDecision::WakeOnly;
     }
+
+    let command_quality = transcript_quality(&response_text);
+    if !is_transcript_useful_for_passive_command(&command_quality) {
+        return AddressingDecision::WakeOnly;
+    }
+
+    AddressingDecision::Respond(response_text)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -567,13 +596,91 @@ fn is_wake_word(token: &str) -> bool {
 }
 
 fn is_wake_filler(token: &str) -> bool {
-    matches!(token, "hey" | "ehi" | "ciao")
+    matches!(
+        token,
+        "hey" | "ehi" | "ciao" | "ok" | "okay" | "pronto" | "eh" | "allora"
+    )
+}
+
+fn transcript_quality(text: &str) -> TranscriptQuality {
+    let normalized = normalize_for_addressing(text);
+    let useful_tokens = normalized
+        .split_whitespace()
+        .filter(|token| !is_low_information_token(token))
+        .collect::<Vec<_>>();
+
+    let alphabetic_char_count = normalized.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let repeated_run_len = longest_repeated_char_run(&normalized);
+
+    TranscriptQuality {
+        useful_char_count: useful_tokens.iter().map(|token| token.chars().count()).sum(),
+        useful_token_count: useful_tokens.len(),
+        alphabetic_char_count,
+        repeated_run_len,
+        normalized,
+    }
+}
+
+fn is_transcript_useful_for_follow_up(quality: &TranscriptQuality) -> bool {
+    quality.useful_token_count >= 1
+        && quality.useful_char_count >= 2
+        && quality.alphabetic_char_count >= 2
+        && quality.repeated_run_len < 5
+}
+
+fn is_transcript_useful_for_passive_command(quality: &TranscriptQuality) -> bool {
+    quality.useful_token_count >= 1
+        && quality.useful_char_count >= 3
+        && quality.alphabetic_char_count >= 3
+        && quality.repeated_run_len < 5
+}
+
+fn is_low_information_token(token: &str) -> bool {
+    matches!(
+        token,
+        "uh"
+            | "eh"
+            | "em"
+            | "mm"
+            | "mmm"
+            | "boh"
+            | "cioe"
+            | "allora"
+            | "pronto"
+            | "ok"
+            | "okay"
+            | "si"
+            | "sì"
+            | "no"
+            | "ciao"
+            | "astra"
+            | "astro"
+            | "extra"
+    )
+}
+
+fn longest_repeated_char_run(value: &str) -> usize {
+    let mut max_run = 0usize;
+    let mut current_run = 0usize;
+    let mut previous = None;
+
+    for ch in value.chars().filter(|ch| !ch.is_whitespace()) {
+        if Some(ch) == previous {
+            current_run += 1;
+        } else {
+            current_run = 1;
+            previous = Some(ch);
+        }
+        max_run = max_run.max(current_run);
+    }
+
+    max_run
 }
 
 fn normalize_for_addressing(text: &str) -> String {
     text.to_lowercase()
         .chars()
-        .map(|ch| if ch.is_alphanumeric() { ch } else { ' ' })
+        .map(|ch| if ch.is_alphanumeric() || ch.is_whitespace() { ch } else { ' ' })
         .collect::<String>()
 }
 
@@ -696,7 +803,7 @@ mod tests {
     fn passive_mode_ignores_unaddressed_speech() {
         assert_eq!(
             addressing_decision("sto parlando con un'altra persona", false),
-            AddressingDecision::Ignored
+            AddressingDecision::Ignored("wake_word_required".to_string())
         );
     }
 
@@ -705,6 +812,14 @@ mod tests {
         assert_eq!(
             addressing_decision("e domani invece?", true),
             AddressingDecision::Respond("e domani invece?".to_string())
+        );
+    }
+
+    #[test]
+    fn active_conversation_rejects_low_information_garbage() {
+        assert_eq!(
+            addressing_decision("ehm", true),
+            AddressingDecision::Ignored("low_information_follow_up".to_string())
         );
     }
 }

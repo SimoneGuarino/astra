@@ -1,5 +1,7 @@
 mod audio_files;
+mod conversation_history;
 mod metrics;
+mod model_routing;
 mod speech_events;
 mod stt_client;
 mod text_segmentation;
@@ -9,8 +11,10 @@ mod voice_metrics;
 mod voice_session;
 
 use audio_files::AudioFileRegistry;
+use conversation_history::ConversationHistoryManager;
 use futures_util::StreamExt;
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
+use model_routing::resolve_ollama_request;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use speech_events::{
@@ -58,6 +62,7 @@ struct AssistantRuntime {
     tts_client: TtsClient,
     voice_metrics: VoiceMetricsTracker,
     voice_session: VoiceSessionManager,
+    conversation_history: ConversationHistoryManager,
 }
 
 impl AssistantRuntime {
@@ -84,6 +89,7 @@ impl AssistantRuntime {
             tts_client: TtsClient::new(project_root.clone()),
             voice_metrics: VoiceMetricsTracker::new(),
             voice_session: VoiceSessionManager::new(project_root),
+            conversation_history: ConversationHistoryManager::new(),
         }
     }
 
@@ -94,6 +100,7 @@ impl AssistantRuntime {
             .expect("active_request_id mutex poisoned");
         if let Some(previous_request_id) = active_request_id.take() {
             self.audio_files.cleanup_request(&previous_request_id);
+            self.conversation_history.discard_turn(&previous_request_id);
         }
         *active_request_id = Some(request_id);
         self.tts_client.cancel_all();
@@ -107,6 +114,7 @@ impl AssistantRuntime {
             .expect("active_request_id mutex poisoned");
         if let Some(previous_request_id) = active_request_id.take() {
             self.audio_files.cleanup_request(&previous_request_id);
+            self.conversation_history.discard_turn(&previous_request_id);
         }
     }
 
@@ -165,50 +173,6 @@ impl AssistantRuntime {
     }
 }
 
-fn select_model(message: &str) -> &'static str {
-    let lower = message.to_lowercase();
-
-    let deep_keywords = [
-        "codice",
-        "code",
-        "bug",
-        "debug",
-        "refactor",
-        "architecture",
-        "architettura",
-        "optimize",
-        "ottimizza",
-        "analyze",
-        "analizza",
-        "implement",
-        "implementa",
-        "task complesso",
-        "reasoning",
-        "progetta",
-        "progettami",
-        "sviluppa",
-        "sviluppami",
-        "backend",
-        "frontend",
-        "typescript",
-        "rust",
-        "python",
-        "go",
-        "sql",
-        "database",
-        "algoritmo",
-        "performance",
-        "scalabilita",
-        "enterprise",
-    ];
-
-    if deep_keywords.iter().any(|keyword| lower.contains(keyword)) {
-        "qwen3.6:35b"
-    } else {
-        "qwen3:4b"
-    }
-}
-
 fn project_root() -> Result<PathBuf, String> {
     let tauri_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     tauri_dir
@@ -235,9 +199,10 @@ async fn start_chat_message_stream(
         Some(message),
         "typed",
     )
+    .await
 }
 
-fn start_assistant_response(
+async fn start_assistant_response(
     window: WebviewWindow,
     runtime: AssistantRuntime,
     message: String,
@@ -245,13 +210,21 @@ fn start_assistant_response(
     source: &str,
 ) -> Result<StartChatResponse, String> {
     let request_id = Uuid::new_v4().to_string();
-    let model = select_model(&message).to_string();
+    let history = runtime.conversation_history.recent_messages(10);
+    let resolved = resolve_ollama_request(&message, source, &history).await?;
+    let model = resolved.model.clone();
 
     runtime.begin_request(request_id.clone());
-    let metrics_snapshot =
-        runtime
-            .metrics
-            .start_request(request_id.clone(), model.clone(), message.chars().count());
+    let history_user_message = display_user_message
+        .clone()
+        .unwrap_or_else(|| message.clone());
+    runtime
+        .conversation_history
+        .begin_turn(request_id.clone(), &history_user_message);
+
+    let metrics_snapshot = runtime
+        .metrics
+        .start_request(request_id.clone(), model.clone(), message.chars().count());
 
     emit_request_started(
         &window,
@@ -268,19 +241,18 @@ fn start_assistant_response(
     let task_window = window.clone();
     let task_runtime = runtime.clone();
     let task_request_id = request_id.clone();
-    let task_model = model.clone();
 
     tauri::async_runtime::spawn(async move {
         let result = run_ollama_stream(
             task_window.clone(),
             task_runtime.clone(),
             task_request_id.clone(),
-            message,
-            task_model,
+            resolved,
         )
         .await;
 
         if let Err(message) = result {
+            task_runtime.conversation_history.discard_turn(&task_request_id);
             if task_runtime.is_active(&task_request_id) {
                 emit_error(&task_window, &task_request_id, "ollama", message);
                 let _ = task_window.emit("assistant-status", "idle");
@@ -295,28 +267,16 @@ async fn run_ollama_stream(
     window: WebviewWindow,
     runtime: AssistantRuntime,
     request_id: String,
-    message: String,
-    model: String,
+    resolved: model_routing::ResolvedOllamaRequest,
 ) -> Result<(), String> {
     let client = Client::new();
     let response = client
         .post("http://127.0.0.1:11434/api/chat")
         .json(&serde_json::json!({
-            "model": model,
+            "model": resolved.model,
             "stream": true,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Sei Astra, un assistant AI locale. Rispondi in italiano naturale, chiaro e professionale. Usa frasi pulite, evita ripetizioni e non leggere codice esteso come se fosse prosa. Quando la risposta contiene elenchi, mantieni punti brevi e scanditi."
-                },
-                {
-                    "role": "user",
-                    "content": message
-                }
-            ],
-            "options": {
-                "temperature": 0.25
-            },
+            "messages": resolved.messages,
+            "options": resolved.options,
             "keep_alive": "30m"
         }))
         .send()
@@ -340,6 +300,7 @@ async fn run_ollama_stream(
     while let Some(item) = stream.next().await {
         if !runtime.is_active(&request_id) {
             println!("Ollama stream cancelled for request_id={request_id}");
+            runtime.conversation_history.discard_turn(&request_id);
             return Ok(());
         }
 
@@ -387,6 +348,10 @@ async fn run_ollama_stream(
             spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
         }
 
+        runtime
+            .conversation_history
+            .commit_turn(&request_id, &full_text);
+
         window
             .emit(
                 "assistant-request-finished",
@@ -400,6 +365,10 @@ async fn run_ollama_stream(
         window
             .emit("assistant-status", "idle")
             .map_err(|error| format!("assistant-status idle emit failed: {error}"))?;
+    }
+
+    if !runtime.is_active(&request_id) {
+        runtime.conversation_history.discard_turn(&request_id);
     }
 
     Ok(())
@@ -438,6 +407,9 @@ fn process_ollama_line(
     if let Some(snapshot) = runtime.metrics.mark_first_llm_chunk(request_id) {
         emit_metrics_update(window, &snapshot);
     }
+    if let Some(snapshot) = runtime.voice_metrics.mark_first_llm_chunk_for_request(request_id) {
+        emit_voice_metrics_update(window, &snapshot);
+    }
 
     window
         .emit(
@@ -458,6 +430,10 @@ fn process_ollama_line(
         );
     }
 
+    if !runtime.is_active(&request_id) {
+        runtime.conversation_history.discard_turn(&request_id);
+    }
+
     Ok(())
 }
 
@@ -473,6 +449,9 @@ fn spawn_tts_segment(
 
     if let Some(snapshot) = runtime.metrics.mark_first_segment_queued(&request_id) {
         emit_metrics_update(&window, &snapshot);
+    }
+    if let Some(snapshot) = runtime.voice_metrics.mark_first_segment_queued_for_request(&request_id) {
+        emit_voice_metrics_update(&window, &snapshot);
     }
 
     let queued_event = SpeechSegmentQueuedEvent {
@@ -509,6 +488,9 @@ fn spawn_tts_segment(
                         .register(&request_id, PathBuf::from(&event.output_path));
                     if let Some(snapshot) = runtime.metrics.mark_first_audio_ready(&request_id) {
                         emit_metrics_update(&window, &snapshot);
+                    }
+                    if let Some(snapshot) = runtime.voice_metrics.mark_first_audio_ready_for_request(&request_id) {
+                        emit_voice_metrics_update(&window, &snapshot);
                     }
 
                     if let Err(error) = window.emit("assistant-audio-segment-ready", event) {
@@ -661,6 +643,12 @@ fn notify_audio_playback_started(
 
     if let Some(snapshot) = state.metrics.mark_first_audio_play(&payload.request_id) {
         emit_metrics_update(&window, &snapshot);
+    }
+    if let Some(snapshot) = state
+        .voice_metrics
+        .mark_first_audio_play_for_request(&payload.request_id)
+    {
+        emit_voice_metrics_update(&window, &snapshot);
     }
     let voice_snapshot = state.voice_session.mark_speaking();
     emit_voice_session_state(&window, &voice_snapshot);
@@ -905,7 +893,7 @@ fn voice_session_audio_chunk(
                             text.chars().count(),
                             false,
                             false,
-                            true,
+                            reason == "wake_word_required",
                         ) {
                             emit_voice_metrics_update(&task_window, &metrics);
                         }
@@ -1006,7 +994,8 @@ fn voice_session_audio_chunk(
                             response_text,
                             Some(text),
                             "voice_session",
-                        ) {
+                        )
+                        .await {
                             Ok(started) => {
                                 if let Some(metrics) = runtime.voice_metrics.mark_response_started(
                                     &utterance.session_id,
@@ -1031,7 +1020,6 @@ fn voice_session_audio_chunk(
             });
         }
     }
-
     Ok(())
 }
 

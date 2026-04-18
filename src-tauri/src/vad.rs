@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-pub const VAD_BACKEND_NAME: &str = "adaptive_energy_v1";
+pub const VAD_BACKEND_NAME: &str = "adaptive_energy_v3";
 
 #[derive(Debug, Clone, Copy)]
 pub struct VadConfig {
@@ -13,7 +13,9 @@ pub struct VadConfig {
     pub noise_end_multiplier: f32,
     pub noise_floor_alpha: f32,
     pub initial_noise_floor: f32,
+    pub rms_smoothing_alpha: f32,
     pub min_speech_ms: u64,
+    pub min_trailing_silence_ms: u64,
     pub end_silence_ms: u64,
     pub min_utterance_ms: u64,
     pub max_utterance_ms: u64,
@@ -24,19 +26,21 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             target_sample_rate: 16_000,
-            min_start_rms: 0.007,
-            min_end_rms: 0.0045,
-            max_start_rms: 0.042,
-            max_end_rms: 0.026,
-            noise_start_multiplier: 2.35,
-            noise_end_multiplier: 1.65,
-            noise_floor_alpha: 0.06,
-            initial_noise_floor: 0.0015,
-            min_speech_ms: 120,
-            end_silence_ms: 1_050,
-            min_utterance_ms: 430,
-            max_utterance_ms: 16_000,
-            pre_roll_ms: 300,
+            min_start_rms: 0.006,
+            min_end_rms: 0.0038,
+            max_start_rms: 0.036,
+            max_end_rms: 0.022,
+            noise_start_multiplier: 2.2,
+            noise_end_multiplier: 1.45,
+            noise_floor_alpha: 0.045,
+            initial_noise_floor: 0.0012,
+            rms_smoothing_alpha: 0.35,
+            min_speech_ms: 90,
+            min_trailing_silence_ms: 180,
+            end_silence_ms: 620,
+            min_utterance_ms: 240,
+            max_utterance_ms: 14_000,
+            pre_roll_ms: 280,
         }
     }
 }
@@ -53,9 +57,11 @@ pub enum VadEvent {
 pub struct VadFrameSnapshot {
     pub backend: &'static str,
     pub rms: f32,
+    pub smoothed_rms: f32,
     pub noise_floor: f32,
     pub start_threshold: f32,
     pub end_threshold: f32,
+    pub start_gate_ms: u64,
     pub speech_ms: u64,
     pub silence_ms: u64,
     pub utterance_ms: u64,
@@ -68,9 +74,11 @@ impl Default for VadFrameSnapshot {
         Self {
             backend: VAD_BACKEND_NAME,
             rms: 0.0,
+            smoothed_rms: 0.0,
             noise_floor: config.initial_noise_floor,
             start_threshold: config.min_start_rms,
             end_threshold: config.min_end_rms,
+            start_gate_ms: 0,
             speech_ms: 0,
             silence_ms: 0,
             utterance_ms: 0,
@@ -91,8 +99,10 @@ pub struct AdaptiveEnergyVad {
     speech_ms: u64,
     silence_ms: u64,
     utterance_ms: u64,
+    start_gate_ms: u64,
     in_speech: bool,
     noise_floor: f32,
+    smoothed_rms: f32,
 }
 
 impl Default for AdaptiveEnergyVad {
@@ -108,8 +118,10 @@ impl AdaptiveEnergyVad {
             speech_ms: 0,
             silence_ms: 0,
             utterance_ms: 0,
+            start_gate_ms: 0,
             in_speech: false,
             noise_floor: config.initial_noise_floor,
+            smoothed_rms: 0.0,
         }
     }
 
@@ -119,6 +131,13 @@ impl AdaptiveEnergyVad {
 
     pub fn update(&mut self, rms: f32, duration_ms: u64) -> VadUpdate {
         let rms = rms.max(0.0);
+        self.smoothed_rms = if self.smoothed_rms <= 0.0 {
+            rms
+        } else {
+            self.smoothed_rms * (1.0 - self.config.rms_smoothing_alpha)
+                + rms * self.config.rms_smoothing_alpha
+        };
+
         let start_threshold = self.start_threshold();
         let end_threshold = self.end_threshold();
         let event = if self.in_speech {
@@ -137,6 +156,7 @@ impl AdaptiveEnergyVad {
         self.speech_ms = 0;
         self.silence_ms = 0;
         self.utterance_ms = 0;
+        self.start_gate_ms = 0;
         self.in_speech = false;
     }
 
@@ -144,9 +164,11 @@ impl AdaptiveEnergyVad {
         VadFrameSnapshot {
             backend: VAD_BACKEND_NAME,
             rms,
+            smoothed_rms: self.smoothed_rms,
             noise_floor: self.noise_floor,
             start_threshold,
             end_threshold,
+            start_gate_ms: self.start_gate_ms,
             speech_ms: self.speech_ms,
             silence_ms: self.silence_ms,
             utterance_ms: self.utterance_ms,
@@ -155,14 +177,18 @@ impl AdaptiveEnergyVad {
     }
 
     fn update_idle(&mut self, rms: f32, duration_ms: u64, start_threshold: f32) -> VadEvent {
-        if rms < start_threshold {
+        let speech_like = self.smoothed_rms >= start_threshold || rms >= start_threshold * 1.1;
+
+        if !speech_like {
             self.update_noise_floor(rms);
             self.speech_ms = 0;
+            self.start_gate_ms = 0;
             return VadEvent::None;
         }
 
+        self.start_gate_ms += duration_ms;
         self.speech_ms += duration_ms;
-        if self.speech_ms >= self.config.min_speech_ms {
+        if self.start_gate_ms >= self.config.min_speech_ms {
             self.in_speech = true;
             self.utterance_ms = self.speech_ms;
             self.silence_ms = 0;
@@ -174,10 +200,16 @@ impl AdaptiveEnergyVad {
 
     fn update_in_speech(&mut self, rms: f32, duration_ms: u64, end_threshold: f32) -> VadEvent {
         self.utterance_ms += duration_ms;
-        if rms <= end_threshold {
+
+        let silence_like = self.smoothed_rms <= end_threshold && rms <= end_threshold * 1.08;
+        if silence_like {
             self.silence_ms += duration_ms;
         } else {
             self.silence_ms = 0;
+        }
+
+        if self.silence_ms >= self.config.min_trailing_silence_ms {
+            self.update_noise_floor(rms.min(end_threshold));
         }
 
         if self.silence_ms >= self.config.end_silence_ms
@@ -191,7 +223,7 @@ impl AdaptiveEnergyVad {
     }
 
     fn update_noise_floor(&mut self, rms: f32) {
-        let sample = rms.max(0.000_5);
+        let sample = rms.max(0.000_4);
         self.noise_floor = self.noise_floor * (1.0 - self.config.noise_floor_alpha)
             + sample * self.config.noise_floor_alpha;
     }
@@ -241,20 +273,20 @@ mod tests {
     fn ignores_low_level_noise() {
         let mut vad = AdaptiveEnergyVad::default();
         for _ in 0..20 {
-            let update = vad.update(0.004, 100);
+            let update = vad.update(0.0035, 60);
             assert_eq!(update.event, VadEvent::None);
         }
     }
 
     #[test]
-    fn detects_sustained_speech_then_end_silence() {
+    fn detects_sustained_speech_then_end_silence_faster() {
         let mut vad = AdaptiveEnergyVad::default();
-        assert_eq!(vad.update(0.03, 100).event, VadEvent::None);
-        assert_eq!(vad.update(0.03, 100).event, VadEvent::SpeechStarted);
+        assert_eq!(vad.update(0.028, 60).event, VadEvent::None);
+        assert_eq!(vad.update(0.029, 60).event, VadEvent::SpeechStarted);
 
-        for _ in 0..10 {
-            assert_eq!(vad.update(0.003, 100).event, VadEvent::SpeechContinued);
+        for _ in 0..9 {
+            assert_eq!(vad.update(0.0025, 60).event, VadEvent::SpeechContinued);
         }
-        assert_eq!(vad.update(0.003, 100).event, VadEvent::SpeechEnded);
+        assert_eq!(vad.update(0.0025, 60).event, VadEvent::SpeechEnded);
     }
 }

@@ -1,5 +1,9 @@
 import type { AssistantStatus } from "../types/assistant";
-import Astra from "../assets/astra.png";
+import { IoClose } from "react-icons/io5";
+import { MdOutlineMinimize } from "react-icons/md";
+import { LuMonitor, LuMonitorOff } from "react-icons/lu";
+
+import { Button } from "../ui/buttons/Button";
 
 type AssistantHeaderProps = {
     activeModel: string;
@@ -24,35 +28,29 @@ export function AssistantHeader({
 }: AssistantHeaderProps) {
     return (
         <>
-            <header className="overlay-topbar window-drag-strip" onMouseDown={startDrag}>
-                <div className="overlay-brand">
+            <header className="overlay-topbar" >
+                <div className="overlay-brand w-full cursor-move"  onMouseDown={startDrag}>
                     <div>
                         <p className="overlay-kicker">PERSONAL AI</p>
                         <h1>Astra</h1>
+                        <p className="assistant-model-label">Model: {activeModel} | {statusLabel}</p>
                     </div>
                 </div>
 
-                <div className="overlay-controls">
-                    <button className="overlay-control" onClick={onTogglePin}>
-                        {isPinned ? "Unpin" : "Pin"}
-                    </button>
-                    <button className="overlay-control" onClick={onMinimize}>
-                        Min
-                    </button>
-                    <button className="overlay-control danger" onClick={onClose}>
-                        X
-                    </button>
+                <div className="flex">
+                    <Button variant="text" radius="full" size="xs" title={isPinned ? "Rimuovi fissaggio" : "Fissa la finestra sempre on top"} onClick={onTogglePin}>
+                        {isPinned ? <LuMonitorOff /> : <LuMonitor />}
+                    </Button>
+                    <Button
+                        variant="text" radius="full" size="xs" title="Minimizza" onClick={onMinimize}>
+                        <MdOutlineMinimize />
+                    </Button>
+                    <Button
+                        variant="text" radius="full" size="xs" title="Chiudi" onClick={onClose}>
+                        <IoClose />
+                    </Button>
                 </div>
             </header>
-
-            <section className="flex items-center justify-between px-4 mb-2">
-                <p className="assistant-model-label">Model: {activeModel}</p>
-
-                <div className={`assistant-status ${status}`}>
-                    <span className={`status-dot ${status}`} />
-                    <span>{statusLabel}</span>
-                </div>
-            </section>
         </>
     );
 }

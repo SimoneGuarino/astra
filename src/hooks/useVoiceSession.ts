@@ -7,8 +7,8 @@ import type {
 } from "../types/assistant";
 
 const TARGET_SAMPLE_RATE = 16_000;
-const CHUNK_MS = 100;
-const MAX_CHUNK_MS = 250;
+const CHUNK_MS = 60;
+const MAX_CHUNK_MS = 180;
 
 type UseVoiceSessionParams = {
     onError: (message: string) => void;

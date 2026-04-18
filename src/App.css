@@ -311,13 +311,6 @@ input {
     cursor: not-allowed;
 }
 
-.window-drag-strip {
-    height: 22px;
-    flex: 0 0 22px;
-    cursor: move;
-    background: transparent;
-}
-
 .compact-mode {
     flex: 1;
     display: flex;

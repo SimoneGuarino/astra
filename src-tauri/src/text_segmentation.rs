@@ -90,9 +90,9 @@ impl SentenceSegmenter {
 }
 
 fn find_boundary(buffer: &str, flush: bool) -> Option<usize> {
-    const MIN_SENTENCE_CHARS: usize = 28;
-    const IDEAL_MAX_CHARS: usize = 220;
-    const HARD_MAX_CHARS: usize = 380;
+    const MIN_SENTENCE_CHARS: usize = 20;
+    const IDEAL_MAX_CHARS: usize = 110;
+    const HARD_MAX_CHARS: usize = 170;
 
     let mut last_soft_boundary = None;
     let mut char_count = 0usize;
@@ -101,7 +101,7 @@ fn find_boundary(buffer: &str, flush: bool) -> Option<usize> {
         char_count += 1;
         let end = idx + ch.len_utf8();
 
-        if matches!(ch, ',' | ';' | ':' | '\n') && char_count >= 120 {
+        if matches!(ch, ',' | ';' | ':' | '\n') && char_count >= 70 {
             last_soft_boundary = Some(end);
         }
 
@@ -112,7 +112,11 @@ fn find_boundary(buffer: &str, flush: bool) -> Option<usize> {
             && !looks_like_decimal(buffer, idx)
             && is_followed_by_boundary(buffer, end)
         {
-            return Some(include_closing_punctuation(buffer, end));
+            let boundary = include_closing_punctuation(buffer, end);
+            if should_hold_for_more_context(&buffer[..boundary], &buffer[boundary..], flush) {
+                continue;
+            }
+            return Some(boundary);
         }
 
         if char_count >= IDEAL_MAX_CHARS {
@@ -197,6 +201,26 @@ fn looks_like_abbreviation(text: &str) -> bool {
     )
 }
 
+fn looks_like_short_conversational_prefix(text: &str) -> bool {
+    let normalized = text.trim().trim_end_matches(',').to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "certo"
+            | "ok"
+            | "okay"
+            | "va bene"
+            | "perfetto"
+            | "capito"
+            | "chiaro"
+            | "bene"
+            | "sì"
+            | "si"
+            | "dimmi"
+            | "eccomi"
+            | "allora"
+    )
+}
+
 fn looks_like_short_conversational_segment(text: &str) -> bool {
     let normalized = text
         .trim()
@@ -224,11 +248,54 @@ fn looks_like_short_conversational_segment(text: &str) -> bool {
         "sì",
         "si",
         "assolutamente",
+        "dimmi",
+        "eccomi",
+        "ci sono",
     ];
 
     acknowledgements
         .iter()
         .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}, ")))
+}
+
+fn should_hold_for_more_context(current: &str, rest: &str, flush: bool) -> bool {
+    if flush {
+        return false;
+    }
+
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let word_count = trimmed.split_whitespace().count();
+    let char_count = trimmed.chars().count();
+    let is_short = char_count <= 26 || word_count <= 4;
+    let is_question = trimmed.ends_with('?');
+    let is_ack = looks_like_short_conversational_segment(trimmed);
+
+    if is_question || is_ack {
+        return false;
+    }
+
+    if !is_short {
+        return false;
+    }
+
+    let next = rest.trim_start();
+    if next.is_empty() {
+        return false;
+    }
+
+    let next_lower = next.to_lowercase();
+    next_lower.starts_with("e ")
+        || next_lower.starts_with("ma ")
+        || next_lower.starts_with("però ")
+        || next_lower.starts_with("quindi ")
+        || next_lower.starts_with("perche ")
+        || next_lower.starts_with("perché ")
+        || next_lower.starts_with("che ")
+        || next_lower.starts_with("se ")
 }
 
 fn find_last_whitespace_before(buffer: &str, end: usize) -> Option<usize> {

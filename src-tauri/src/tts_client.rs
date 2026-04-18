@@ -17,7 +17,6 @@ use tokio::{
 };
 use uuid::Uuid;
 
-const TTS_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
 pub enum TtsClientError {
@@ -80,6 +79,7 @@ impl TtsClient {
                 rx,
                 cancel_rx,
                 worker: None,
+                tts_timeout: read_tts_timeout(),
             }
             .run()
             .await;
@@ -127,6 +127,16 @@ impl TtsClient {
     }
 }
 
+
+fn read_tts_timeout() -> Duration {
+    let seconds = std::env::var("ASTRA_TTS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 5)
+        .unwrap_or(240);
+    Duration::from_secs(seconds)
+}
+
 enum TtsCommand {
     Synthesize(TtsJob),
 }
@@ -145,6 +155,7 @@ struct TtsActor {
     rx: mpsc::Receiver<TtsCommand>,
     cancel_rx: watch::Receiver<u64>,
     worker: Option<WorkerProcess>,
+    tts_timeout: Duration,
 }
 
 impl TtsActor {
@@ -250,7 +261,7 @@ impl TtsActor {
                     }
                     return Err(TtsClientError::Cancelled);
                 }
-                _ = sleep(TTS_TIMEOUT) => {
+                _ = sleep(self.tts_timeout) => {
                     let _ = child.kill().await;
                     return Err(TtsClientError::Timeout);
                 }
@@ -331,7 +342,9 @@ async fn start_worker(project_root: &PathBuf) -> Result<WorkerProcess, TtsClient
     }
 
     let mut child = Command::new(&python)
-        .arg(&worker_path)
+        .current_dir(project_root)
+        .arg("-m")
+        .arg("python_services.tts.tts_worker")
         .arg("--server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

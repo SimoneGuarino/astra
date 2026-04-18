@@ -101,9 +101,11 @@ export type VoiceSessionStateEvent = {
 export type VadFrameSnapshot = {
     backend: string;
     rms: number;
+    smoothed_rms: number;
     noise_floor: number;
     start_threshold: number;
     end_threshold: number;
+    start_gate_ms: number;
     speech_ms: number;
     silence_ms: number;
     utterance_ms: number;
@@ -120,6 +122,10 @@ export type VoiceTurnMetricsSnapshot = {
     stt_completed_at: number | null;
     wake_detected_at: number | null;
     response_started_at: number | null;
+    first_llm_chunk_at: number | null;
+    first_segment_queued_at: number | null;
+    first_audio_ready_at: number | null;
+    first_audio_play_at: number | null;
     interruption_detected_at: number | null;
     interruption_stop_completed_at: number | null;
     follow_up_window_opened_at: number | null;
@@ -130,9 +136,11 @@ export type VoiceTurnMetricsSnapshot = {
     request_id: string | null;
     utterance_duration_ms: number | null;
     speech_to_stt_ms: number | null;
+    user_end_to_stt_ms: number | null;
     stt_duration_ms: number | null;
     stt_to_response_start_ms: number | null;
     user_end_to_response_start_ms: number | null;
+    response_start_to_first_audio_ms: number | null;
     interruption_latency_ms: number | null;
 };
 
