@@ -1,9 +1,16 @@
 import json
+import contextlib
 import os
 import sys
 import traceback
 from pathlib import Path
 from typing import Any
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 def _bootstrap_cuda_dlls() -> None:
@@ -46,12 +53,13 @@ DEFAULT_LANGUAGE = os.environ.get("ASTRA_STT_LANGUAGE", "it")
 
 def _create_model() -> WhisperModel:
     try:
-        return WhisperModel(
-            MODEL_SIZE,
-            device="cuda",
-            compute_type="float16",
-            cpu_threads=4,
-        )
+        with contextlib.redirect_stdout(sys.stderr):
+            return WhisperModel(
+                MODEL_SIZE,
+                device="cuda",
+                compute_type="float16",
+                cpu_threads=4,
+            )
     except Exception as gpu_error:
         print(
             json.dumps(
@@ -64,36 +72,38 @@ def _create_model() -> WhisperModel:
             file=sys.stderr,
             flush=True,
         )
-        return WhisperModel(
-            MODEL_SIZE,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=max(2, (os.cpu_count() or 4) // 2),
-        )
+        with contextlib.redirect_stdout(sys.stderr):
+            return WhisperModel(
+                MODEL_SIZE,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=max(2, (os.cpu_count() or 4) // 2),
+            )
 
 
 MODEL = _create_model()
 
 
 def transcribe(audio_path: str) -> dict[str, Any]:
-    segments, info = MODEL.transcribe(
-        audio_path,
-        language=DEFAULT_LANGUAGE,
-        vad_filter=True,
-        vad_parameters={
-            "min_silence_duration_ms": 350,
-            "speech_pad_ms": 120,
-        },
-        beam_size=1,
-        best_of=1,
-        temperature=0.0,
-        patience=1.0,
-        condition_on_previous_text=False,
-        without_timestamps=True,
-        compression_ratio_threshold=2.6,
-        log_prob_threshold=-1.2,
-        no_speech_threshold=0.45,
-    )
+    with contextlib.redirect_stdout(sys.stderr):
+        segments, info = MODEL.transcribe(
+            audio_path,
+            language=DEFAULT_LANGUAGE,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 350,
+                "speech_pad_ms": 120,
+            },
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            patience=1.0,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+            compression_ratio_threshold=2.6,
+            log_prob_threshold=-1.2,
+            no_speech_threshold=0.45,
+        )
 
     text = " ".join(
         segment.text.strip()

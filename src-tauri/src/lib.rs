@@ -1,5 +1,7 @@
 mod action_policy;
 mod assistant_context;
+mod assistant_memory;
+mod assistant_response;
 mod audio_files;
 mod audit_log;
 mod browser_agent;
@@ -27,6 +29,11 @@ mod voice_metrics;
 mod voice_session;
 
 use assistant_context::build_capability_context;
+use assistant_memory::RecentArtifactMemory;
+use assistant_response::{
+    fallback_display_for_empty_response, present_display_text, render_action_response,
+    speech_safe_text, RenderedAssistantResponse, StreamPresentationState,
+};
 use audio_files::AudioFileRegistry;
 use conversation_history::ConversationHistoryManager;
 use conversation_router::{route_message, ConversationRoute};
@@ -44,13 +51,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use speech_events::{
     AssistantErrorEvent, AssistantInterruptedEvent, AssistantRequestFinishedEvent,
-    AssistantRequestStartedEvent, AudioPlaybackEvent, AudioSegmentFailedEvent,
-    AudioSessionCompletedRequest, ChatStartRequest, SpeechSegmentQueuedEvent, StartChatResponse,
-    StreamChunkEvent, VoiceSessionAudioChunk, VoiceSessionStartResponse, VoiceSessionStateEvent,
-    VoiceSessionTranscriptEvent, VoiceTranscriptionFinishedEvent, VoiceTranscriptionRequest,
-    VoiceTranscriptionResponse, VoiceTranscriptionStartedEvent,
+    AssistantRequestSettledEvent, AssistantRequestStartedEvent, AudioPlaybackEvent,
+    AudioSegmentFailedEvent, AudioSessionCompletedRequest, ChatStartRequest,
+    SpeechSegmentQueuedEvent, StartChatResponse, StreamChunkEvent, VoiceSessionAudioChunk,
+    VoiceSessionStartResponse, VoiceSessionStateEvent, VoiceSessionTranscriptEvent,
+    VoiceTranscriptionFinishedEvent, VoiceTranscriptionRequest, VoiceTranscriptionResponse,
+    VoiceTranscriptionStartedEvent,
 };
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -89,6 +98,8 @@ struct AssistantRuntime {
     voice_session: VoiceSessionManager,
     conversation_history: ConversationHistoryManager,
     desktop_agent: DesktopAgentRuntime,
+    recent_artifacts: RecentArtifactMemory,
+    tts_segment_fingerprints: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl AssistantRuntime {
@@ -117,6 +128,8 @@ impl AssistantRuntime {
             voice_session: VoiceSessionManager::new(project_root.clone()),
             conversation_history: ConversationHistoryManager::new(),
             desktop_agent: DesktopAgentRuntime::new(project_root),
+            recent_artifacts: RecentArtifactMemory::default(),
+            tts_segment_fingerprints: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -128,6 +141,7 @@ impl AssistantRuntime {
         if let Some(previous_request_id) = active_request_id.take() {
             self.audio_files.cleanup_request(&previous_request_id);
             self.conversation_history.discard_turn(&previous_request_id);
+            self.clear_tts_fingerprints(&previous_request_id);
         }
         *active_request_id = Some(request_id);
         self.tts_client.cancel_all();
@@ -142,7 +156,21 @@ impl AssistantRuntime {
         if let Some(previous_request_id) = active_request_id.take() {
             self.audio_files.cleanup_request(&previous_request_id);
             self.conversation_history.discard_turn(&previous_request_id);
+            self.clear_tts_fingerprints(&previous_request_id);
         }
+    }
+
+    fn interrupt_active_for_replacement(&self) -> Option<String> {
+        self.tts_client.cancel_all();
+        let mut active_request_id = self
+            .active_request_id
+            .lock()
+            .expect("active_request_id mutex poisoned");
+        let previous_request_id = active_request_id.take()?;
+        self.audio_files.cleanup_request(&previous_request_id);
+        self.conversation_history.discard_turn(&previous_request_id);
+        self.clear_tts_fingerprints(&previous_request_id);
+        Some(previous_request_id)
     }
 
     fn finish_request(&self, request_id: &str) {
@@ -153,6 +181,7 @@ impl AssistantRuntime {
         if active_request_id.as_deref() == Some(request_id) {
             *active_request_id = None;
         }
+        self.clear_tts_fingerprints(request_id);
     }
 
     fn begin_voice_request(&self, request_id: String) {
@@ -198,6 +227,30 @@ impl AssistantRuntime {
             .expect("active_voice_request_id mutex poisoned");
         active_voice_request_id.as_deref() == Some(request_id)
     }
+
+    fn should_synthesize_segment(&self, request_id: &str, text: &str) -> bool {
+        let fingerprint = tts_segment_fingerprint(text);
+        if fingerprint.is_empty() || fingerprint == "ho completato la richiesta" {
+            return false;
+        }
+
+        let mut fingerprints = self
+            .tts_segment_fingerprints
+            .lock()
+            .expect("tts_segment_fingerprints mutex poisoned");
+        fingerprints
+            .entry(request_id.to_string())
+            .or_default()
+            .insert(fingerprint)
+    }
+
+    fn clear_tts_fingerprints(&self, request_id: &str) {
+        let mut fingerprints = self
+            .tts_segment_fingerprints
+            .lock()
+            .expect("tts_segment_fingerprints mutex poisoned");
+        fingerprints.remove(request_id);
+    }
 }
 
 fn project_root() -> Result<PathBuf, String> {
@@ -236,8 +289,35 @@ async fn start_assistant_response(
     display_user_message: Option<String>,
     source: &str,
 ) -> Result<StartChatResponse, String> {
+    if let Some(previous_request_id) = runtime.interrupt_active_for_replacement() {
+        let _ = window.emit(
+            "assistant-interrupted",
+            AssistantInterruptedEvent {
+                request_id: Some(previous_request_id),
+                reason: "replaced_by_new_request".into(),
+            },
+        );
+    }
+
     let history = runtime.conversation_history.recent_messages(10);
     let manifest = runtime.desktop_agent.capability_manifest().await;
+
+    if let Some(memory_response) = runtime.recent_artifacts.answer_followup(&message) {
+        emit_route_diagnostic(
+            &window,
+            &recent_artifact_diagnostic(&message, "recent_artifact_memory"),
+        );
+        return start_grounded_response(
+            window,
+            runtime,
+            message,
+            display_user_message,
+            source,
+            RenderedAssistantResponse::from_display(memory_response),
+            "artifact-memory",
+        )
+        .await;
+    }
 
     let route_result = route_message(&runtime.desktop_agent, &manifest, &message).await?;
     emit_route_diagnostic(&window, &route_result.diagnostic);
@@ -250,32 +330,38 @@ async fn start_assistant_response(
                 message,
                 display_user_message,
                 source,
-                response_text,
+                RenderedAssistantResponse::from_display(response_text),
                 "capability-router",
             )
             .await;
         }
         ConversationRoute::ActionResponse(action_response) => {
-            let response_text = summarize_action_response(&action_response);
+            runtime
+                .recent_artifacts
+                .remember_action_response(&action_response);
+            let rendered = render_action_response(&action_response, &message);
             return start_grounded_response(
                 window,
                 runtime,
                 message,
                 display_user_message,
                 source,
-                response_text,
+                rendered,
                 "desktop-agent",
             )
             .await;
         }
         ConversationRoute::ScreenAnalysis(result) => {
+            if let Some(analysis) = result.analysis.as_ref() {
+                runtime.recent_artifacts.remember_screen_analysis(analysis);
+            }
             return start_grounded_response(
                 window,
                 runtime,
                 message,
                 display_user_message,
                 source,
-                result.response_text,
+                RenderedAssistantResponse::from_display(result.response_text),
                 "screen-vision",
             )
             .await;
@@ -322,6 +408,7 @@ async fn start_assistant_response(
             task_window.clone(),
             task_runtime.clone(),
             task_request_id.clone(),
+            message.clone(),
             resolved,
         )
         .await;
@@ -345,9 +432,11 @@ async fn start_grounded_response(
     original_message: String,
     display_user_message: Option<String>,
     source: &str,
-    response_text: String,
+    rendered: RenderedAssistantResponse,
     model_label: &str,
 ) -> Result<StartChatResponse, String> {
+    let display_text = rendered.display_text;
+    let speech_text = rendered.speech_text;
     let request_id = Uuid::new_v4().to_string();
     runtime.begin_request(request_id.clone());
     let history_user_message = display_user_message
@@ -374,13 +463,13 @@ async fn start_grounded_response(
         .map_err(|error| format!("assistant-status emit failed: {error}"))?;
     runtime
         .conversation_history
-        .commit_turn(&request_id, &response_text);
+        .commit_turn(&request_id, &display_text);
     window
         .emit(
             "assistant-stream-chunk",
             StreamChunkEvent {
                 request_id: request_id.clone(),
-                chunk: response_text.clone(),
+                chunk: display_text.clone(),
             },
         )
         .map_err(|error| format!("assistant-stream-chunk emit failed: {error}"))?;
@@ -391,7 +480,7 @@ async fn start_grounded_response(
         emit_metrics_update(&window, &snapshot);
     }
     let mut segmenter = SentenceSegmenter::new();
-    for segment in segmenter.push(&response_text) {
+    for segment in segmenter.push(&speech_text) {
         spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
     }
     for segment in segmenter.flush() {
@@ -402,67 +491,51 @@ async fn start_grounded_response(
             "assistant-request-finished",
             AssistantRequestFinishedEvent {
                 request_id: request_id.clone(),
-                full_text: response_text,
+                full_text: display_text,
             },
         )
         .map_err(|error| format!("assistant-request-finished emit failed: {error}"))?;
     window
-        .emit("assistant-status", "idle")
-        .map_err(|error| format!("assistant-status idle emit failed: {error}"))?;
+        .emit("assistant-status", "settling")
+        .map_err(|error| format!("assistant-status settling emit failed: {error}"))?;
     Ok(StartChatResponse {
         request_id,
         model: model_label.to_string(),
     })
 }
 
-fn summarize_action_response(response: &DesktopActionResponse) -> String {
-    match response.status {
-        crate::desktop_agent_types::DesktopActionStatus::Executed => {
-            match response.tool_name.as_str() {
-                "desktop.launch_app" => {
-                    let target = response
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.get("path"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("the application");
-                    format!("I opened {target}.")
-                }
-                "filesystem.write_text" => {
-                    let path = response
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.get("path"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("the file");
-                    format!("I wrote the file successfully: {path}.")
-                }
-                "browser.open" => "I opened the requested URL.".into(),
-                "browser.search" => "I opened the web search.".into(),
-                _ => format!("I executed {} successfully.", response.tool_name),
-            }
-        }
-        crate::desktop_agent_types::DesktopActionStatus::ApprovalRequired => {
-            format!("{} is available, but this action requires your approval before I can execute it. I have created a pending approval.", response.tool_name)
-        }
-        crate::desktop_agent_types::DesktopActionStatus::Rejected => {
-            format!("The action for {} was rejected.", response.tool_name)
-        }
-        crate::desktop_agent_types::DesktopActionStatus::Failed => response
-            .message
-            .clone()
-            .unwrap_or_else(|| format!("The action for {} failed.", response.tool_name)),
-    }
-}
-
 fn emit_route_diagnostic(window: &WebviewWindow, diagnostic: &ConversationRouteDiagnostic) {
     let _ = window.emit("assistant-route-diagnostic", diagnostic.clone());
+}
+
+fn recent_artifact_diagnostic(message: &str, routed_to: &str) -> ConversationRouteDiagnostic {
+    ConversationRouteDiagnostic {
+        message_excerpt: message.chars().take(160).collect(),
+        classifier_source: "recent_artifact_memory".into(),
+        intent: "artifact_followup".into(),
+        target: Some("recent_artifact".into()),
+        action: Some("answer_from_memory".into()),
+        tool_name: None,
+        extracted_params: None,
+        confidence: Some(0.70),
+        routed_to: routed_to.into(),
+        grounded: true,
+        fallback_used: false,
+        submit_action_called: false,
+        action_id: None,
+        action_status: None,
+        approval_created: false,
+        audit_expected: false,
+        rationale: Some("Resolved an unambiguous follow-up against session-scoped recent artifact memory".into()),
+        error: None,
+    }
 }
 
 async fn run_ollama_stream(
     window: WebviewWindow,
     runtime: AssistantRuntime,
     request_id: String,
+    original_message: String,
     resolved: model_routing::ResolvedOllamaRequest,
 ) -> Result<(), String> {
     let client = Client::new();
@@ -491,7 +564,8 @@ async fn run_ollama_stream(
     let mut stream = response.bytes_stream();
     let mut stream_buffer = String::new();
     let mut full_text = String::new();
-    let mut segmenter = SentenceSegmenter::new();
+    let mut presentation = StreamPresentationState::new();
+    let mut emitted_display_text = false;
 
     while let Some(item) = stream.next().await {
         if !runtime.is_active(&request_id) {
@@ -512,38 +586,96 @@ async fn run_ollama_stream(
                 continue;
             }
 
-            process_ollama_line(
+            emitted_display_text |= process_ollama_line(
                 &window,
                 &runtime,
                 &request_id,
                 &line,
                 &mut full_text,
-                &mut segmenter,
+                &mut presentation,
             )?;
         }
     }
 
     let trailing = stream_buffer.trim().to_string();
     if !trailing.is_empty() && runtime.is_active(&request_id) {
-        process_ollama_line(
+        emitted_display_text |= process_ollama_line(
             &window,
             &runtime,
             &request_id,
             &trailing,
             &mut full_text,
-            &mut segmenter,
+            &mut presentation,
         )?;
     }
 
     if runtime.is_active(&request_id) {
+        let trailing_display = presentation.finish();
+        if !trailing_display.trim().is_empty() {
+            if !emitted_display_text {
+                if let Some(snapshot) = runtime.metrics.mark_first_llm_chunk(&request_id) {
+                    emit_metrics_update(&window, &snapshot);
+                }
+                if let Some(snapshot) = runtime
+                    .voice_metrics
+                    .mark_first_llm_chunk_for_request(&request_id)
+                {
+                    emit_voice_metrics_update(&window, &snapshot);
+                }
+            }
+            emitted_display_text = true;
+            window
+                .emit(
+                    "assistant-stream-chunk",
+                    StreamChunkEvent {
+                        request_id: request_id.clone(),
+                        chunk: trailing_display.clone(),
+                    },
+                )
+                .map_err(|error| format!("assistant-stream-chunk emit failed: {error}"))?;
+        }
+
+        let mut final_text = present_display_text(&full_text);
+        if final_text.trim().is_empty() {
+            final_text = fallback_display_for_empty_response(&original_message);
+        }
+
+        if !emitted_display_text {
+            if let Some(snapshot) = runtime.metrics.mark_first_llm_chunk(&request_id) {
+                emit_metrics_update(&window, &snapshot);
+            }
+            if let Some(snapshot) = runtime
+                .voice_metrics
+                .mark_first_llm_chunk_for_request(&request_id)
+            {
+                emit_voice_metrics_update(&window, &snapshot);
+            }
+            window
+                .emit(
+                    "assistant-stream-chunk",
+                    StreamChunkEvent {
+                        request_id: request_id.clone(),
+                        chunk: final_text.clone(),
+                    },
+                )
+                .map_err(|error| format!("assistant-stream-chunk emit failed: {error}"))?;
+        }
+
         runtime
             .conversation_history
-            .commit_turn(&request_id, &full_text);
+            .commit_turn(&request_id, &final_text);
 
         if let Some(snapshot) = runtime.metrics.mark_llm_completed(&request_id) {
             emit_metrics_update(&window, &snapshot);
         }
 
+        let mut segmenter = SentenceSegmenter::new();
+        let speech_text = speech_safe_text(&final_text);
+        if !speech_text.trim().is_empty() {
+            for segment in segmenter.push(&speech_text) {
+                spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
+            }
+        }
         for segment in segmenter.flush() {
             spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
         }
@@ -553,14 +685,14 @@ async fn run_ollama_stream(
                 "assistant-request-finished",
                 AssistantRequestFinishedEvent {
                     request_id: request_id.clone(),
-                    full_text,
+                    full_text: final_text,
                 },
             )
             .map_err(|error| format!("assistant-request-finished emit failed: {error}"))?;
 
         window
-            .emit("assistant-status", "idle")
-            .map_err(|error| format!("assistant-status idle emit failed: {error}"))?;
+            .emit("assistant-status", "settling")
+            .map_err(|error| format!("assistant-status settling emit failed: {error}"))?;
     }
 
     if !runtime.is_active(&request_id) {
@@ -576,29 +708,33 @@ fn process_ollama_line(
     request_id: &str,
     line: &str,
     full_text: &mut String,
-    segmenter: &mut SentenceSegmenter,
-) -> Result<(), String> {
+    presentation: &mut StreamPresentationState,
+) -> Result<bool, String> {
     let parsed: OllamaStreamChunk = match serde_json::from_str(line) {
         Ok(parsed) => parsed,
         Err(error) => {
             println!("Ollama stream parse ignored: {error} | line={line:?}");
-            return Ok(());
+            return Ok(false);
         }
     };
 
     if !runtime.is_active(request_id) {
-        return Ok(());
+        return Ok(false);
     }
 
     let Some(message) = parsed.message else {
-        return Ok(());
+        return Ok(false);
     };
 
     if message.content.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     full_text.push_str(&message.content);
+    let display_chunk = presentation.display_chunk(&message.content);
+    if display_chunk.trim().is_empty() {
+        return Ok(false);
+    }
 
     if let Some(snapshot) = runtime.metrics.mark_first_llm_chunk(request_id) {
         emit_metrics_update(window, &snapshot);
@@ -615,25 +751,16 @@ fn process_ollama_line(
             "assistant-stream-chunk",
             StreamChunkEvent {
                 request_id: request_id.to_string(),
-                chunk: message.content.clone(),
+                chunk: display_chunk.clone(),
             },
         )
         .map_err(|error| format!("assistant-stream-chunk emit failed: {error}"))?;
-
-    for segment in segmenter.push(&message.content) {
-        spawn_tts_segment(
-            window.clone(),
-            runtime.clone(),
-            request_id.to_string(),
-            segment,
-        );
-    }
 
     if !runtime.is_active(&request_id) {
         runtime.conversation_history.discard_turn(&request_id);
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn spawn_tts_segment(
@@ -643,6 +770,9 @@ fn spawn_tts_segment(
     segment: SpeechSegment,
 ) {
     if !runtime.is_active(&request_id) {
+        return;
+    }
+    if !runtime.should_synthesize_segment(&request_id, &segment.text) {
         return;
     }
 
@@ -726,6 +856,14 @@ fn spawn_tts_segment(
             }
         }
     });
+}
+
+fn tts_segment_fingerprint(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?'))
+        .to_lowercase()
 }
 
 fn emit_request_started(
@@ -904,6 +1042,18 @@ fn notify_audio_session_completed(
 
     state.audio_files.cleanup_request(&payload.request_id);
     state.finish_request(&payload.request_id);
+    window
+        .emit(
+            "assistant-request-settled",
+            AssistantRequestSettledEvent {
+                request_id: payload.request_id.clone(),
+                had_tts_failures: payload.had_failures,
+            },
+        )
+        .map_err(|error| format!("assistant-request-settled emit failed: {error}"))?;
+    window
+        .emit("assistant-status", "idle")
+        .map_err(|error| format!("assistant-status idle emit failed: {error}"))?;
     let voice_snapshot = state.voice_session.mark_assistant_idle();
     emit_voice_session_state(&window, &voice_snapshot);
     Ok(())

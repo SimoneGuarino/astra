@@ -28,6 +28,12 @@ pub struct AssistantRequestFinishedEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantRequestSettledEvent {
+    pub request_id: String,
+    pub had_tts_failures: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantErrorEvent {
     pub request_id: String,
     pub stage: String,

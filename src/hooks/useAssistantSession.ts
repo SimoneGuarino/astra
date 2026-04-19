@@ -12,6 +12,7 @@ import type {
     AssistantErrorEvent,
     AssistantInterruptedEvent,
     AssistantRequestFinishedEvent,
+    AssistantRequestSettledEvent,
     AssistantRequestStartedEvent,
     AssistantStatus,
     ChatMessage,
@@ -32,6 +33,9 @@ const INITIAL_MESSAGES: ChatMessage[] = [
         content: "Ciao. Sono pronta. Dimmi pure cosa vuoi fare.",
     },
 ];
+
+const EMPTY_RESPONSE_FALLBACK =
+    "Non ho ricevuto una risposta testuale dal modello. Riprova o cambia modello.";
 
 export function useAssistantSession() {
     const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
@@ -85,8 +89,13 @@ export function useAssistantSession() {
             return;
         }
 
-        if (isStreamingRef.current || pendingSpeechSegmentsRef.current.size > 0) {
+        if (isStreamingRef.current) {
             setStatus("thinking");
+            return;
+        }
+
+        if (pendingSpeechSegmentsRef.current.size > 0) {
+            setStatus("settling");
             return;
         }
 
@@ -182,6 +191,8 @@ export function useAssistantSession() {
             ) {
                 settleVisualStatus();
                 void completeAudioSession(requestId);
+            } else if (!isAudioSpeakingRef.current) {
+                setStatus("settling");
             }
         },
         [completeAudioSession, hasPendingWork, settleVisualStatus]
@@ -194,7 +205,7 @@ export function useAssistantSession() {
                 bufferedFinishedEventsRef.current.delete(requestId);
                 bufferedStreamChunksRef.current.delete(requestId);
                 finishedRequestIdsRef.current.add(requestId);
-                updateAssistantMessage(assistantMessageId, finished.full_text, "replace");
+                updateAssistantMessage(assistantMessageId, finalAssistantText(finished.full_text), "replace");
                 finishRequestLifecycle(requestId);
                 return;
             }
@@ -412,7 +423,7 @@ export function useAssistantSession() {
 
         pendingSpeechSegmentsRef.current.add(`${event.request_id}:${event.sequence}`);
         if (!isAudioSpeakingRef.current) {
-            setStatus("thinking");
+            setStatus("settling");
         }
     }, []);
 
@@ -426,7 +437,7 @@ export function useAssistantSession() {
 
             bufferedStreamChunksRef.current.delete(event.request_id);
             finishedRequestIdsRef.current.add(event.request_id);
-            updateAssistantMessage(assistantId, event.full_text, "replace");
+            updateAssistantMessage(assistantId, finalAssistantText(event.full_text), "replace");
             finishRequestLifecycle(event.request_id);
         },
         [finishRequestLifecycle, updateAssistantMessage]
@@ -439,6 +450,7 @@ export function useAssistantSession() {
             console.error(`Assistant ${stage} error:`, message);
 
             if (stage === "tts") {
+                settleVisualStatus();
                 return;
             }
 
@@ -472,15 +484,30 @@ export function useAssistantSession() {
     );
 
     const handleAssistantInterrupted = useCallback(
-        (_event: AssistantInterruptedEvent) => {
+        (event: AssistantInterruptedEvent) => {
             stopAllAudio();
             pendingSpeechSegmentsRef.current.clear();
             isStreamingRef.current = false;
             isAudioSpeakingRef.current = false;
             setIsLoading(false);
+            if (event.reason === "replaced_by_new_request") {
+                setStatus("thinking");
+                return;
+            }
             setStatus("listening");
         },
         [stopAllAudio]
+    );
+
+    const handleRequestSettled = useCallback(
+        (_event: AssistantRequestSettledEvent) => {
+            pendingSpeechSegmentsRef.current.clear();
+            isStreamingRef.current = false;
+            isAudioSpeakingRef.current = false;
+            setIsLoading(false);
+            settleVisualStatus();
+        },
+        [settleVisualStatus]
     );
 
     const handleVoiceSessionState = useCallback(
@@ -538,6 +565,13 @@ export function useAssistantSession() {
                 return;
             }
 
+            if (nextStatus === "settling") {
+                if (!isAudioSpeakingRef.current) {
+                    setStatus("settling");
+                }
+                return;
+            }
+
             if (nextStatus === "thinking" && isAudioSpeakingRef.current) {
                 return;
             }
@@ -554,6 +588,7 @@ export function useAssistantSession() {
         onAudioFailed: handleAudioFailed,
         onSpeechQueued: handleSpeechQueued,
         onRequestFinished: handleRequestFinished,
+        onRequestSettled: handleRequestSettled,
         onAssistantError: handleAssistantError,
         onStatus: handleStatus,
         onModel: setActiveModel,
@@ -591,6 +626,10 @@ function playbackPayload(segment: AudioSegmentReadyEvent) {
         sequence: segment.sequence,
         output_path: segment.output_path,
     };
+}
+
+function finalAssistantText(text: string) {
+    return text.trim() ? text : EMPTY_RESPONSE_FALLBACK;
 }
 
 function getVoiceRestStatus(event: VoiceSessionStateEvent): AssistantStatus | null {

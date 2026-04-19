@@ -6,6 +6,7 @@ use crate::{
     desktop_agent_types::{
         CapabilityManifest, CapabilityToolAvailability, ConversationRouteDiagnostic,
         DesktopActionRequest, DesktopActionResponse, DesktopActionStatus, ScreenAnalysisRequest,
+        ScreenAnalysisResult,
     },
     semantic_intent::{
         classify_intent, CapabilityTarget, SemanticAction, SemanticIntent, SemanticIntentKind,
@@ -29,6 +30,7 @@ pub struct ConversationRouteResult {
 
 pub struct ScreenAnalysisResultEnvelope {
     pub response_text: String,
+    pub analysis: Option<ScreenAnalysisResult>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +50,23 @@ pub async fn route_message(
 
     let (intent, source, fallback_used, classifier_error) = match classifier {
         Ok(intent) if intent.confidence >= MIN_CLASSIFIER_CONFIDENCE => {
-            (intent, "semantic_classifier".to_string(), false, None)
+            if should_override_normal_chat_with_action(&intent) {
+                if let Some(fallback) = actionable_fallback_intent(&lower, normalized) {
+                    (
+                        fallback,
+                        "heuristic_override_action_request".to_string(),
+                        true,
+                        Some(format!(
+                            "classifier selected {} for an actionable desktop request",
+                            intent.kind.as_str()
+                        )),
+                    )
+                } else {
+                    (intent, "semantic_classifier".to_string(), false, None)
+                }
+            } else {
+                (intent, "semantic_classifier".to_string(), false, None)
+            }
         }
         Ok(intent) => {
             if let Some(fallback) = fallback_intent(&lower, normalized) {
@@ -274,18 +292,20 @@ async fn route_screen_analysis(
             } else {
                 "screen_analysis_recent_capture".into()
             };
-            ConversationRoute::ScreenAnalysis(ScreenAnalysisResultEnvelope {
-                response_text: localized_owned(
-                    language,
-                    format!(
-                        "I analyzed the current screen using {}. {}",
-                        result.model, result.answer
-                    ),
-                    format!(
-                        "Ho analizzato lo schermo con {}. {}",
-                        result.model, result.answer
-                    ),
+            let response_text = localized_owned(
+                language,
+                format!(
+                    "I analyzed the current screen using {}. {}",
+                    result.model, result.answer
                 ),
+                format!(
+                    "Ho analizzato lo schermo con {}. {}",
+                    result.model, result.answer
+                ),
+            );
+            ConversationRoute::ScreenAnalysis(ScreenAnalysisResultEnvelope {
+                response_text,
+                analysis: Some(result),
             })
         }
         Err(error) => {
@@ -466,7 +486,9 @@ fn build_action_request(
                 .ok_or_else(|| "I need the app name or executable path to launch.".to_string())?;
             let path = resolve_app_alias(&app_or_path).unwrap_or(app_or_path);
             let mut args = param_string_array_any(&params, &["args", "arguments"]);
-            if args.is_empty() && wants_new_tab(original) {
+            if args.is_empty() && wants_new_window(original) {
+                args.push("--new-window".into());
+            } else if args.is_empty() && wants_new_tab(original) {
                 args.push("--new-tab".into());
             }
             Ok(DesktopActionRequest {
@@ -848,6 +870,19 @@ fn availability_for_tool<'a>(
     }
 }
 
+fn should_override_normal_chat_with_action(intent: &SemanticIntent) -> bool {
+    matches!(intent.kind, SemanticIntentKind::NormalChat | SemanticIntentKind::CapabilityQuestion)
+}
+
+fn actionable_fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
+    fallback_intent(lower, original).filter(|intent| {
+        matches!(
+            intent.kind,
+            SemanticIntentKind::ToolActionRequest | SemanticIntentKind::ScreenAnalysisRequest
+        )
+    })
+}
+
 fn fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
     if is_pending_approval_question(lower) {
         return Some(intent(
@@ -889,6 +924,9 @@ fn fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
             "file write action fallback",
         ));
     }
+    if let Some(search) = infer_browser_search_action(lower, original) {
+        return Some(search);
+    }
     if let Some(query) = strip_any_prefix(
         original,
         &[
@@ -907,6 +945,19 @@ fn fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
             "web search action fallback",
         ));
     }
+    if let Some(url) = infer_youtube_chrome_search_url(lower, original) {
+        return Some(intent(
+            SemanticIntentKind::ToolActionRequest,
+            CapabilityTarget::DesktopLaunch,
+            SemanticAction::DesktopLaunchApp,
+            json!({
+                "app": "google chrome",
+                "args": vec!["--new-window".to_string(), url],
+            }),
+            0.67,
+            "youtube chrome search fallback",
+        ));
+    }
     if looks_like_chrome_launch_request(lower) {
         return Some(intent(
             SemanticIntentKind::ToolActionRequest,
@@ -914,7 +965,13 @@ fn fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
             SemanticAction::DesktopLaunchApp,
             json!({
                 "app": "google chrome",
-                "args": if wants_new_tab(original) { vec!["--new-tab"] } else { Vec::<&str>::new() },
+                "args": if wants_new_window(original) {
+                    vec!["--new-window"]
+                } else if wants_new_tab(original) {
+                    vec!["--new-tab"]
+                } else {
+                    Vec::<&str>::new()
+                },
             }),
             0.64,
             "chrome launch fallback",
@@ -927,7 +984,13 @@ fn fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
             SemanticAction::DesktopLaunchApp,
             json!({
                 "app": "browser",
-                "args": if wants_new_tab(original) { vec!["--new-tab"] } else { Vec::<&str>::new() },
+                "args": if wants_new_window(original) {
+                    vec!["--new-window"]
+                } else if wants_new_tab(original) {
+                    vec!["--new-tab"]
+                } else {
+                    Vec::<&str>::new()
+                },
             }),
             0.58,
             "browser launch fallback",
@@ -1341,6 +1404,10 @@ fn looks_like_governed_action_request(lower: &str) -> bool {
         "run",
         "scrivi",
         "write",
+        "cerchi",
+        "cercami",
+        "sirchi",
+        "serchi",
         "cerca sul web",
         "search the web",
     ]
@@ -1351,6 +1418,10 @@ fn looks_like_governed_action_request(lower: &str) -> bool {
         ".txt",
         "browser",
         "chrome",
+        "google",
+        "youtube",
+        "web",
+        "internet",
         "terminale",
         "terminal",
         "powershell",
@@ -1412,6 +1483,280 @@ fn wants_new_tab(value: &str) -> bool {
         || lower.contains("--new-tab")
 }
 
+fn wants_new_window(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("new window")
+        || lower.contains("nuova finestra")
+        || lower.contains("finestra nuova")
+        || lower.contains("--new-window")
+}
+
+fn infer_browser_search_action(lower: &str, original: &str) -> Option<SemanticIntent> {
+    if !looks_like_search_request(lower) {
+        return None;
+    }
+
+    let mentions_chrome = lower.contains("chrome") || lower.contains("google chrome");
+    let new_window = wants_new_window(original);
+    let youtube = lower.contains("youtube") || lower.contains("you tube");
+    let google = lower.contains("google")
+        || lower.contains("web")
+        || lower.contains("internet")
+        || lower.contains("online")
+        || lower.contains("sul web");
+
+    if youtube {
+        let query = extract_search_query(original, SearchProvider::YouTube)?;
+        let url = youtube_search_url(&query);
+        if mentions_chrome {
+            return Some(desktop_launch_search_intent(
+                url,
+                new_window,
+                "youtube chrome search fallback",
+            ));
+        }
+        return Some(intent(
+            SemanticIntentKind::ToolActionRequest,
+            CapabilityTarget::Browser,
+            SemanticAction::BrowserOpenUrl,
+            json!({"url": url}),
+            0.66,
+            "youtube search URL fallback",
+        ));
+    }
+
+    if google || lower.contains("cerca") || lower.contains("cerchi") || lower.contains("sirchi") {
+        let query = extract_search_query(original, SearchProvider::Google)?;
+        if mentions_chrome {
+            return Some(desktop_launch_search_intent(
+                google_search_url(&query),
+                new_window,
+                "google chrome search fallback",
+            ));
+        }
+        return Some(intent(
+            SemanticIntentKind::ToolActionRequest,
+            CapabilityTarget::Browser,
+            SemanticAction::BrowserSearch,
+            json!({"query": query}),
+            0.64,
+            "google search action fallback",
+        ));
+    }
+
+    None
+}
+
+fn desktop_launch_search_intent(url: String, new_window: bool, rationale: &str) -> SemanticIntent {
+    let first_arg = if new_window { "--new-window" } else { "--new-tab" };
+    intent(
+        SemanticIntentKind::ToolActionRequest,
+        CapabilityTarget::DesktopLaunch,
+        SemanticAction::DesktopLaunchApp,
+        json!({
+            "app": "google chrome",
+            "args": vec![first_arg.to_string(), url],
+        }),
+        0.67,
+        rationale,
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SearchProvider {
+    Google,
+    YouTube,
+}
+
+fn looks_like_search_request(lower: &str) -> bool {
+    let search_verb = [
+        "cerca",
+        "cercami",
+        "cerchi",
+        "sirchi",
+        "serchi",
+        "search",
+        "trova",
+        "find",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let search_target = [
+        "google",
+        "youtube",
+        "you tube",
+        "web",
+        "internet",
+        "online",
+        "chrome",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    search_verb && search_target
+}
+
+fn extract_search_query(original: &str, provider: SearchProvider) -> Option<String> {
+    let mut query = strip_wake_prefix(original)
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ',' | ':' | ';'))
+        .trim()
+        .to_string();
+
+    let markers: &[&str] = match provider {
+        SearchProvider::Google => &[
+            "apri google e cerca",
+            "google e cerca",
+            "mi cerchi su google",
+            "mi sirchi su google",
+            "mi serchi su google",
+            "cercami su google",
+            "cerca su google",
+            "search google for",
+            "apri chrome in una nuova finestra e cerca",
+            "apri chrome e cerca",
+            "cerca sul web",
+            "cerca online",
+            "cercami",
+            "cerca",
+            "cerchi",
+            "sirchi",
+            "serchi",
+        ],
+        SearchProvider::YouTube => &[
+            "mi cerchi su youtube",
+            "mi sirchi su youtube",
+            "cercami su youtube",
+            "cerca su youtube",
+            "cerca youtube",
+            "search youtube for",
+            "search on youtube for",
+            "youtube",
+        ],
+    };
+
+    for marker in markers {
+        if let Some(index) = find_case_insensitive(&query, marker) {
+            let after = index + marker.len();
+            query = query[after..].trim().to_string();
+            break;
+        }
+    }
+
+    for marker in [
+        ", su una finestra",
+        " su una finestra",
+        ", in una finestra",
+        " in una finestra",
+        ", su google chrome",
+        " su google chrome",
+        ", su chrome",
+        " su chrome",
+        " sul web",
+        " su internet",
+        " online",
+    ] {
+        if let Some(index) = find_case_insensitive(&query, marker) {
+            query.truncate(index);
+        }
+    }
+
+    let query = query
+        .replace("la canzone", "")
+        .replace("canzone", "")
+        .replace("song", "")
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';'))
+        .trim()
+        .to_string();
+
+    (!query.is_empty()).then_some(query)
+}
+
+fn strip_wake_prefix(value: &str) -> String {
+    let trimmed = value.trim();
+    let lower = trimmed.to_lowercase();
+    if lower == "astra" {
+        return String::new();
+    }
+    for prefix in ["astra,", "astra ", "astra:"] {
+        if lower.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim_start().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn google_search_url(query: &str) -> String {
+    format!("https://www.google.com/search?q={}", url_encode_query(query))
+}
+
+fn youtube_search_url(query: &str) -> String {
+    format!(
+        "https://www.youtube.com/results?search_query={}",
+        url_encode_query(query)
+    )
+}
+
+fn infer_youtube_chrome_search_url(lower: &str, original: &str) -> Option<String> {
+    let mentions_youtube = lower.contains("youtube") || lower.contains("you tube");
+    let mentions_chrome = lower.contains("chrome") || lower.contains("google chrome");
+    let asks_search = lower.contains("cerca")
+        || lower.contains("cerchi")
+        || lower.contains("search")
+        || lower.contains("trova");
+    if !(mentions_youtube && mentions_chrome && asks_search) {
+        return None;
+    }
+
+    let mut query = original.trim().to_string();
+    for prefix in [
+        "mi cerchi su youtube",
+        "cercami su youtube",
+        "cerca su youtube",
+        "cerca youtube",
+        "search youtube for",
+        "search on youtube for",
+    ] {
+        if let Some(stripped) = strip_case_insensitive_prefix(&query, prefix) {
+            query = stripped.trim().to_string();
+            break;
+        }
+    }
+
+    for marker in [
+        ", su una finestra",
+        " su una finestra",
+        ", in una finestra",
+        " in una finestra",
+        ", su google chrome",
+        " su google chrome",
+        ", su chrome",
+        " su chrome",
+    ] {
+        if let Some(index) = find_case_insensitive(&query, marker) {
+            query.truncate(index);
+        }
+    }
+
+    let query = query
+        .replace("la canzone", "")
+        .replace("canzone", "")
+        .replace("song", "")
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';'))
+        .trim()
+        .to_string();
+
+    if query.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "https://www.youtube.com/results?search_query={}",
+        url_encode_query(&query)
+    ))
+}
+
 fn looks_like_chrome_launch_request(lower: &str) -> bool {
     let mentions_chrome = lower.contains("chrome") || lower.contains("google chrome");
     let launch_verb = lower.contains("apri")
@@ -1420,6 +1765,31 @@ fn looks_like_chrome_launch_request(lower: &str) -> bool {
         || lower.contains("launch")
         || lower.contains("avvia");
     mentions_chrome && launch_verb
+}
+
+fn strip_case_insensitive_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let trimmed = value.trim_start();
+    let lower = trimmed.to_lowercase();
+    lower
+        .starts_with(prefix)
+        .then(|| trimmed[prefix.len()..].trim_start())
+}
+
+fn find_case_insensitive(value: &str, needle: &str) -> Option<usize> {
+    value.to_lowercase().find(&needle.to_lowercase())
+}
+
+fn url_encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b' ' => "+".to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect::<String>()
 }
 
 fn strip_any_prefix(value: &str, prefixes: &[&str]) -> Option<String> {
@@ -1603,6 +1973,123 @@ mod tests {
             .unwrap()
             .to_ascii_lowercase()
             .contains("chrome"));
+    }
+
+    #[test]
+    fn youtube_chrome_search_fallback_builds_confirmed_launch_action() {
+        let original =
+            "mi cerchi su youtube la canzone stella stellina, su una finestra nuova di google chrome";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube chrome fallback");
+
+        assert_eq!(intent.kind, SemanticIntentKind::ToolActionRequest);
+        assert_eq!(intent.target, CapabilityTarget::DesktopLaunch);
+        assert_eq!(intent.action, SemanticAction::DesktopLaunchApp);
+
+        let action = build_action_request(&intent, original).expect("expected launch action");
+        assert_eq!(action.tool_name, "desktop.launch_app");
+        let args = action
+            .params
+            .get("args")
+            .and_then(|value| value.as_array())
+            .expect("args");
+        assert_eq!(args[0], json!("--new-window"));
+        assert!(args[1]
+            .as_str()
+            .unwrap()
+            .contains("youtube.com/results?search_query=stella+stellina"));
+    }
+
+    #[test]
+    fn google_search_fallback_handles_italian_wake_prefix() {
+        let original = "astra mi cerchi su google coca cola";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected google search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser search");
+
+        assert_eq!(action.tool_name, "browser.search");
+        assert_eq!(
+            action.params.get("query").and_then(|value| value.as_str()),
+            Some("coca cola")
+        );
+    }
+
+    #[test]
+    fn google_search_fallback_handles_noisy_stt_sirchi() {
+        let original = "astra, mi sirchi su google Coca-Cola";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected noisy search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser search");
+
+        assert_eq!(action.tool_name, "browser.search");
+        assert_eq!(
+            action.params.get("query").and_then(|value| value.as_str()),
+            Some("Coca-Cola")
+        );
+    }
+
+    #[test]
+    fn open_google_and_search_fallback_executes_search() {
+        let original = "apri google e cerca coca cola";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected google search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser search");
+
+        assert_eq!(action.tool_name, "browser.search");
+        assert_eq!(
+            action.params.get("query").and_then(|value| value.as_str()),
+            Some("coca cola")
+        );
+    }
+
+    #[test]
+    fn search_web_suffix_fallback_executes_search() {
+        let original = "cercami coca cola sul web";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected web search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser search");
+
+        assert_eq!(action.tool_name, "browser.search");
+        assert_eq!(
+            action.params.get("query").and_then(|value| value.as_str()),
+            Some("coca cola")
+        );
+    }
+
+    #[test]
+    fn youtube_search_without_chrome_opens_youtube_results() {
+        let original = "cerca su youtube stella stellina";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .contains("youtube.com/results?search_query=stella+stellina"));
+    }
+
+    #[test]
+    fn chrome_new_window_google_search_uses_desktop_launch() {
+        let original = "apri chrome in una nuova finestra e cerca coca cola";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected chrome search fallback");
+        let action = build_action_request(&intent, original).expect("expected chrome launch");
+
+        assert_eq!(action.tool_name, "desktop.launch_app");
+        let args = action
+            .params
+            .get("args")
+            .and_then(|value| value.as_array())
+            .expect("args");
+        assert_eq!(args[0], json!("--new-window"));
+        assert!(args[1]
+            .as_str()
+            .unwrap()
+            .contains("google.com/search?q=coca+cola"));
     }
 
     #[test]

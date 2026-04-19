@@ -729,6 +729,51 @@ def stabilize_tts_text(text: str) -> str:
     return text
 
 
+def prepare_worker_tts_text(text: str) -> str:
+    text = str(text)
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^\s*\+[-+=]+\+\s*$", " ", text)
+    text = re.sub(r"(?m)^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", " ", text)
+    text = re.sub(r"[{}\[\]`|]", " ", text)
+    text = re.sub(r"\b(tool_name|parameters|arguments|browser\.open|browser\.search|screen\.analyze)\b", " ", text, flags=re.IGNORECASE)
+    text = collapse_repeated_sentences(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if is_degenerate_tts_text(text):
+        log_tts_event("tts_degenerate_text_suppressed", chars=len(text))
+        return ""
+    return text
+
+
+def collapse_repeated_sentences(text: str) -> str:
+    parts = re.split(r"(?<=[.!?])\s+", str(text).strip())
+    output: list[str] = []
+    previous = ""
+    for part in parts:
+        normalized = re.sub(r"\s+", " ", part).strip()
+        if not normalized:
+            continue
+        fingerprint = normalized.lower().strip(" .!?;:")
+        if fingerprint == previous:
+            continue
+        previous = fingerprint
+        output.append(normalized)
+    return " ".join(output)
+
+
+def is_degenerate_tts_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text)).strip().lower().strip(".!?;:")
+    if not normalized:
+        return True
+    if normalized == "ho completato la richiesta":
+        return True
+    tokens = normalized.split()
+    if len(tokens) >= 8:
+        unique_ratio = len(set(tokens)) / len(tokens)
+        if unique_ratio < 0.28:
+            return True
+    return False
+
+
 def log_tts_event(event: str, **fields: Any) -> None:
     payload = {"type": "tts_worker", "event": event, **fields}
     print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
@@ -863,7 +908,9 @@ def handle_request(engine: TtsEngine, request: dict[str, Any]) -> dict[str, Any]
     request_id = str(request["request_id"])
     segment_id = str(request["segment_id"])
     sequence = int(request.get("sequence", 0))
-    text = str(request["text"])
+    text = prepare_worker_tts_text(str(request["text"]))
+    if not text:
+        raise RuntimeError("No stable speakable text after worker safety filtering")
     output_path = str(request["output_path"])
     voice = str(request.get("voice", DEFAULT_VOICE))
     speed = float(request.get("speed", DEFAULT_SPEED))

@@ -216,6 +216,37 @@ input {
     border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.message-text-block {
+    white-space: pre-wrap;
+}
+
+.message-table-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+    margin-top: 8px;
+}
+
+.message-table {
+    width: 100%;
+    min-width: 260px;
+    border-collapse: collapse;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.message-table th,
+.message-table td {
+    padding: 8px 10px;
+    border: 1px solid rgba(126, 155, 255, 0.22);
+    text-align: left;
+    vertical-align: top;
+}
+
+.message-table th {
+    background: rgba(126, 155, 255, 0.16);
+    font-weight: 700;
+}
+
 .input-panel {
     padding: 12px 18px 18px 18px;
     border-top: 1px solid rgba(255, 255, 255, 0.06);

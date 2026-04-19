@@ -4,6 +4,7 @@ import type {
     AssistantErrorEvent,
     AssistantInterruptedEvent,
     AssistantRequestFinishedEvent,
+    AssistantRequestSettledEvent,
     AssistantRequestStartedEvent,
     AssistantStatus,
     RequestMetricsSnapshot,
@@ -26,6 +27,7 @@ type UseAssistantEventsParams = {
     onAudioFailed: (event: AudioSegmentFailedEvent) => void;
     onSpeechQueued: (event: SpeechSegmentQueuedEvent) => void;
     onRequestFinished: (event: AssistantRequestFinishedEvent) => void;
+    onRequestSettled?: (event: AssistantRequestSettledEvent) => void;
     onAssistantError: (event: AssistantErrorEvent) => void;
     onStatus: (status: AssistantStatus) => void;
     onModel: (model: string) => void;
@@ -44,6 +46,7 @@ export function useAssistantEvents({
     onAudioFailed,
     onSpeechQueued,
     onRequestFinished,
+    onRequestSettled,
     onAssistantError,
     onStatus,
     onModel,
@@ -94,6 +97,12 @@ export function useAssistantEvents({
                     "assistant-request-finished",
                     (event) => {
                         if (!disposed) onRequestFinished(event.payload);
+                    }
+                );
+                const unlistenRequestSettled = await listen<AssistantRequestSettledEvent>(
+                    "assistant-request-settled",
+                    (event) => {
+                        if (!disposed) onRequestSettled?.(event.payload);
                     }
                 );
                 const unlistenError = await listen<AssistantErrorEvent>(
@@ -152,6 +161,7 @@ export function useAssistantEvents({
                     unlistenAudioFailed,
                     unlistenSpeechQueued,
                     unlistenRequestFinished,
+                    unlistenRequestSettled,
                     unlistenError,
                     unlistenStatus,
                     unlistenModel,
@@ -179,6 +189,7 @@ export function useAssistantEvents({
         onMetrics,
         onModel,
         onRequestFinished,
+        onRequestSettled,
         onRequestStarted,
         onSpeechQueued,
         onStatus,

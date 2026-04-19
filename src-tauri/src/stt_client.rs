@@ -9,7 +9,7 @@ use std::{
     },
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, watch},
     time::{sleep, Duration},
@@ -215,11 +215,8 @@ impl SttActor {
                     let _ = child.kill().await;
                     return Err(SttClientError::Timeout);
                 }
-                line = stdout.next_line() => {
-                    let line = line
-                        .map_err(|error| SttClientError::Io(format!("worker stdout read failed: {error}")))?;
-
-                    let Some(line) = line else {
+                line = read_worker_line(stdout) => {
+                    let Some(line) = line? else {
                         return Err(SttClientError::WorkerUnavailable);
                     };
 
@@ -289,6 +286,8 @@ async fn start_worker(project_root: &PathBuf) -> Result<WorkerProcess, SttClient
         .arg("-m")
         .arg("python_services.stt.stt_worker")
         .arg("--server")
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8:replace")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -308,14 +307,14 @@ async fn start_worker(project_root: &PathBuf) -> Result<WorkerProcess, SttClient
     Ok(WorkerProcess {
         child,
         stdin,
-        stdout: BufReader::new(stdout).lines(),
+        stdout: BufReader::new(stdout),
     })
 }
 
 struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: Lines<BufReader<ChildStdout>>,
+    stdout: BufReader<ChildStdout>,
 }
 
 #[derive(Debug, Serialize)]
@@ -329,4 +328,31 @@ struct WorkerResponse {
     audio_path: String,
     text: Option<String>,
     error: Option<String>,
+}
+
+async fn read_worker_line(
+    stdout: &mut BufReader<ChildStdout>,
+) -> Result<Option<String>, SttClientError> {
+    let mut bytes = Vec::new();
+    let read = stdout
+        .read_until(b'\n', &mut bytes)
+        .await
+        .map_err(|error| SttClientError::Io(format!("worker stdout read failed: {error}")))?;
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(decode_worker_stdout_line(&bytes)))
+}
+
+fn decode_worker_stdout_line(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim_end_matches(['\r', '\n']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn invalid_utf8_worker_stdout_is_lossy_decoded() {
+        let decoded = super::decode_worker_stdout_line(b"{\"ok\":false}\xff\n");
+        assert!(decoded.starts_with("{\"ok\":false}"));
+    }
 }

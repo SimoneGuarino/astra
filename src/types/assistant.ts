@@ -4,7 +4,8 @@ export type AssistantStatus =
     | "armed"
     | "thinking"
     | "listening"
-    | "speaking";
+    | "speaking"
+    | "settling";
 
 export type ChatMessage = {
     id: string;
@@ -27,6 +28,11 @@ export type AssistantRequestStartedEvent = {
 export type AssistantRequestFinishedEvent = {
     request_id: string;
     full_text: string;
+};
+
+export type AssistantRequestSettledEvent = {
+    request_id: string;
+    had_tts_failures: boolean;
 };
 
 export type AssistantErrorEvent = {

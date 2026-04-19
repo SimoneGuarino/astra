@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
     CapabilityManifest,
@@ -81,18 +81,34 @@ export function useDesktopAgent() {
         []
     );
 
-    return {
-        analyzeScreenContext,
-        approveAction,
-        captureScreenSnapshot,
-        executeAction,
-        getCapabilityManifest,
-        getPendingApprovals,
-        getPolicySnapshot,
-        getRecentAuditEvents,
-        getScreenObservationStatus,
-        listTools,
-        rejectAction,
-        setScreenObservationEnabled,
-    };
+    return useMemo(
+        () => ({
+            analyzeScreenContext,
+            approveAction,
+            captureScreenSnapshot,
+            executeAction,
+            getCapabilityManifest,
+            getPendingApprovals,
+            getPolicySnapshot,
+            getRecentAuditEvents,
+            getScreenObservationStatus,
+            listTools,
+            rejectAction,
+            setScreenObservationEnabled,
+        }),
+        [
+            analyzeScreenContext,
+            approveAction,
+            captureScreenSnapshot,
+            executeAction,
+            getCapabilityManifest,
+            getPendingApprovals,
+            getPolicySnapshot,
+            getRecentAuditEvents,
+            getScreenObservationStatus,
+            listTools,
+            rejectAction,
+            setScreenObservationEnabled,
+        ]
+    );
 }

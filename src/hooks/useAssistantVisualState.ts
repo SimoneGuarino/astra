@@ -8,6 +8,7 @@ export function useAssistantVisualState(status: AssistantStatus) {
         if (status === "thinking") return "Elaboro...";
         if (status === "listening") return "Ti ascolto...";
         if (status === "speaking") return "Sto parlando...";
+        if (status === "settling") return "Sto finendo...";
         return "Online";
     }, [status]);
 }

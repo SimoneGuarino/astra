@@ -12,6 +12,7 @@ const ORB_STATE_LABEL: Record<AssistantStatus, string> = {
   thinking: "ELABORO",
   listening: "ASCOLTO",
   speaking: "VOCE",
+  settling: "FINISCO",
 };
 
 export default function AstraOrb({ status }: AstraOrbProps) {
