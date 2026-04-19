@@ -1,20 +1,42 @@
+mod action_policy;
+mod audit_log;
 mod audio_files;
+mod browser_agent;
+mod capability_manifest;
+mod assistant_context;
+mod conversation_router;
 mod conversation_history;
+mod desktop_agent;
+mod desktop_agent_types;
+mod filesystem_service;
+mod pending_approvals_store;
 mod metrics;
 mod model_routing;
+mod permissions;
 mod speech_events;
 mod stt_client;
+mod terminal_runner;
 mod text_segmentation;
+mod screen_capture;
+mod screen_vision;
+mod tools_registry;
 mod tts_client;
 mod vad;
 mod voice_metrics;
 mod voice_session;
 
 use audio_files::AudioFileRegistry;
+use desktop_agent::DesktopAgentRuntime;
+use desktop_agent_types::{
+    ApprovalDecisionRequest, CapabilityManifest, DesktopActionRequest, DesktopActionResponse, DesktopAuditEvent,
+    DesktopPolicySnapshot, PendingApproval, ScreenAnalysisRequest, ScreenAnalysisResult, ScreenCaptureResult, ScreenObservationStatus, ToolDescriptor,
+};
 use conversation_history::ConversationHistoryManager;
 use futures_util::StreamExt;
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
 use model_routing::resolve_ollama_request;
+use assistant_context::build_capability_context;
+use conversation_router::{route_message, ConversationRoute};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use speech_events::{
@@ -63,6 +85,7 @@ struct AssistantRuntime {
     voice_metrics: VoiceMetricsTracker,
     voice_session: VoiceSessionManager,
     conversation_history: ConversationHistoryManager,
+    desktop_agent: DesktopAgentRuntime,
 }
 
 impl AssistantRuntime {
@@ -88,8 +111,9 @@ impl AssistantRuntime {
             stt_client: SttClient::new(project_root.clone()),
             tts_client: TtsClient::new(project_root.clone()),
             voice_metrics: VoiceMetricsTracker::new(),
-            voice_session: VoiceSessionManager::new(project_root),
+            voice_session: VoiceSessionManager::new(project_root.clone()),
             conversation_history: ConversationHistoryManager::new(),
+            desktop_agent: DesktopAgentRuntime::new(project_root),
         }
     }
 
@@ -209,48 +233,74 @@ async fn start_assistant_response(
     display_user_message: Option<String>,
     source: &str,
 ) -> Result<StartChatResponse, String> {
-    let request_id = Uuid::new_v4().to_string();
     let history = runtime.conversation_history.recent_messages(10);
-    let resolved = resolve_ollama_request(&message, source, &history).await?;
+    let manifest = runtime.desktop_agent.capability_manifest().await;
+
+    match route_message(&runtime.desktop_agent, &manifest, &message).await? {
+        ConversationRoute::DirectResponse(response_text) => {
+            return start_grounded_response(
+                window,
+                runtime,
+                message,
+                display_user_message,
+                source,
+                response_text,
+                "capability-router",
+            )
+            .await;
+        }
+        ConversationRoute::ActionResponse(action_response) => {
+            let response_text = summarize_action_response(&action_response);
+            return start_grounded_response(
+                window,
+                runtime,
+                message,
+                display_user_message,
+                source,
+                response_text,
+                "desktop-agent",
+            )
+            .await;
+        }
+        ConversationRoute::ScreenAnalysis(result) => {
+            let response_text = format!(
+                "I analyzed the current screen using {}. {}",
+                result.model, result.answer
+            );
+            return start_grounded_response(
+                window,
+                runtime,
+                message,
+                display_user_message,
+                source,
+                response_text,
+                "screen-vision",
+            )
+            .await;
+        }
+        ConversationRoute::Continue => {}
+    }
+
+    let request_id = Uuid::new_v4().to_string();
+    let assistant_context = build_capability_context(&manifest);
+    let resolved = resolve_ollama_request(&message, source, &history, Some(&assistant_context)).await?;
     let model = resolved.model.clone();
 
     runtime.begin_request(request_id.clone());
-    let history_user_message = display_user_message
-        .clone()
-        .unwrap_or_else(|| message.clone());
-    runtime
-        .conversation_history
-        .begin_turn(request_id.clone(), &history_user_message);
+    let history_user_message = display_user_message.clone().unwrap_or_else(|| message.clone());
+    runtime.conversation_history.begin_turn(request_id.clone(), &history_user_message);
 
-    let metrics_snapshot = runtime
-        .metrics
-        .start_request(request_id.clone(), model.clone(), message.chars().count());
+    let metrics_snapshot = runtime.metrics.start_request(request_id.clone(), model.clone(), message.chars().count());
 
-    emit_request_started(
-        &window,
-        &request_id,
-        &model,
-        source,
-        display_user_message.clone(),
-    )?;
+    emit_request_started(&window, &request_id, &model, source, display_user_message.clone())?;
     emit_metrics_update(&window, &metrics_snapshot);
-    window
-        .emit("assistant-status", "thinking")
-        .map_err(|error| format!("assistant-status emit failed: {error}"))?;
+    window.emit("assistant-status", "thinking").map_err(|error| format!("assistant-status emit failed: {error}"))?;
 
     let task_window = window.clone();
     let task_runtime = runtime.clone();
     let task_request_id = request_id.clone();
-
     tauri::async_runtime::spawn(async move {
-        let result = run_ollama_stream(
-            task_window.clone(),
-            task_runtime.clone(),
-            task_request_id.clone(),
-            resolved,
-        )
-        .await;
-
+        let result = run_ollama_stream(task_window.clone(), task_runtime.clone(), task_request_id.clone(), resolved).await;
         if let Err(message) = result {
             task_runtime.conversation_history.discard_turn(&task_request_id);
             if task_runtime.is_active(&task_request_id) {
@@ -261,6 +311,49 @@ async fn start_assistant_response(
     });
 
     Ok(StartChatResponse { request_id, model })
+}
+
+async fn start_grounded_response(
+    window: WebviewWindow,
+    runtime: AssistantRuntime,
+    original_message: String,
+    display_user_message: Option<String>,
+    source: &str,
+    response_text: String,
+    model_label: &str,
+) -> Result<StartChatResponse, String> {
+    let request_id = Uuid::new_v4().to_string();
+    runtime.begin_request(request_id.clone());
+    let history_user_message = display_user_message.clone().unwrap_or_else(|| original_message.clone());
+    runtime.conversation_history.begin_turn(request_id.clone(), &history_user_message);
+    let metrics_snapshot = runtime.metrics.start_request(request_id.clone(), model_label.to_string(), original_message.chars().count());
+    emit_request_started(&window, &request_id, model_label, source, display_user_message)?;
+    emit_metrics_update(&window, &metrics_snapshot);
+    if let Some(snapshot) = runtime.metrics.mark_first_llm_chunk(&request_id) { emit_metrics_update(&window, &snapshot); }
+    if let Some(snapshot) = runtime.metrics.mark_llm_completed(&request_id) { emit_metrics_update(&window, &snapshot); }
+    window.emit("assistant-status", "thinking").map_err(|error| format!("assistant-status emit failed: {error}"))?;
+    runtime.conversation_history.commit_turn(&request_id, &response_text);
+    window.emit("assistant-stream-chunk", StreamChunkEvent { request_id: request_id.clone(), chunk: response_text.clone() }).map_err(|error| format!("assistant-stream-chunk emit failed: {error}"))?;
+    let mut segmenter = SentenceSegmenter::new();
+    for segment in segmenter.push(&response_text) { spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment); }
+    for segment in segmenter.flush() { spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment); }
+    window.emit("assistant-request-finished", AssistantRequestFinishedEvent { request_id: request_id.clone(), full_text: response_text }).map_err(|error| format!("assistant-request-finished emit failed: {error}"))?;
+    window.emit("assistant-status", "idle").map_err(|error| format!("assistant-status idle emit failed: {error}"))?;
+    Ok(StartChatResponse { request_id, model: model_label.to_string() })
+}
+
+fn summarize_action_response(response: &DesktopActionResponse) -> String {
+    match response.status {
+        crate::desktop_agent_types::DesktopActionStatus::Executed => {
+            if let Some(result) = &response.result { format!("I executed {} successfully. Result: {}", response.tool_name, result) }
+            else { format!("I executed {} successfully.", response.tool_name) }
+        }
+        crate::desktop_agent_types::DesktopActionStatus::ApprovalRequired => {
+            format!("{} is available, but this action requires your approval before I can execute it. I have created a pending approval.", response.tool_name)
+        }
+        crate::desktop_agent_types::DesktopActionStatus::Rejected => format!("The action for {} was rejected.", response.tool_name),
+        crate::desktop_agent_types::DesktopActionStatus::Failed => response.message.clone().unwrap_or_else(|| format!("The action for {} failed.", response.tool_name)),
+    }
 }
 
 async fn run_ollama_stream(
@@ -1147,6 +1240,95 @@ fn audio_extension_for_mime_type(mime_type: &str) -> &'static str {
 }
 
 #[tauri::command]
+fn list_desktop_tools(state: State<'_, AssistantRuntime>) -> Result<Vec<ToolDescriptor>, String> {
+    Ok(state.desktop_agent.list_tools())
+}
+
+#[tauri::command]
+fn get_desktop_policy_snapshot(
+    state: State<'_, AssistantRuntime>,
+) -> Result<DesktopPolicySnapshot, String> {
+    Ok(state.desktop_agent.policy_snapshot())
+}
+
+#[tauri::command]
+fn get_pending_desktop_approvals(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Vec<PendingApproval>, String> {
+    Ok(state.desktop_agent.pending_approvals())
+}
+
+#[tauri::command]
+fn get_recent_desktop_audit_events(
+    state: State<'_, AssistantRuntime>,
+    limit: Option<usize>,
+) -> Result<Vec<DesktopAuditEvent>, String> {
+    Ok(state.desktop_agent.recent_audit_events(limit.unwrap_or(50)))
+}
+
+#[tauri::command]
+fn execute_desktop_action(
+    state: State<'_, AssistantRuntime>,
+    payload: DesktopActionRequest,
+) -> Result<DesktopActionResponse, String> {
+    let request_id = Uuid::new_v4().to_string();
+    state.desktop_agent.submit_action(request_id, payload)
+}
+
+#[tauri::command]
+fn approve_desktop_action(
+    state: State<'_, AssistantRuntime>,
+    payload: ApprovalDecisionRequest,
+) -> Result<DesktopActionResponse, String> {
+    state.desktop_agent.approve_pending(&payload.action_id, payload.note)
+}
+
+#[tauri::command]
+fn reject_desktop_action(
+    state: State<'_, AssistantRuntime>,
+    payload: ApprovalDecisionRequest,
+) -> Result<(), String> {
+    state.desktop_agent.reject_pending(&payload.action_id, payload.note)
+}
+
+#[tauri::command]
+async fn get_capability_manifest(
+    state: State<'_, AssistantRuntime>,
+) -> Result<CapabilityManifest, String> {
+    Ok(state.desktop_agent.capability_manifest().await)
+}
+
+#[tauri::command]
+fn get_screen_observation_status(
+    state: State<'_, AssistantRuntime>,
+) -> Result<ScreenObservationStatus, String> {
+    Ok(state.desktop_agent.screen_status())
+}
+
+#[tauri::command]
+fn set_screen_observation_enabled(
+    state: State<'_, AssistantRuntime>,
+    enabled: bool,
+) -> Result<ScreenObservationStatus, String> {
+    Ok(state.desktop_agent.set_screen_observation_enabled(enabled))
+}
+
+#[tauri::command]
+fn capture_screen_snapshot(
+    state: State<'_, AssistantRuntime>,
+) -> Result<ScreenCaptureResult, String> {
+    state.desktop_agent.capture_screen_snapshot()
+}
+
+#[tauri::command]
+async fn analyze_screen_context(
+    state: State<'_, AssistantRuntime>,
+    payload: ScreenAnalysisRequest,
+) -> Result<ScreenAnalysisResult, String> {
+    state.desktop_agent.analyze_screen(payload).await
+}
+
+#[tauri::command]
 fn minimize_window(window: WebviewWindow) -> Result<(), String> {
     window.minimize().map_err(|error| error.to_string())
 }
@@ -1219,6 +1401,18 @@ pub fn run() {
             voice_session_audio_chunk,
             transcribe_voice_input,
             cancel_voice_input,
+            list_desktop_tools,
+            get_desktop_policy_snapshot,
+            get_pending_desktop_approvals,
+            get_recent_desktop_audit_events,
+            execute_desktop_action,
+            approve_desktop_action,
+            reject_desktop_action,
+            get_capability_manifest,
+            get_screen_observation_status,
+            set_screen_observation_enabled,
+            capture_screen_snapshot,
+            analyze_screen_context,
             minimize_window,
             toggle_always_on_top,
             close_window,

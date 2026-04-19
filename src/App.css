@@ -347,3 +347,173 @@ input {
     justify-content: center;
     align-items: center;
 }
+
+.desktop-agent-panel {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(247, 250, 255, 0.86);
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    max-height: 42%;
+    overflow: hidden;
+}
+
+.desktop-agent-panel__header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.desktop-agent-panel__header h2 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.desktop-agent-panel__kicker,
+.desktop-agent-panel__subtitle,
+.desktop-agent-muted {
+    margin: 0;
+    color: rgba(58, 79, 128, 0.72);
+    font-size: 12px;
+}
+
+.desktop-agent-tabs {
+    display: flex;
+    gap: 8px;
+}
+
+.desktop-agent-tab {
+    border: 1px solid rgba(102, 127, 210, 0.16);
+    background: rgba(255, 255, 255, 0.72);
+    color: #4361c2;
+    border-radius: 999px;
+    padding: 7px 12px;
+    text-transform: capitalize;
+    cursor: pointer;
+}
+
+.desktop-agent-tab.active {
+    background: rgba(87, 121, 255, 0.14);
+    border-color: rgba(87, 121, 255, 0.3);
+}
+
+.desktop-agent-section {
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.desktop-agent-card-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.desktop-agent-card {
+    border: 1px solid rgba(115, 143, 255, 0.18);
+    background: rgba(255, 255, 255, 0.78);
+    border-radius: 16px;
+    padding: 12px;
+}
+
+.desktop-agent-card h3,
+.desktop-agent-approval-header h3 {
+    margin: 0 0 6px 0;
+    font-size: 14px;
+}
+
+.desktop-agent-inline-actions,
+.desktop-agent-panel__actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.desktop-agent-tools-list,
+.desktop-agent-json {
+    max-height: 180px;
+    overflow: auto;
+}
+
+.desktop-agent-tool-row,
+.desktop-agent-audit-header,
+.desktop-agent-approval-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.desktop-agent-tool-row p,
+.desktop-agent-approval-header p,
+.desktop-agent-audit-card p {
+    margin: 4px 0 0 0;
+    font-size: 12px;
+    color: rgba(70, 79, 110, 0.8);
+}
+
+.desktop-agent-json {
+    margin: 0;
+    padding: 10px;
+    border-radius: 12px;
+    background: rgba(20, 29, 56, 0.06);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.desktop-agent-empty,
+.desktop-agent-error {
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 13px;
+}
+
+.desktop-agent-empty {
+    background: rgba(255, 255, 255, 0.65);
+    color: rgba(64, 78, 120, 0.84);
+}
+
+.desktop-agent-error {
+    background: rgba(255, 89, 94, 0.12);
+    color: rgba(154, 34, 55, 0.96);
+}
+
+
+.desktop-agent-textarea {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  background: rgba(10, 14, 24, 0.88);
+  border: 1px solid rgba(136, 181, 255, 0.2);
+  color: #ecf4ff;
+  border-radius: 14px;
+  padding: 12px 14px;
+  font: inherit;
+}
+
+.desktop-agent-checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  color: rgba(230, 240, 255, 0.8);
+}
+
+.desktop-agent-screen-result {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 16px;
+  background: rgba(10, 14, 24, 0.78);
+  border: 1px solid rgba(136, 181, 255, 0.14);
+}
+
+.desktop-agent-screen-answer {
+  margin-top: 10px;
+  white-space: pre-wrap;
+  line-height: 1.55;
+  color: #f3f8ff;
+}

@@ -19,11 +19,12 @@ pub async fn resolve_ollama_request(
     message: &str,
     source: &str,
     history: &[ConversationMessage],
+    assistant_context: Option<&str>,
 ) -> Result<ResolvedOllamaRequest, String> {
     let source_kind = RequestSource::from_source(source);
     let installed_models = fetch_installed_models().await.unwrap_or_default();
     let model = select_model(message, source_kind, &installed_models);
-    let system_prompt = build_system_prompt(source_kind, message);
+    let system_prompt = build_system_prompt(source_kind, message, assistant_context);
     let messages = build_messages(&system_prompt, history, message);
     let options = build_options(source_kind, message);
 
@@ -149,7 +150,7 @@ fn looks_reasoning_heavy(message: &str) -> bool {
     message.chars().count() > 180 || keywords.iter().any(|keyword| lower.contains(keyword))
 }
 
-fn build_system_prompt(source: RequestSource, message: &str) -> String {
+fn build_system_prompt(source: RequestSource, message: &str, assistant_context: Option<&str>) -> String {
     let reasoning = looks_reasoning_heavy(message);
     match source {
         RequestSource::Voice => {
@@ -158,9 +159,16 @@ fn build_system_prompt(source: RequestSource, message: &str) -> String {
             } else {
                 "Per richieste semplici, rispondi in 1-3 frasi brevi."
             };
-            format!(
+            let mut prompt = format!(
                 "Sei Astra, un'assistente AI locale. Devi parlare in italiano molto naturale, caldo, rapido e conversazionale, con una voce percepita simile a un assistente premium. Non usare markdown. Non usare elenchi puntati salvo richiesta esplicita. Evita meta-commenti, ripetizioni, filler inutili e spiegazioni prolisse. Usa aperture brevi solo quando aiutano il ritmo, per esempio: 'Certo,', 'Sì,', 'Va bene,'. Se serve fare una domanda, fanne una sola e molto breve. {brevity} Mantieni precisione tecnica quando serve, ma con resa orale pulita."
-            )
+            );
+            if let Some(context) = assistant_context.filter(|value| !value.trim().is_empty()) {
+                prompt.push_str("
+
+");
+                prompt.push_str(context);
+            }
+            prompt
         }
         RequestSource::Typed => {
             let detail = if reasoning {
@@ -168,9 +176,16 @@ fn build_system_prompt(source: RequestSource, message: &str) -> String {
             } else {
                 "Per richieste semplici, sii diretta, fluida e naturale."
             };
-            format!(
+            let mut prompt = format!(
                 "Sei Astra, un'assistente AI locale molto competente. Rispondi in italiano naturale, chiaro e professionale. Evita ripetizioni e tono robotico. Se utile, usa una struttura leggibile, ma senza gonfiare la risposta. {detail}"
-            )
+            );
+            if let Some(context) = assistant_context.filter(|value| !value.trim().is_empty()) {
+                prompt.push_str("
+
+");
+                prompt.push_str(context);
+            }
+            prompt
         }
     }
 }

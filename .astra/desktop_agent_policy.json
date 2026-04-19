@@ -1,0 +1,22 @@
+{
+  "allowed_roots": [
+    "C:\\Users\\Simone\\personal_ai\\personal_ai",
+    "C:\\Users\\Simone\\Desktop"
+  ],
+  "terminal_allowed_commands": [
+    "git",
+    "cargo",
+    "npm",
+    "pnpm",
+    "yarn",
+    "python",
+    "py",
+    "dir",
+    "type",
+    "rg",
+    "ls"
+  ],
+  "approval_required_for_high_risk": true,
+  "browser_enabled": true,
+  "desktop_control_enabled": true
+}

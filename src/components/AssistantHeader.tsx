@@ -8,9 +8,11 @@ import { Button } from "../ui/buttons/Button";
 type AssistantHeaderProps = {
     activeModel: string;
     isPinned: boolean;
+    isDesktopPanelOpen: boolean;
     onClose: () => void;
     onMinimize: () => void;
     onTogglePin: () => void;
+    onToggleDesktopPanel: () => void;
     startDrag: (e: React.MouseEvent) => void;
     status: AssistantStatus;
     statusLabel: string;
@@ -19,8 +21,10 @@ type AssistantHeaderProps = {
 export function AssistantHeader({
     activeModel,
     isPinned,
+    isDesktopPanelOpen,
     onClose,
     onMinimize,
+    onToggleDesktopPanel,
     onTogglePin,
     startDrag,
     status,
@@ -38,6 +42,9 @@ export function AssistantHeader({
                 </div>
 
                 <div className="flex">
+                    <Button variant="text" radius="full" size="xs" title="Desktop agent panel" onClick={onToggleDesktopPanel}>
+                        {isDesktopPanelOpen ? "Agent −" : "Agent +"}
+                    </Button>
                     <Button variant="text" radius="full" size="xs" title={isPinned ? "Rimuovi fissaggio" : "Fissa la finestra sempre on top"} onClick={onTogglePin}>
                         {isPinned ? <LuMonitorOff /> : <LuMonitor />}
                     </Button>
