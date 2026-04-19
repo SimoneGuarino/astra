@@ -1,5 +1,10 @@
 use crate::desktop_agent_types::PendingApproval;
-use std::{collections::HashMap, fs, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone)]
 pub struct PendingApprovalsStore {
@@ -16,11 +21,17 @@ impl PendingApprovalsStore {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        Self { path, lock: Arc::new(Mutex::new(())) }
+        Self {
+            path,
+            lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn load(&self) -> HashMap<String, PendingApproval> {
-        let _guard = self.lock.lock().expect("pending approvals store mutex poisoned");
+        let _guard = self
+            .lock
+            .lock()
+            .expect("pending approvals store mutex poisoned");
         let Ok(raw) = fs::read_to_string(&self.path) else {
             return HashMap::new();
         };
@@ -32,7 +43,10 @@ impl PendingApprovalsStore {
     }
 
     pub fn save(&self, approvals: impl IntoIterator<Item = PendingApproval>) -> Result<(), String> {
-        let _guard = self.lock.lock().expect("pending approvals store mutex poisoned");
+        let _guard = self
+            .lock
+            .lock()
+            .expect("pending approvals store mutex poisoned");
         let values: Vec<PendingApproval> = approvals.into_iter().collect();
         let raw = serde_json::to_string_pretty(&values).map_err(|e| e.to_string())?;
         fs::write(&self.path, raw).map_err(|e| e.to_string())

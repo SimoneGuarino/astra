@@ -49,13 +49,24 @@ impl ConversationHistoryManager {
             return;
         }
 
-        let mut state = self.inner.lock().expect("conversation history mutex poisoned");
-        state.pending.insert(request_id, PendingTurn { user_message: normalized });
+        let mut state = self
+            .inner
+            .lock()
+            .expect("conversation history mutex poisoned");
+        state.pending.insert(
+            request_id,
+            PendingTurn {
+                user_message: normalized,
+            },
+        );
     }
 
     pub fn commit_turn(&self, request_id: &str, assistant_message: &str) {
         let assistant_message = sanitize_message(assistant_message, self.max_chars_per_message());
-        let mut state = self.inner.lock().expect("conversation history mutex poisoned");
+        let mut state = self
+            .inner
+            .lock()
+            .expect("conversation history mutex poisoned");
         let Some(pending) = state.pending.remove(request_id) else {
             return;
         };
@@ -78,18 +89,27 @@ impl ConversationHistoryManager {
     }
 
     pub fn discard_turn(&self, request_id: &str) {
-        let mut state = self.inner.lock().expect("conversation history mutex poisoned");
+        let mut state = self
+            .inner
+            .lock()
+            .expect("conversation history mutex poisoned");
         state.pending.remove(request_id);
     }
 
     pub fn recent_messages(&self, limit: usize) -> Vec<ConversationMessage> {
-        let state = self.inner.lock().expect("conversation history mutex poisoned");
+        let state = self
+            .inner
+            .lock()
+            .expect("conversation history mutex poisoned");
         let start = state.committed.len().saturating_sub(limit);
         state.committed.iter().skip(start).cloned().collect()
     }
 
     fn max_chars_per_message(&self) -> usize {
-        let state = self.inner.lock().expect("conversation history mutex poisoned");
+        let state = self
+            .inner
+            .lock()
+            .expect("conversation history mutex poisoned");
         state.max_chars_per_message
     }
 }
@@ -105,5 +125,10 @@ fn sanitize_message(message: &str, max_chars: usize) -> String {
         return trimmed.to_string();
     }
 
-    trimmed.chars().take(max_chars).collect::<String>().trim().to_string()
+    trimmed
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }

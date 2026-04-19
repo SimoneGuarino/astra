@@ -140,17 +140,48 @@ fn env_candidates(key: &str, fallback: &str) -> Vec<String> {
 fn looks_reasoning_heavy(message: &str) -> bool {
     let lower = message.to_lowercase();
     let keywords = [
-        "codice", "code", "bug", "debug", "refactor", "architecture", "architettura",
-        "ottimizza", "optimize", "analyze", "analizza", "implement", "implementa",
-        "progetta", "sviluppa", "backend", "frontend", "typescript", "rust", "python",
-        "go", "sql", "database", "algoritmo", "performance", "scalabilita", "enterprise",
-        "spiega nel dettaglio", "analisi", "design", "tradeoff", "trade-off",
+        "codice",
+        "code",
+        "bug",
+        "debug",
+        "refactor",
+        "architecture",
+        "architettura",
+        "ottimizza",
+        "optimize",
+        "analyze",
+        "analizza",
+        "implement",
+        "implementa",
+        "progetta",
+        "sviluppa",
+        "backend",
+        "frontend",
+        "typescript",
+        "rust",
+        "python",
+        "go",
+        "sql",
+        "database",
+        "algoritmo",
+        "performance",
+        "scalabilita",
+        "enterprise",
+        "spiega nel dettaglio",
+        "analisi",
+        "design",
+        "tradeoff",
+        "trade-off",
     ];
 
     message.chars().count() > 180 || keywords.iter().any(|keyword| lower.contains(keyword))
 }
 
-fn build_system_prompt(source: RequestSource, message: &str, assistant_context: Option<&str>) -> String {
+fn build_system_prompt(
+    source: RequestSource,
+    message: &str,
+    assistant_context: Option<&str>,
+) -> String {
     let reasoning = looks_reasoning_heavy(message);
     match source {
         RequestSource::Voice => {
@@ -163,9 +194,11 @@ fn build_system_prompt(source: RequestSource, message: &str, assistant_context: 
                 "Sei Astra, un'assistente AI locale. Devi parlare in italiano molto naturale, caldo, rapido e conversazionale, con una voce percepita simile a un assistente premium. Non usare markdown. Non usare elenchi puntati salvo richiesta esplicita. Evita meta-commenti, ripetizioni, filler inutili e spiegazioni prolisse. Usa aperture brevi solo quando aiutano il ritmo, per esempio: 'Certo,', 'Sì,', 'Va bene,'. Se serve fare una domanda, fanne una sola e molto breve. {brevity} Mantieni precisione tecnica quando serve, ma con resa orale pulita."
             );
             if let Some(context) = assistant_context.filter(|value| !value.trim().is_empty()) {
-                prompt.push_str("
+                prompt.push_str(
+                    "
 
-");
+",
+                );
                 prompt.push_str(context);
             }
             prompt
@@ -180,9 +213,11 @@ fn build_system_prompt(source: RequestSource, message: &str, assistant_context: 
                 "Sei Astra, un'assistente AI locale molto competente. Rispondi in italiano naturale, chiaro e professionale. Evita ripetizioni e tono robotico. Se utile, usa una struttura leggibile, ma senza gonfiare la risposta. {detail}"
             );
             if let Some(context) = assistant_context.filter(|value| !value.trim().is_empty()) {
-                prompt.push_str("
+                prompt.push_str(
+                    "
 
-");
+",
+                );
                 prompt.push_str(context);
             }
             prompt
@@ -190,7 +225,11 @@ fn build_system_prompt(source: RequestSource, message: &str, assistant_context: 
     }
 }
 
-fn build_messages(system_prompt: &str, history: &[ConversationMessage], message: &str) -> Vec<Value> {
+fn build_messages(
+    system_prompt: &str,
+    history: &[ConversationMessage],
+    message: &str,
+) -> Vec<Value> {
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(json!({"role": "system", "content": system_prompt}));
 

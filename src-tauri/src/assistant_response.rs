@@ -95,16 +95,28 @@ pub fn render_action_response(
         }
         DesktopActionStatus::Rejected => {
             if italian {
-                format!("L'azione {} e' stata rifiutata.", friendly_tool_name(&response.tool_name))
+                format!(
+                    "L'azione {} e' stata rifiutata.",
+                    friendly_tool_name(&response.tool_name)
+                )
             } else {
-                format!("The {} action was rejected.", friendly_tool_name(&response.tool_name))
+                format!(
+                    "The {} action was rejected.",
+                    friendly_tool_name(&response.tool_name)
+                )
             }
         }
         DesktopActionStatus::Failed => response.message.clone().unwrap_or_else(|| {
             if italian {
-                format!("L'azione {} non e' riuscita.", friendly_tool_name(&response.tool_name))
+                format!(
+                    "L'azione {} non e' riuscita.",
+                    friendly_tool_name(&response.tool_name)
+                )
             } else {
-                format!("The {} action failed.", friendly_tool_name(&response.tool_name))
+                format!(
+                    "The {} action failed.",
+                    friendly_tool_name(&response.tool_name)
+                )
             }
         }),
     };
@@ -149,7 +161,9 @@ pub fn sanitize_display_text(text: &str) -> String {
 }
 
 pub fn present_display_text(text: &str) -> String {
-    normalize_ascii_tables(&strip_embedded_diagnostic_payloads(&sanitize_display_text(text)))
+    normalize_ascii_tables(&strip_embedded_diagnostic_payloads(&sanitize_display_text(
+        text,
+    )))
 }
 
 pub fn speech_safe_text(text: &str) -> String {
@@ -275,9 +289,15 @@ fn render_executed_action(response: &DesktopActionResponse, italian: bool) -> St
         "desktop.launch_app" => render_desktop_launch(response, italian),
         _ => {
             if italian {
-                format!("Ho eseguito {} correttamente.", friendly_tool_name(&response.tool_name))
+                format!(
+                    "Ho eseguito {} correttamente.",
+                    friendly_tool_name(&response.tool_name)
+                )
             } else {
-                format!("I executed {} successfully.", friendly_tool_name(&response.tool_name))
+                format!(
+                    "I executed {} successfully.",
+                    friendly_tool_name(&response.tool_name)
+                )
             }
         }
     }
@@ -653,13 +673,21 @@ fn structured_speech_summary(text: &str) -> Option<String> {
 
     if table.rows.len() > 3 {
         parts.push(if italian {
-            format!("Ci sono altre {} righe visibili in chat.", table.rows.len() - 3)
+            format!(
+                "Ci sono altre {} righe visibili in chat.",
+                table.rows.len() - 3
+            )
         } else {
-            format!("There are {} more rows visible in chat.", table.rows.len() - 3)
+            format!(
+                "There are {} more rows visible in chat.",
+                table.rows.len() - 3
+            )
         });
     }
 
-    Some(suppress_repeated_sentences(&collapse_whitespace(&parts.join(" "))))
+    Some(suppress_repeated_sentences(&collapse_whitespace(
+        &parts.join(" "),
+    )))
 }
 
 fn first_table_with_preface(text: &str) -> Option<(ParsedTable, String)> {
@@ -737,11 +765,19 @@ fn markdown_table(table: &ParsedTable) -> String {
     lines.push(format!("| {} |", headers.join(" | ")));
     lines.push(format!(
         "| {} |",
-        headers.iter().map(|_| "---").collect::<Vec<_>>().join(" | ")
+        headers
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
     ));
     for row in &table.rows {
         let cells = (0..headers.len())
-            .map(|index| row.get(index).map(|cell| escape_table_cell(cell)).unwrap_or_default())
+            .map(|index| {
+                row.get(index)
+                    .map(|cell| escape_table_cell(cell))
+                    .unwrap_or_default()
+            })
             .collect::<Vec<_>>();
         lines.push(format!("| {} |", cells.join(" | ")));
     }
@@ -761,10 +797,7 @@ fn is_tableish_line(line: &str) -> bool {
 
 fn is_markdown_separator_cell(cell: &str) -> bool {
     let trimmed = cell.trim();
-    !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|ch| matches!(ch, '-' | ':' | ' '))
+    !trimmed.is_empty() && trimmed.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
 }
 
 fn escape_table_cell(cell: &str) -> String {
@@ -836,7 +869,11 @@ fn content_preview(content: &str) -> String {
         return String::new();
     }
 
-    let truncated = content.lines().filter(|line| !line.trim().is_empty()).count() > lines.len();
+    let truncated = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        > lines.len();
     let mut preview = lines.drain(..).collect::<Vec<_>>().join("\n");
     if preview.chars().count() > 2_000 {
         preview = preview.chars().take(2_000).collect::<String>();
@@ -882,8 +919,19 @@ fn friendly_tool_name(tool_name: &str) -> &'static str {
 fn looks_italian(value: &str) -> bool {
     let lower = value.to_lowercase();
     [
-        "puoi", "mi ", "apri", "aprimi", "cerca", "crea", "creami", "leggi", "schermo",
-        "file", "contenente", "finestra", "scheda",
+        "puoi",
+        "mi ",
+        "apri",
+        "aprimi",
+        "cerca",
+        "crea",
+        "creami",
+        "leggi",
+        "schermo",
+        "file",
+        "contenente",
+        "finestra",
+        "scheda",
     ]
     .iter()
     .any(|marker| lower.contains(marker))

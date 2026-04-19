@@ -871,7 +871,10 @@ fn availability_for_tool<'a>(
 }
 
 fn should_override_normal_chat_with_action(intent: &SemanticIntent) -> bool {
-    matches!(intent.kind, SemanticIntentKind::NormalChat | SemanticIntentKind::CapabilityQuestion)
+    matches!(
+        intent.kind,
+        SemanticIntentKind::NormalChat | SemanticIntentKind::CapabilityQuestion
+    )
 }
 
 fn actionable_fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
@@ -1548,7 +1551,11 @@ fn infer_browser_search_action(lower: &str, original: &str) -> Option<SemanticIn
 }
 
 fn desktop_launch_search_intent(url: String, new_window: bool, rationale: &str) -> SemanticIntent {
-    let first_arg = if new_window { "--new-window" } else { "--new-tab" };
+    let first_arg = if new_window {
+        "--new-window"
+    } else {
+        "--new-tab"
+    };
     intent(
         SemanticIntentKind::ToolActionRequest,
         CapabilityTarget::DesktopLaunch,
@@ -1570,25 +1577,13 @@ enum SearchProvider {
 
 fn looks_like_search_request(lower: &str) -> bool {
     let search_verb = [
-        "cerca",
-        "cercami",
-        "cerchi",
-        "sirchi",
-        "serchi",
-        "search",
-        "trova",
+        "cerca", "cercami", "cerchi", "sirchi", "serchi", "search", "trova", "trovi", "trovami",
         "find",
     ]
     .iter()
     .any(|marker| lower.contains(marker));
     let search_target = [
-        "google",
-        "youtube",
-        "you tube",
-        "web",
-        "internet",
-        "online",
-        "chrome",
+        "google", "youtube", "you tube", "web", "internet", "online", "chrome",
     ]
     .iter()
     .any(|marker| lower.contains(marker));
@@ -1596,11 +1591,7 @@ fn looks_like_search_request(lower: &str) -> bool {
 }
 
 fn extract_search_query(original: &str, provider: SearchProvider) -> Option<String> {
-    let mut query = strip_wake_prefix(original)
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, ',' | ':' | ';'))
-        .trim()
-        .to_string();
+    let query = trim_query_edges(&strip_wake_prefix(original));
 
     let markers: &[&str] = match provider {
         SearchProvider::Google => &[
@@ -1625,23 +1616,91 @@ fn extract_search_query(original: &str, provider: SearchProvider) -> Option<Stri
         SearchProvider::YouTube => &[
             "mi cerchi su youtube",
             "mi sirchi su youtube",
+            "mi serchi su youtube",
             "cercami su youtube",
             "cerca su youtube",
             "cerca youtube",
+            "apri youtube e cerca",
+            "youtube e cerca",
+            "mi trovi su youtube",
+            "trovami su youtube",
+            "trova su youtube",
             "search youtube for",
             "search on youtube for",
-            "youtube",
         ],
     };
 
+    let mut candidates = Vec::new();
     for marker in markers {
         if let Some(index) = find_case_insensitive(&query, marker) {
             let after = index + marker.len();
-            query = query[after..].trim().to_string();
-            break;
+            candidates.push(query[after..].trim().to_string());
         }
     }
 
+    if let Some(before_domain) = extract_search_query_before_domain(&query, provider) {
+        candidates.push(before_domain);
+    }
+    candidates.push(query);
+
+    candidates
+        .into_iter()
+        .find_map(|candidate| clean_search_query_candidate(&candidate, provider))
+}
+
+fn extract_search_query_before_domain(query: &str, provider: SearchProvider) -> Option<String> {
+    let domain_markers: &[&str] = match provider {
+        SearchProvider::Google => &[
+            " su google",
+            " on google",
+            " sul web",
+            " su internet",
+            " online",
+            " google",
+        ],
+        SearchProvider::YouTube => &[
+            " su youtube",
+            " su you tube",
+            " on youtube",
+            " on you tube",
+            " youtube",
+            " you tube",
+        ],
+    };
+
+    domain_markers
+        .iter()
+        .filter_map(|marker| find_case_insensitive(query, marker))
+        .min()
+        .and_then(|index| {
+            let candidate = query[..index].trim();
+            (!candidate.is_empty()).then(|| candidate.to_string())
+        })
+}
+
+fn clean_search_query_candidate(candidate: &str, provider: SearchProvider) -> Option<String> {
+    let mut query = trim_query_edges(candidate);
+    if query.is_empty() {
+        return None;
+    }
+
+    query = strip_search_command_prefixes(&query);
+    query = strip_provider_location_prefixes(&query, provider);
+    query = truncate_search_query_suffixes(&query, provider);
+    query = strip_search_command_prefixes(&query);
+    query = strip_provider_location_prefixes(&query, provider);
+    query = trim_query_edges(&query);
+
+    if matches!(provider, SearchProvider::YouTube) {
+        query = normalize_youtube_media_query(&query);
+    }
+
+    query = trim_query_edges(&query);
+    is_valid_search_query(&query).then_some(query)
+}
+
+fn truncate_search_query_suffixes(query: &str, provider: SearchProvider) -> String {
+    let mut query = query.to_string();
     for marker in [
         ", su una finestra",
         " su una finestra",
@@ -1660,16 +1719,162 @@ fn extract_search_query(original: &str, provider: SearchProvider) -> Option<Stri
         }
     }
 
-    let query = query
-        .replace("la canzone", "")
-        .replace("canzone", "")
-        .replace("song", "")
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';'))
-        .trim()
-        .to_string();
+    let provider_suffixes: &[&str] = match provider {
+        SearchProvider::Google => &[
+            " su google",
+            " on google",
+            " google",
+            " sul web",
+            " su internet",
+            " online",
+        ],
+        SearchProvider::YouTube => &[
+            " su youtube",
+            " su you tube",
+            " on youtube",
+            " on you tube",
+            " youtube",
+            " you tube",
+        ],
+    };
+    for marker in provider_suffixes {
+        if let Some(index) = find_case_insensitive(&query, marker) {
+            query.truncate(index);
+        }
+    }
 
-    (!query.is_empty()).then_some(query)
+    trim_query_edges(&query)
+}
+
+fn strip_search_command_prefixes(value: &str) -> String {
+    let mut query = trim_query_edges(value);
+    loop {
+        let before = query.clone();
+        for prefix in [
+            "mi puoi cercare",
+            "potresti cercare",
+            "puoi cercare",
+            "mi cerchi",
+            "mi sirchi",
+            "mi serchi",
+            "mi trovi",
+            "trovami",
+            "cercami",
+            "cerca",
+            "cerchi",
+            "sirchi",
+            "serchi",
+            "trova",
+            "trovi",
+            "search for",
+            "search",
+            "find",
+            "apri google e cerca",
+            "apri youtube e cerca",
+            "open google and search",
+            "open youtube and search",
+        ] {
+            if let Some(stripped) = strip_case_insensitive_prefix(&query, prefix) {
+                query = trim_query_edges(stripped);
+                break;
+            }
+        }
+        if query == before {
+            return query;
+        }
+    }
+}
+
+fn strip_provider_location_prefixes(value: &str, provider: SearchProvider) -> String {
+    let mut query = trim_query_edges(value);
+    let prefixes: &[&str] = match provider {
+        SearchProvider::Google => &[
+            "su google",
+            "on google",
+            "google",
+            "sul web",
+            "su internet",
+            "online",
+        ],
+        SearchProvider::YouTube => &[
+            "su youtube",
+            "su you tube",
+            "on youtube",
+            "on you tube",
+            "youtube",
+            "you tube",
+        ],
+    };
+
+    loop {
+        let before = query.clone();
+        for prefix in prefixes {
+            if let Some(stripped) = strip_case_insensitive_prefix(&query, prefix) {
+                query = trim_query_edges(stripped);
+                break;
+            }
+        }
+        if query == before {
+            return query;
+        }
+    }
+}
+
+fn normalize_youtube_media_query(value: &str) -> String {
+    let query = trim_query_edges(value);
+
+    for (prefix, content_word) in [
+        ("una canzone di ", "canzone"),
+        ("un brano di ", "brano"),
+        ("un video di ", "video"),
+        ("a song by ", "song"),
+        ("song by ", "song"),
+        ("a video by ", "video"),
+        ("video by ", "video"),
+    ] {
+        if let Some(rest) = strip_case_insensitive_prefix(&query, prefix) {
+            let rest = trim_query_edges(rest);
+            if is_valid_search_query(&rest) {
+                return format!("{rest} {content_word}");
+            }
+        }
+    }
+
+    for prefix in [
+        "la canzone ",
+        "il brano ",
+        "la traccia ",
+        "canzone ",
+        "brano ",
+        "song ",
+    ] {
+        if let Some(rest) = strip_case_insensitive_prefix(&query, prefix) {
+            let rest = trim_query_edges(rest);
+            if is_valid_search_query(&rest) {
+                return rest;
+            }
+        }
+    }
+
+    query
+}
+
+fn trim_query_edges(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';' | '?' | '!' | '"' | '\''))
+        .trim()
+        .to_string()
+}
+
+fn is_valid_search_query(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().any(|ch| ch.is_alphanumeric())
+        && !matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "su" | "on" | "youtube" | "you tube" | "google" | "web" | "online"
+        )
 }
 
 fn strip_wake_prefix(value: &str) -> String {
@@ -1678,7 +1883,7 @@ fn strip_wake_prefix(value: &str) -> String {
     if lower == "astra" {
         return String::new();
     }
-    for prefix in ["astra,", "astra ", "astra:"] {
+    for prefix in ["astra,", "astra ", "astra:", "astrami,", "astrami "] {
         if lower.starts_with(prefix) {
             return trimmed[prefix.len()..].trim_start().to_string();
         }
@@ -1687,7 +1892,10 @@ fn strip_wake_prefix(value: &str) -> String {
 }
 
 fn google_search_url(query: &str) -> String {
-    format!("https://www.google.com/search?q={}", url_encode_query(query))
+    format!(
+        "https://www.google.com/search?q={}",
+        url_encode_query(query)
+    )
 }
 
 fn youtube_search_url(query: &str) -> String {
@@ -1708,48 +1916,7 @@ fn infer_youtube_chrome_search_url(lower: &str, original: &str) -> Option<String
         return None;
     }
 
-    let mut query = original.trim().to_string();
-    for prefix in [
-        "mi cerchi su youtube",
-        "cercami su youtube",
-        "cerca su youtube",
-        "cerca youtube",
-        "search youtube for",
-        "search on youtube for",
-    ] {
-        if let Some(stripped) = strip_case_insensitive_prefix(&query, prefix) {
-            query = stripped.trim().to_string();
-            break;
-        }
-    }
-
-    for marker in [
-        ", su una finestra",
-        " su una finestra",
-        ", in una finestra",
-        " in una finestra",
-        ", su google chrome",
-        " su google chrome",
-        ", su chrome",
-        " su chrome",
-    ] {
-        if let Some(index) = find_case_insensitive(&query, marker) {
-            query.truncate(index);
-        }
-    }
-
-    let query = query
-        .replace("la canzone", "")
-        .replace("canzone", "")
-        .replace("song", "")
-        .trim()
-        .trim_matches(|ch: char| matches!(ch, ',' | '.' | ':' | ';'))
-        .trim()
-        .to_string();
-
-    if query.is_empty() {
-        return None;
-    }
+    let query = extract_search_query(original, SearchProvider::YouTube)?;
 
     Some(format!(
         "https://www.youtube.com/results?search_query={}",
@@ -2070,6 +2237,105 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap()
             .contains("youtube.com/results?search_query=stella+stellina"));
+    }
+
+    #[test]
+    fn youtube_search_extracts_query_before_domain_without_punctuation() {
+        let original = "Astra, mi cerchi una canzone di Shiva su YouTube?";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query="));
+        assert!(url.contains("Shiva+canzone"));
+        assert!(!url.contains("search_query=%3F"));
+    }
+
+    #[test]
+    fn youtube_search_keeps_noisy_stt_entity_as_useful_query() {
+        let original = "mi cerchi una canzone di sciva su youtube";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query=sciva+canzone"));
+        assert!(!url.contains("search_query=%3F"));
+    }
+
+    #[test]
+    fn youtube_search_direct_query_before_domain() {
+        let original = "cercami shiva su youtube";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query=shiva"));
+    }
+
+    #[test]
+    fn youtube_search_after_open_youtube_and_search() {
+        let original = "apri youtube e cerca una canzone di shiva";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query=shiva+canzone"));
+    }
+
+    #[test]
+    fn youtube_search_brano_phrase_keeps_media_context() {
+        let original = "cercami su youtube un brano di shiva";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query=shiva+brano"));
+    }
+
+    #[test]
+    fn youtube_search_mi_trovi_phrase_uses_query_before_domain() {
+        let original = "mi trovi una canzone di shiva su youtube";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query=shiva+canzone"));
     }
 
     #[test]

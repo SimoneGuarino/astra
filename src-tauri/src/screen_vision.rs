@@ -14,7 +14,9 @@ pub struct ScreenVisionRuntime {
 
 impl ScreenVisionRuntime {
     pub fn new() -> Self {
-        Self { client: Client::new() }
+        Self {
+            client: Client::new(),
+        }
     }
 
     pub async fn availability(&self) -> VisionAvailability {
@@ -63,7 +65,8 @@ impl ScreenVisionRuntime {
             ]
         });
 
-        let response = self.client
+        let response = self
+            .client
             .post(format!("{OLLAMA_BASE_URL}/api/chat"))
             .json(&payload)
             .send()
@@ -103,7 +106,8 @@ impl ScreenVisionRuntime {
     }
 
     async fn fetch_installed_models(&self) -> Result<Vec<String>, String> {
-        let response = self.client
+        let response = self
+            .client
             .get(format!("{OLLAMA_BASE_URL}/api/tags"))
             .send()
             .await
@@ -131,7 +135,10 @@ impl ScreenVisionRuntime {
 
 fn vision_candidates() -> Vec<String> {
     env::var("ASTRA_MODEL_VISION_CANDIDATES")
-        .unwrap_or_else(|_| "qwen2.5vl:7b,qwen2.5vl:3b,llava:7b,llava:13b,llava-phi3:3.8b,moondream:latest".to_string())
+        .unwrap_or_else(|_| {
+            "qwen2.5vl:7b,qwen2.5vl:3b,llava:7b,llava:13b,llava-phi3:3.8b,moondream:latest"
+                .to_string()
+        })
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())

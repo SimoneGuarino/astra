@@ -335,7 +335,10 @@ impl VoiceTurnMetrics {
             stt_duration_ms: delta(self.stt_started_at, self.stt_completed_at),
             stt_to_response_start_ms: delta(self.stt_completed_at, self.response_started_at),
             user_end_to_response_start_ms: delta(self.utterance_ended_at, self.response_started_at),
-            response_start_to_first_audio_ms: delta(self.response_started_at, self.first_audio_play_at),
+            response_start_to_first_audio_ms: delta(
+                self.response_started_at,
+                self.first_audio_play_at,
+            ),
             interruption_latency_ms: delta(
                 self.interruption_detected_at,
                 self.interruption_stop_completed_at,

@@ -1,5 +1,9 @@
 use crate::desktop_agent_types::DesktopAuditEvent;
-use std::{fs, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Clone)]
 pub struct AuditLogStore {
@@ -16,7 +20,10 @@ impl AuditLogStore {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        Self { path, lock: Arc::new(Mutex::new(())) }
+        Self {
+            path,
+            lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn append(&self, event: &DesktopAuditEvent) {
@@ -26,7 +33,9 @@ impl AuditLogStore {
                 .create(true)
                 .append(true)
                 .open(&self.path)
-                .and_then(|mut file| std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()));
+                .and_then(|mut file| {
+                    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())
+                });
         }
     }
 

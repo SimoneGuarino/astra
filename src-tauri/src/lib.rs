@@ -526,7 +526,10 @@ fn recent_artifact_diagnostic(message: &str, routed_to: &str) -> ConversationRou
         action_status: None,
         approval_created: false,
         audit_expected: false,
-        rationale: Some("Resolved an unambiguous follow-up against session-scoped recent artifact memory".into()),
+        rationale: Some(
+            "Resolved an unambiguous follow-up against session-scoped recent artifact memory"
+                .into(),
+        ),
         error: None,
     }
 }

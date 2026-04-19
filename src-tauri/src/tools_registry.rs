@@ -82,6 +82,9 @@ impl ToolsRegistry {
     }
 
     pub fn get(&self, tool_name: &str) -> Option<ToolDescriptor> {
-        self.tools.iter().find(|tool| tool.tool_name == tool_name).cloned()
+        self.tools
+            .iter()
+            .find(|tool| tool.tool_name == tool_name)
+            .cloned()
     }
 }

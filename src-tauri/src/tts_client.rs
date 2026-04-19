@@ -17,7 +17,6 @@ use tokio::{
 };
 use uuid::Uuid;
 
-
 #[derive(Debug)]
 pub enum TtsClientError {
     Cancelled,
@@ -126,7 +125,6 @@ impl TtsClient {
             .map_err(|_| TtsClientError::WorkerUnavailable)?
     }
 }
-
 
 fn read_tts_timeout() -> Duration {
     let seconds = std::env::var("ASTRA_TTS_TIMEOUT_SECS")

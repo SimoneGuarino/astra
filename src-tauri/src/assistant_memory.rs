@@ -1,4 +1,6 @@
-use crate::desktop_agent_types::{DesktopActionResponse, DesktopActionStatus, ScreenAnalysisResult};
+use crate::desktop_agent_types::{
+    DesktopActionResponse, DesktopActionStatus, ScreenAnalysisResult,
+};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
@@ -168,7 +170,9 @@ fn answer_file_followup(file: &RecentFileArtifact, message: &str) -> String {
         if preview.is_empty() {
             return format!("Il file **{file_name}** e' vuoto.");
         }
-        return format!("Nel file **{file_name}** ho trovato queste informazioni principali:\n{preview}");
+        return format!(
+            "Nel file **{file_name}** ho trovato queste informazioni principali:\n{preview}"
+        );
     }
 
     format!(
@@ -186,7 +190,10 @@ fn find_secret_line(content: &str, keywords: &[String]) -> Option<String> {
     let mut best: Option<(usize, usize)> = None;
     for (index, lower_line) in lower_lines.iter().enumerate() {
         let mut score = 0;
-        if lower_line.contains("password") || lower_line.contains("pwd") || lower_line.contains("pass") {
+        if lower_line.contains("password")
+            || lower_line.contains("pwd")
+            || lower_line.contains("pass")
+        {
             score += 3;
         }
         for keyword in keywords {
@@ -194,7 +201,11 @@ fn find_secret_line(content: &str, keywords: &[String]) -> Option<String> {
                 score += 2;
             }
         }
-        if score > 0 && best.map(|(_, best_score)| score > best_score).unwrap_or(true) {
+        if score > 0
+            && best
+                .map(|(_, best_score)| score > best_score)
+                .unwrap_or(true)
+        {
             best = Some((index, score));
         }
     }

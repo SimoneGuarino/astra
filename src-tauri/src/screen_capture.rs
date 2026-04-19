@@ -1,5 +1,10 @@
 use crate::desktop_agent_types::{ScreenCaptureResult, ScreenObservationStatus};
-use std::{fs, path::PathBuf, process::Command, sync::{Arc, Mutex}};
+use std::{
+    fs,
+    path::PathBuf,
+    process::Command,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -31,11 +36,17 @@ impl ScreenCaptureRuntime {
     }
 
     pub fn status(&self) -> ScreenObservationStatus {
-        self.status.lock().expect("screen capture status mutex poisoned").clone()
+        self.status
+            .lock()
+            .expect("screen capture status mutex poisoned")
+            .clone()
     }
 
     pub fn set_enabled(&self, enabled: bool) -> ScreenObservationStatus {
-        let mut status = self.status.lock().expect("screen capture status mutex poisoned");
+        let mut status = self
+            .status
+            .lock()
+            .expect("screen capture status mutex poisoned");
         status.enabled = enabled;
         if enabled {
             status.note = "Screen observation is enabled in on-demand mode".into();
@@ -46,13 +57,21 @@ impl ScreenCaptureRuntime {
     }
 
     pub fn latest_capture_path(&self) -> Option<String> {
-        self.status.lock().expect("screen capture status mutex poisoned").last_capture_path.clone()
+        self.status
+            .lock()
+            .expect("screen capture status mutex poisoned")
+            .last_capture_path
+            .clone()
     }
 
     pub fn capture_snapshot(&self) -> Result<ScreenCaptureResult, String> {
         if !cfg!(target_os = "windows") {
-            let mut status = self.status.lock().expect("screen capture status mutex poisoned");
-            status.last_error = Some("Screen capture is currently implemented only on Windows".into());
+            let mut status = self
+                .status
+                .lock()
+                .expect("screen capture status mutex poisoned");
+            status.last_error =
+                Some("Screen capture is currently implemented only on Windows".into());
             return Err("Screen capture is currently implemented only on Windows".into());
         }
 
@@ -67,20 +86,30 @@ impl ScreenCaptureRuntime {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             let message = if stderr.is_empty() {
-                format!("screen capture command exited with status {:?}", output.status.code())
+                format!(
+                    "screen capture command exited with status {:?}",
+                    output.status.code()
+                )
             } else {
                 stderr
             };
-            let mut status = self.status.lock().expect("screen capture status mutex poisoned");
+            let mut status = self
+                .status
+                .lock()
+                .expect("screen capture status mutex poisoned");
             status.last_error = Some(message.clone());
             return Err(message);
         }
 
-        let metadata = fs::metadata(&output_path).map_err(|e| format!("screen capture file missing after capture: {e}"))?;
+        let metadata = fs::metadata(&output_path)
+            .map_err(|e| format!("screen capture file missing after capture: {e}"))?;
         let now = now_ms();
         let path_string = output_path.display().to_string();
 
-        let mut status = self.status.lock().expect("screen capture status mutex poisoned");
+        let mut status = self
+            .status
+            .lock()
+            .expect("screen capture status mutex poisoned");
         status.last_frame_at = Some(now);
         status.last_error = None;
         status.last_capture_path = Some(path_string.clone());

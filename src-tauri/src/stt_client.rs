@@ -345,7 +345,9 @@ async fn read_worker_line(
 }
 
 fn decode_worker_stdout_line(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).trim_end_matches(['\r', '\n']).to_string()
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches(['\r', '\n'])
+        .to_string()
 }
 
 #[cfg(test)]

@@ -1,5 +1,8 @@
 use serde_json::json;
-use std::{path::{Path, PathBuf}, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 #[derive(Clone)]
 pub struct TerminalRunner {
@@ -10,14 +13,26 @@ pub struct TerminalRunner {
 impl TerminalRunner {
     pub fn new(allowed_commands: &[String], allowed_roots: &[String]) -> Self {
         Self {
-            allowed_commands: allowed_commands.iter().map(|s| s.to_ascii_lowercase()).collect(),
+            allowed_commands: allowed_commands
+                .iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect(),
             allowed_roots: allowed_roots.iter().map(PathBuf::from).collect(),
         }
     }
 
-    pub fn run(&self, command: &str, args: &[String], cwd: Option<&str>) -> Result<serde_json::Value, String> {
+    pub fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         let normalized = command.trim().to_ascii_lowercase();
-        if !self.allowed_commands.iter().any(|allowed| allowed == &normalized) {
+        if !self
+            .allowed_commands
+            .iter()
+            .any(|allowed| allowed == &normalized)
+        {
             return Err(format!("Command is not allowlisted: {command}"));
         }
 
@@ -25,7 +40,10 @@ impl TerminalRunner {
             let candidate = PathBuf::from(cwd);
             self.ensure_allowed_dir(&candidate)?
         } else {
-            self.allowed_roots.first().cloned().ok_or_else(|| "No allowed roots configured".to_string())?
+            self.allowed_roots
+                .first()
+                .cloned()
+                .ok_or_else(|| "No allowed roots configured".to_string())?
         };
 
         let output = if cfg!(target_os = "windows") {
@@ -57,13 +75,18 @@ impl TerminalRunner {
         let normalized = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir().map_err(|e| e.to_string())?.join(path)
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(path)
         };
         for root in &self.allowed_roots {
             if normalized.starts_with(root) {
                 return Ok(normalized);
             }
         }
-        Err(format!("Working directory is outside allowed roots: {}", normalized.display()))
+        Err(format!(
+            "Working directory is outside allowed roots: {}",
+            normalized.display()
+        ))
     }
 }

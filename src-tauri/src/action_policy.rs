@@ -16,7 +16,9 @@ pub struct DesktopAgentPolicy {
 
 impl DesktopAgentPolicy {
     pub fn load_or_default(project_root: &PathBuf) -> Self {
-        let config_path = project_root.join(".astra").join("desktop_agent_policy.json");
+        let config_path = project_root
+            .join(".astra")
+            .join("desktop_agent_policy.json");
         if let Ok(raw) = fs::read_to_string(&config_path) {
             if let Ok(parsed) = serde_json::from_str::<DesktopAgentPolicy>(&raw) {
                 return parsed;
