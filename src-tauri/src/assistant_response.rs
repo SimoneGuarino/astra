@@ -313,16 +313,41 @@ fn render_file_read(response: &DesktopActionResponse, italian: bool) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
+    let wants_summary = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("post_processing"))
+        .and_then(|post| post.get("mode"))
+        .and_then(Value::as_str)
+        .map(|mode| mode.eq_ignore_ascii_case("summary"))
+        .unwrap_or(false)
+        || response
+            .result
+            .as_ref()
+            .and_then(|result| result.get("operation"))
+            .and_then(Value::as_str)
+            .map(|operation| operation == "read_and_summarize_file")
+            .unwrap_or(false);
     let preview = content_preview(content);
 
     if italian {
         if preview.is_empty() {
             format!("Ho letto il file **{label}**. Il file e' vuoto.")
+        } else if wants_summary {
+            format!(
+                "Ho letto il file **{label}**.\n\nSintesi:\n{}",
+                summarize_text_content(content, true)
+            )
         } else {
             format!("Ho letto il file **{label}**.\n\nContenuto rilevante:\n{preview}")
         }
     } else if preview.is_empty() {
         format!("I read **{label}**. The file is empty.")
+    } else if wants_summary {
+        format!(
+            "I read **{label}**.\n\nSummary:\n{}",
+            summarize_text_content(content, false)
+        )
     } else {
         format!("I read **{label}**.\n\nRelevant content:\n{preview}")
     }
@@ -882,6 +907,41 @@ fn content_preview(content: &str) -> String {
         preview.push_str("\n...");
     }
     preview
+}
+
+fn summarize_text_content(content: &str, italian: bool) -> String {
+    let lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(6)
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        return if italian {
+            "Il file non contiene testo leggibile da riassumere.".into()
+        } else {
+            "The file does not contain readable text to summarize.".into()
+        };
+    }
+
+    let joined = lines.join(" ");
+    let mut summary = joined.chars().take(700).collect::<String>();
+    if joined.chars().count() > summary.chars().count() {
+        summary.push_str("...");
+    }
+
+    if italian {
+        format!(
+            "Il contenuto principale riguarda: {}",
+            collapse_whitespace(&summary)
+        )
+    } else {
+        format!(
+            "The main content is about: {}",
+            collapse_whitespace(&summary)
+        )
+    }
 }
 
 fn action_result_path(response: &DesktopActionResponse) -> Option<String> {

@@ -11,7 +11,7 @@ import { useAssistantVisualState } from "./hooks/useAssistantVisualState";
 import { useWindowControls } from "./hooks/useWindowControls";
 import SplitText from "./components/SplitText";
 
-import AstraLogo from "./assets/astra_01.png";
+import AstraLogo from "./assets/astra_02_black.png";
 
 type IntroPhase = "logo" | "splitText" | "main";
 
@@ -146,7 +146,7 @@ function App() {
                     0.22
                 );
             }
-        }, 4000);
+        }, 2000);
 
         return () => {
             if (revealTimeoutRef.current !== null) {
@@ -252,14 +252,9 @@ function App() {
                     </section>
                 </div>
 
-                <div ref={chatWrapRef} style={{ flex: 1, minHeight: 0 }}>
-                    <AssistantChat messages={session.messages} />
+                <div ref={chatWrapRef} className="h-full chat-area overflow-auto" style={{ flex: 1, minHeight: 0 }}>
+                    <AssistantChat messages={session.messages} chatRef={chatWrapRef} />
                 </div>
-
-                <DesktopAgentPanel
-                    isOpen={isDesktopPanelOpen}
-                    onClose={() => setIsDesktopPanelOpen(false)}
-                />
 
                 <div ref={inputWrapRef}>
                     <AssistantInputBar
@@ -274,6 +269,11 @@ function App() {
                         voiceSession={session.voiceSession}
                     />
                 </div>
+
+                <DesktopAgentPanel
+                    isOpen={isDesktopPanelOpen}
+                    onClose={() => setIsDesktopPanelOpen(false)}
+                />
             </section>
         </main>
     );

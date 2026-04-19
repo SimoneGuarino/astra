@@ -10,8 +10,13 @@ use crate::{
     },
     filesystem_service::FilesystemService,
     permissions::PermissionProfile,
+    screen_workflow::{
+        execute_screen_workflow, refresh_screen_workflow_plan, ScreenWorkflow, ScreenWorkflowRun,
+    },
     terminal_runner::TerminalRunner,
     tools_registry::ToolsRegistry,
+    ui_control::{UIControlRuntime, UIPrimitiveCapabilitySet},
+    ui_target_grounding::UITargetCandidate,
 };
 use serde_json::{json, Value};
 use std::{
@@ -34,6 +39,8 @@ pub struct DesktopAgentRuntime {
     pending_store: crate::pending_approvals_store::PendingApprovalsStore,
     screen_capture: crate::screen_capture::ScreenCaptureRuntime,
     screen_vision: crate::screen_vision::ScreenVisionRuntime,
+    ui_control: UIControlRuntime,
+    recent_workflow_targets: Arc<Mutex<Vec<UITargetCandidate>>>,
 }
 
 #[derive(Clone)]
@@ -64,6 +71,7 @@ impl DesktopAgentRuntime {
             .collect::<HashMap<_, _>>();
         let screen_capture = crate::screen_capture::ScreenCaptureRuntime::new(&project_root);
         let screen_vision = crate::screen_vision::ScreenVisionRuntime::new();
+        let ui_control = UIControlRuntime::new();
         Self {
             filesystem: FilesystemService::new(&policy.allowed_roots),
             terminal: TerminalRunner::new(&policy.terminal_allowed_commands, &policy.allowed_roots),
@@ -76,6 +84,8 @@ impl DesktopAgentRuntime {
             pending_store,
             screen_capture,
             screen_vision,
+            ui_control,
+            recent_workflow_targets: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -206,6 +216,97 @@ impl DesktopAgentRuntime {
             }
         }
     }
+
+    pub fn ui_primitive_capabilities(&self) -> UIPrimitiveCapabilitySet {
+        let enabled = self
+            .permissions
+            .allows(&crate::desktop_agent_types::Permission::DesktopControl)
+            && self
+                .policy
+                .permission_enabled(&crate::desktop_agent_types::Permission::DesktopControl);
+        self.ui_control.capabilities(enabled)
+    }
+
+    pub fn execute_screen_workflow(&self, mut workflow: ScreenWorkflow) -> ScreenWorkflowRun {
+        let request_id = Uuid::new_v4().to_string();
+        let action_id = Uuid::new_v4().to_string();
+        let capabilities = self.ui_primitive_capabilities();
+        workflow.grounding.recent_target_candidates = self.recent_workflow_targets();
+        refresh_screen_workflow_plan(&mut workflow);
+        self.audit.append(&DesktopAuditEvent {
+            audit_id: Uuid::new_v4().to_string(),
+            action_id: action_id.clone(),
+            request_id: request_id.clone(),
+            tool_name: "screen.workflow".into(),
+            stage: "workflow".into(),
+            status: "started".into(),
+            timestamp: now_ms(),
+            risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+            details: json!({
+                "workflow": workflow.diagnostic_value(),
+                "primitive_capabilities": capabilities,
+            }),
+        });
+
+        let run = execute_screen_workflow(workflow, &self.ui_control, capabilities);
+        self.remember_workflow_targets(&run);
+        self.audit.append(&DesktopAuditEvent {
+            audit_id: Uuid::new_v4().to_string(),
+            action_id,
+            request_id,
+            tool_name: "screen.workflow".into(),
+            stage: "workflow".into(),
+            status: run.status.as_str().into(),
+            timestamp: now_ms(),
+            risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+            details: run.diagnostic_value(),
+        });
+        run
+    }
+
+    fn recent_workflow_targets(&self) -> Vec<UITargetCandidate> {
+        self.recent_workflow_targets
+            .lock()
+            .expect("recent workflow target memory poisoned")
+            .clone()
+    }
+
+    fn remember_workflow_targets(&self, run: &ScreenWorkflowRun) {
+        let mut selected = run
+            .step_runs
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.status,
+                    crate::screen_workflow::WorkflowRunStatus::Completed
+                )
+            })
+            .filter_map(|step| step.target_selection.as_ref())
+            .filter_map(|selection| selection.selected_candidate.clone())
+            .collect::<Vec<_>>();
+
+        if selected.is_empty() {
+            return;
+        }
+
+        let now = now_ms();
+        for candidate in &mut selected {
+            candidate.observed_at_ms = Some(now);
+            candidate.reuse_eligible = true;
+        }
+
+        let mut memory = self
+            .recent_workflow_targets
+            .lock()
+            .expect("recent workflow target memory poisoned");
+        for candidate in selected {
+            memory.retain(|existing| existing.candidate_id != candidate.candidate_id);
+            memory.push(candidate);
+        }
+        memory.sort_by(|left, right| right.observed_at_ms.cmp(&left.observed_at_ms));
+        memory.truncate(12);
+    }
+
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
         self.pending
             .lock()
@@ -439,7 +540,14 @@ impl DesktopAgentRuntime {
                     .get("path")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| "filesystem.read_text requires params.path".to_string())?;
-                self.filesystem.read_text(path)
+                let mut result = self.filesystem.read_text(path)?;
+                if let Some(post_processing) = request.params.get("post_processing") {
+                    result["post_processing"] = post_processing.clone();
+                }
+                if let Some(operation) = request.params.get("operation") {
+                    result["operation"] = operation.clone();
+                }
+                Ok(result)
             }
             "filesystem.write_text" => {
                 let path = request

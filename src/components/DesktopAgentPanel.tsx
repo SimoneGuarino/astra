@@ -162,7 +162,8 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
     }
 
     return (
-        <aside className="desktop-agent-panel">
+        <aside className="flex p-4 bg-white/60 flex-col absolute bottom-0 
+        z-10 w-full h-1/2 backdrop-blur-sm border-t border-gray-200 gap-2 min-h-[300px]">
             <div className="desktop-agent-panel__header">
                 <div>
                     <p className="desktop-agent-panel__kicker">DESKTOP AGENT</p>

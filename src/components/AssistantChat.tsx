@@ -1,26 +1,23 @@
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import type { ChatMessage } from "../types/assistant";
 
 type AssistantChatProps = {
     messages: ChatMessage[];
+    chatRef: React.RefObject<HTMLDivElement | null>;
 };
 
-export function AssistantChat({ messages }: AssistantChatProps) {
-    const chatAreaRef = useRef<HTMLElement | null>(null);
-
+export function AssistantChat({ messages, chatRef }: AssistantChatProps) {
     useEffect(() => {
-        if (!chatAreaRef.current) return;
-        chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight;
+        if (!chatRef.current) return;
+        chatRef.current.scrollTop = chatRef.current.scrollHeight;
     }, [messages]);
 
     return (
-        <section className="chat-area" ref={chatAreaRef}>
-            {messages.map((message) => (
+            messages.map((message) => (
                 <div key={message.id} className={`message ${message.role}`}>
                     {message.content ? <MessageContent content={message.content} /> : "..."}
                 </div>
-            ))}
-        </section>
+            ))
     );
 }
 

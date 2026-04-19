@@ -186,8 +186,20 @@ fn classifier_system_prompt() -> &'static str {
         "\"target\":\"screen|browser|terminal|filesystem_read|filesystem_write|filesystem_search|desktop_launch|approval|general|unknown\",",
         "\"action\":\"browser_search|browser_open_url|filesystem_read|filesystem_search|filesystem_write|terminal_run|desktop_launch_app|none|unknown\",",
         "\"params\":{\"query\":null,\"url\":null,\"path\":null,\"pattern\":null,\"content\":null,\"mode\":null,\"command\":null,\"args\":[],\"cwd\":null,\"app\":null},",
+        "\"operation\":\"read_file|read_and_summarize_file|write_file|search_file|browser_search|browser_open|desktop_launch_app|screen_guided_browser_workflow|screen_guided_followup_action|screen_guided_navigation_workflow|unknown\",",
+        "\"domain\":\"filesystem|browser|desktop|terminal|browser_screen_interaction|screen_interaction|screen_navigation|screen|unknown\",",
+        "\"provider\":\"google|youtube|web|chrome|null\",",
+        "\"query_mode\":\"precise|semantic|null\",",
+        "\"entities\":{},\"post_processing\":{},\"workflow_steps\":[],\"requires_screen_context\":false,\"ambiguity\":null,",
         "\"screen\":{\"capture_fresh\":null,\"reuse_recent\":null,\"state_question\":null},",
         "\"confidence\":0.0,\"language\":\"en|it|mixed|unknown\",\"rationale\":\"short reason\"}. ",
+        "Use operation/entities to preserve user-operation semantics before tool execution. ",
+        "For file reading use operation read_file; for file summaries use read_and_summarize_file, never write_file. ",
+        "For open-ended searches such as 'una canzone di Shiva su YouTube', use browser_search with provider youtube and query_mode semantic. ",
+        "For exact quoted or explicitly named searches, use query_mode precise. ",
+        "For future screen-guided browser workflows, use screen_guided_browser_workflow and workflow_steps, but Rust still validates whether execution is supported. ",
+        "For follow-up visible-screen commands such as clicking the first visible result, use screen_guided_followup_action. ",
+        "For requests to go back to a previous screen, use screen_guided_navigation_workflow. ",
         "Use capability_question when the user asks what Astra can do. ",
         "Use screen_question for screen access/state questions such as whether Astra can see, observe, capture, or analyze the screen. ",
         "Use screen_analysis_request when the user wants visible screen content interpreted, asks what they are looking at, what is wrong here, what to click, or wants a fresh screen analysis. ",
@@ -205,13 +217,22 @@ struct RawIntent {
     tool_name: Option<String>,
     params: Option<Value>,
     parameters: Option<Value>,
+    operation: Option<String>,
+    domain: Option<String>,
+    provider: Option<String>,
+    query_mode: Option<String>,
+    entities: Option<Value>,
+    post_processing: Option<Value>,
+    workflow_steps: Option<Vec<String>>,
+    requires_screen_context: Option<bool>,
+    ambiguity: Option<String>,
     screen: Option<RawScreenRequest>,
     confidence: Option<f32>,
     language: Option<String>,
     rationale: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RawScreenRequest {
     capture_fresh: Option<bool>,
     reuse_recent: Option<bool>,
@@ -233,12 +254,17 @@ fn parse_intent_json(content: &str) -> Result<SemanticIntent, String> {
         kind = SemanticIntentKind::ToolActionRequest;
     }
     let confidence = raw.confidence.unwrap_or(0.0).clamp(0.0, 1.0);
-    let screen = raw.screen.unwrap_or(RawScreenRequest {
+    let screen = raw.screen.clone().unwrap_or(RawScreenRequest {
         capture_fresh: None,
         reuse_recent: None,
         state_question: None,
     });
-    let params = raw.params.or(raw.parameters).unwrap_or_else(|| json!({}));
+    let mut params = raw
+        .params
+        .clone()
+        .or_else(|| raw.parameters.clone())
+        .unwrap_or_else(|| json!({}));
+    merge_action_resolution_hints(&mut params, &raw);
 
     Ok(SemanticIntent {
         kind,
@@ -257,6 +283,51 @@ fn parse_intent_json(content: &str) -> Result<SemanticIntent, String> {
             .map(|value| value.trim().chars().take(180).collect::<String>())
             .filter(|value| !value.is_empty()),
     })
+}
+
+fn merge_action_resolution_hints(params: &mut Value, raw: &RawIntent) {
+    if !params.is_object() {
+        *params = json!({ "raw_params": params.clone() });
+    }
+    let Some(map) = params.as_object_mut() else {
+        return;
+    };
+
+    for (key, value) in [
+        ("operation", raw.operation.as_deref()),
+        ("domain", raw.domain.as_deref()),
+        ("provider", raw.provider.as_deref()),
+        ("query_mode", raw.query_mode.as_deref()),
+        ("ambiguity", raw.ambiguity.as_deref()),
+    ] {
+        if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+            map.entry(key).or_insert_with(|| json!(value));
+        }
+    }
+
+    if let Some(entities) = raw.entities.as_ref().filter(|value| value.is_object()) {
+        map.entry("entities").or_insert_with(|| entities.clone());
+    }
+    if let Some(post_processing) = raw
+        .post_processing
+        .as_ref()
+        .filter(|value| value.is_object())
+    {
+        map.entry("post_processing")
+            .or_insert_with(|| post_processing.clone());
+    }
+    if let Some(workflow_steps) = raw
+        .workflow_steps
+        .as_ref()
+        .filter(|steps| !steps.is_empty())
+    {
+        map.entry("workflow_steps")
+            .or_insert_with(|| json!(workflow_steps));
+    }
+    if let Some(requires_screen_context) = raw.requires_screen_context {
+        map.entry("requires_screen_context")
+            .or_insert_with(|| json!(requires_screen_context));
+    }
 }
 
 fn extract_json_object(content: &str) -> Option<&str> {

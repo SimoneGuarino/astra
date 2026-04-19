@@ -1,6 +1,9 @@
 use serde_json::{json, Value};
 
 use crate::{
+    action_resolution::{
+        ActionDomain, ActionOperation, ActionResolution, QueryMode, ResolutionSource,
+    },
     assistant_context::capability_label,
     desktop_agent::DesktopAgentRuntime,
     desktop_agent_types::{
@@ -8,6 +11,7 @@ use crate::{
         DesktopActionRequest, DesktopActionResponse, DesktopActionStatus, ScreenAnalysisRequest,
         ScreenAnalysisResult,
     },
+    screen_workflow::{render_screen_workflow_run_response, resolve_screen_workflow},
     semantic_intent::{
         classify_intent, CapabilityTarget, SemanticAction, SemanticIntent, SemanticIntentKind,
         SemanticScreenRequest,
@@ -330,7 +334,38 @@ fn route_tool_action(
     diagnostic.routed_to = "desktop_action_governance".into();
     diagnostic.grounded = true;
 
-    let action = match build_action_request(intent, normalized) {
+    let resolution = resolve_action_resolution(intent, normalized);
+    if let Some(resolution) = resolution.as_ref() {
+        diagnostic.extracted_params = Some(resolution.diagnostic_value());
+        if let Some(rationale) = resolution.rationale.as_ref() {
+            diagnostic.rationale = Some(rationale.clone());
+        }
+        if matches!(
+            resolution.operation,
+            ActionOperation::ScreenGuidedBrowserWorkflow
+                | ActionOperation::ScreenGuidedFollowupAction
+                | ActionOperation::ScreenGuidedNavigationWorkflow
+        ) {
+            diagnostic.routed_to = "screen_grounded_workflow_planned".into();
+            if let Some(workflow) = resolve_screen_workflow(resolution, manifest, normalized) {
+                let run = runtime.execute_screen_workflow(workflow);
+                diagnostic.routed_to = "screen_grounded_workflow_executed".into();
+                diagnostic.extracted_params = Some(run.diagnostic_value());
+                return ConversationRoute::DirectResponse(render_screen_workflow_run_response(
+                    &run,
+                    matches!(language, ResponseLanguage::Italian),
+                ));
+            }
+        }
+    }
+
+    let action_result = if let Some(resolution) = resolution.as_ref() {
+        build_action_request_from_resolution(resolution, normalized)
+    } else {
+        build_action_request(intent, normalized)
+    };
+
+    let action = match action_result {
         Ok(action) => action,
         Err(message) => {
             diagnostic.routed_to = "desktop_action_missing_parameters".into();
@@ -387,6 +422,500 @@ fn action_status_label(status: &DesktopActionStatus) -> &'static str {
         DesktopActionStatus::ApprovalRequired => "approval_required",
         DesktopActionStatus::Rejected => "rejected",
         DesktopActionStatus::Failed => "failed",
+    }
+}
+
+fn resolve_action_resolution(intent: &SemanticIntent, original: &str) -> Option<ActionResolution> {
+    if !matches!(intent.kind, SemanticIntentKind::ToolActionRequest) {
+        return None;
+    }
+
+    let params = effective_params(&intent.params);
+    let lower = original.to_lowercase();
+    let source = if param_str(&params, "operation").is_some()
+        || params.get("entities").and_then(Value::as_object).is_some()
+    {
+        ResolutionSource::ModelAssisted
+    } else if intent
+        .rationale
+        .as_deref()
+        .map(|value| value.contains("fallback"))
+        .unwrap_or(false)
+    {
+        ResolutionSource::HeuristicFallback
+    } else {
+        ResolutionSource::RustNormalizer
+    };
+
+    let operation = model_operation(&params)
+        .or_else(|| infer_resolution_operation(intent, &lower, &params))
+        .or_else(|| infer_textual_resolution_operation(&lower))?;
+    let domain = model_domain(&params).unwrap_or_else(|| domain_for_operation(&operation, intent));
+    let mut resolution =
+        ActionResolution::new(operation.clone(), domain, intent.confidence, source);
+
+    resolution.provider = param_str_any_deep(&params, &["provider", "search_provider", "engine"])
+        .or_else(|| infer_search_provider(&lower));
+    resolution.query_mode = param_str_any_deep(&params, &["query_mode"])
+        .as_deref()
+        .and_then(QueryMode::from_str)
+        .or_else(|| infer_query_mode(original, &operation));
+    resolution.entities = normalized_resolution_entities(&params, original, &operation);
+    resolution.post_processing = normalized_post_processing(&params, &operation);
+    resolution.requires_screen_context = params
+        .get("requires_screen_context")
+        .and_then(Value::as_bool)
+        .unwrap_or(matches!(
+            operation,
+            ActionOperation::ScreenGuidedBrowserWorkflow
+        ));
+    resolution.workflow_steps = param_string_array_any(&params, &["workflow_steps", "steps"])
+        .into_iter()
+        .collect();
+    if matches!(operation, ActionOperation::ScreenGuidedBrowserWorkflow)
+        && resolution.workflow_steps.is_empty()
+    {
+        resolution.workflow_steps = vec![
+            "locate_existing_browser_tab".into(),
+            "focus_search_input".into(),
+            "enter_query".into(),
+            "submit_search".into(),
+            "open_first_result".into(),
+        ];
+    }
+    resolution.ambiguity = param_str(&params, "ambiguity");
+    resolution.rationale = Some(format!(
+        "{} resolution for {}",
+        resolution.source.as_str(),
+        resolution.operation.as_str()
+    ));
+
+    Some(resolution)
+}
+
+fn build_action_request_from_resolution(
+    resolution: &ActionResolution,
+    original: &str,
+) -> Result<DesktopActionRequest, String> {
+    match resolution.operation {
+        ActionOperation::ReadFile | ActionOperation::ReadAndSummarizeFile => {
+            let path = resolve_file_read_path(&resolution.entities, original)
+                .ok_or_else(|| "I need the file path to read.".to_string())?;
+            let post_processing = if matches!(
+                resolution.operation,
+                ActionOperation::ReadAndSummarizeFile
+            ) {
+                let mut post_processing = resolution.post_processing.clone();
+                if !post_processing.is_object() {
+                    post_processing = json!({});
+                }
+                post_processing["mode"] = json!("summary");
+                post_processing
+            } else {
+                resolution.post_processing.clone()
+            };
+
+            Ok(DesktopActionRequest {
+                tool_name: "filesystem.read_text".into(),
+                params: json!({
+                    "path": path,
+                    "operation": resolution.operation.as_str(),
+                    "post_processing": post_processing,
+                }),
+                preview_only: false,
+                reason: Some(match resolution.operation {
+                    ActionOperation::ReadAndSummarizeFile => {
+                        "User requested reading and summarizing a file".into()
+                    }
+                    _ => "User requested reading a file".into(),
+                }),
+            })
+        }
+        ActionOperation::SearchFile => {
+            let pattern = entity_str_any(resolution, &["pattern", "query", "filename", "file_name"])
+                .ok_or_else(|| "I need the filename or pattern to search for.".to_string())?;
+            let mut params = json!({"pattern": pattern, "max_results": 25});
+            if let Some(root) = entity_str_any(resolution, &["root", "location_hint"]) {
+                if root != "desktop" && root != "scrivania" {
+                    params["root"] = json!(root);
+                }
+            }
+            Ok(DesktopActionRequest {
+                tool_name: "filesystem.search".into(),
+                params,
+                preview_only: false,
+                reason: Some("User requested searching files".into()),
+            })
+        }
+        ActionOperation::WriteFile => {
+            let path = resolve_file_write_path(&resolution.entities, original)
+                .ok_or_else(|| "I need the target file path before writing.".to_string())?;
+            let content = entity_str_any(resolution, &["content", "text"])
+                .or_else(|| infer_file_content_from_text(original))
+                .ok_or_else(|| {
+                    "I need the content to write before creating or modifying a file.".to_string()
+                })?;
+            let mode = entity_str_any(resolution, &["mode"]).unwrap_or_else(|| "overwrite".into());
+            Ok(DesktopActionRequest {
+                tool_name: "filesystem.write_text".into(),
+                params: json!({"path": path, "content": content, "mode": mode, "create_empty": false}),
+                preview_only: false,
+                reason: Some("User requested writing a file".into()),
+            })
+        }
+        ActionOperation::BrowserSearch => {
+            let provider = resolution
+                .provider
+                .as_deref()
+                .unwrap_or("web")
+                .to_ascii_lowercase();
+            let query =
+                entity_str_any(resolution, &["query_candidate", "query", "search_query"]).or_else(
+                    || {
+                        let provider = if provider == "youtube" || provider == "you tube" {
+                            SearchProvider::YouTube
+                        } else {
+                            SearchProvider::Google
+                        };
+                        extract_search_query(original, provider)
+                    },
+                );
+            let query = query.ok_or_else(|| "I need a search query.".to_string())?;
+            if !is_valid_search_query(&query) {
+                return Err("I need a search query.".into());
+            }
+            if provider == "youtube" || provider == "you tube" {
+                return Ok(DesktopActionRequest {
+                    tool_name: "browser.open".into(),
+                    params: json!({
+                        "url": youtube_search_url(&query),
+                        "query": query,
+                        "provider": "youtube",
+                        "query_mode": resolution.query_mode.as_ref().map(QueryMode::as_str),
+                    }),
+                    preview_only: false,
+                    reason: Some("User requested a YouTube search".into()),
+                });
+            }
+            Ok(DesktopActionRequest {
+                tool_name: "browser.search".into(),
+                params: json!({
+                    "query": query,
+                    "provider": provider,
+                    "query_mode": resolution.query_mode.as_ref().map(QueryMode::as_str),
+                }),
+                preview_only: false,
+                reason: Some("User requested a web search".into()),
+            })
+        }
+        ActionOperation::BrowserOpen => {
+            let url = entity_str_any(resolution, &["url"])
+                .ok_or_else(|| "I need the URL to open.".to_string())?;
+            if !is_http_url(&url) {
+                return Err("I can open web URLs when they include http:// or https://.".into());
+            }
+            Ok(DesktopActionRequest {
+                tool_name: "browser.open".into(),
+                params: json!({"url": url}),
+                preview_only: false,
+                reason: Some("User requested opening a URL".into()),
+            })
+        }
+        ActionOperation::DesktopLaunchApp => {
+            let app_or_path =
+                entity_str_any(resolution, &["path", "app", "app_name", "application", "name"])
+                    .ok_or_else(|| {
+                        "I need the app name or executable path to launch.".to_string()
+                    })?;
+            let path = resolve_app_alias(&app_or_path).unwrap_or(app_or_path);
+            Ok(DesktopActionRequest {
+                tool_name: "desktop.launch_app".into(),
+                params: json!({"path": path, "args": Vec::<String>::new()}),
+                preview_only: false,
+                reason: Some("User requested launching a desktop app".into()),
+            })
+        }
+        ActionOperation::ScreenGuidedBrowserWorkflow
+        | ActionOperation::ScreenGuidedFollowupAction
+        | ActionOperation::ScreenGuidedNavigationWorkflow => Err(
+            "Screen-guided workflows are recognized, but interactive UI control is not available in this runtime yet."
+                .into(),
+        ),
+        ActionOperation::Unknown => Err(
+            "I understood this as an action request, but I need a clearer target before running anything."
+                .into(),
+        ),
+    }
+}
+
+fn model_operation(params: &Value) -> Option<ActionOperation> {
+    param_str(params, "operation")
+        .as_deref()
+        .and_then(ActionOperation::from_str)
+}
+
+fn model_domain(params: &Value) -> Option<ActionDomain> {
+    match param_str(params, "domain")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "filesystem" | "file" => Some(ActionDomain::Filesystem),
+        "browser" | "web" => Some(ActionDomain::Browser),
+        "desktop" => Some(ActionDomain::Desktop),
+        "terminal" => Some(ActionDomain::Terminal),
+        "browser_screen_interaction" | "screen_browser" => {
+            Some(ActionDomain::BrowserScreenInteraction)
+        }
+        "screen_interaction" | "screen_navigation" => Some(ActionDomain::Screen),
+        "screen" => Some(ActionDomain::Screen),
+        "unknown" => Some(ActionDomain::Unknown),
+        _ => None,
+    }
+}
+
+fn infer_resolution_operation(
+    intent: &SemanticIntent,
+    lower: &str,
+    params: &Value,
+) -> Option<ActionOperation> {
+    if looks_like_screen_guided_browser_workflow(lower) {
+        return Some(ActionOperation::ScreenGuidedBrowserWorkflow);
+    }
+    if looks_like_screen_guided_followup_action(lower) {
+        return Some(ActionOperation::ScreenGuidedFollowupAction);
+    }
+    if looks_like_screen_guided_navigation_workflow(lower) {
+        return Some(ActionOperation::ScreenGuidedNavigationWorkflow);
+    }
+
+    match intent.action {
+        SemanticAction::FilesystemRead => Some(if looks_like_file_summary_request(lower) {
+            ActionOperation::ReadAndSummarizeFile
+        } else {
+            ActionOperation::ReadFile
+        }),
+        SemanticAction::FilesystemSearch => Some(ActionOperation::SearchFile),
+        SemanticAction::FilesystemWrite => Some(ActionOperation::WriteFile),
+        SemanticAction::BrowserSearch => Some(ActionOperation::BrowserSearch),
+        SemanticAction::BrowserOpenUrl => {
+            if param_str(params, "url")
+                .map(|url| url.contains("youtube.com/results") || url.contains("google.com/search"))
+                .unwrap_or(false)
+            {
+                Some(ActionOperation::BrowserSearch)
+            } else {
+                Some(ActionOperation::BrowserOpen)
+            }
+        }
+        SemanticAction::DesktopLaunchApp => Some(ActionOperation::DesktopLaunchApp),
+        SemanticAction::TerminalRun | SemanticAction::None | SemanticAction::Unknown => None,
+    }
+}
+
+fn infer_textual_resolution_operation(lower: &str) -> Option<ActionOperation> {
+    if looks_like_screen_guided_browser_workflow(lower) {
+        return Some(ActionOperation::ScreenGuidedBrowserWorkflow);
+    }
+    if looks_like_screen_guided_followup_action(lower) {
+        return Some(ActionOperation::ScreenGuidedFollowupAction);
+    }
+    if looks_like_screen_guided_navigation_workflow(lower) {
+        return Some(ActionOperation::ScreenGuidedNavigationWorkflow);
+    }
+    if looks_like_file_read_or_summary_request(lower) {
+        return Some(if looks_like_file_summary_request(lower) {
+            ActionOperation::ReadAndSummarizeFile
+        } else {
+            ActionOperation::ReadFile
+        });
+    }
+    if looks_like_search_request(lower) {
+        return Some(ActionOperation::BrowserSearch);
+    }
+    None
+}
+
+fn domain_for_operation(operation: &ActionOperation, intent: &SemanticIntent) -> ActionDomain {
+    match operation {
+        ActionOperation::ReadFile
+        | ActionOperation::ReadAndSummarizeFile
+        | ActionOperation::WriteFile
+        | ActionOperation::SearchFile => ActionDomain::Filesystem,
+        ActionOperation::BrowserSearch | ActionOperation::BrowserOpen => ActionDomain::Browser,
+        ActionOperation::DesktopLaunchApp => ActionDomain::Desktop,
+        ActionOperation::ScreenGuidedBrowserWorkflow => ActionDomain::BrowserScreenInteraction,
+        ActionOperation::ScreenGuidedFollowupAction
+        | ActionOperation::ScreenGuidedNavigationWorkflow => ActionDomain::Screen,
+        ActionOperation::Unknown => match intent.target {
+            CapabilityTarget::Browser => ActionDomain::Browser,
+            CapabilityTarget::FilesystemRead
+            | CapabilityTarget::FilesystemWrite
+            | CapabilityTarget::FilesystemSearch => ActionDomain::Filesystem,
+            CapabilityTarget::DesktopLaunch => ActionDomain::Desktop,
+            CapabilityTarget::Terminal => ActionDomain::Terminal,
+            CapabilityTarget::Screen => ActionDomain::Screen,
+            _ => ActionDomain::Unknown,
+        },
+    }
+}
+
+fn normalized_resolution_entities(
+    params: &Value,
+    original: &str,
+    operation: &ActionOperation,
+) -> Value {
+    let mut entities = params
+        .get("entities")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for key in [
+        "path",
+        "file_name",
+        "filename",
+        "name",
+        "query",
+        "query_candidate",
+        "search_query",
+        "url",
+        "content",
+        "mode",
+        "location_hint",
+        "root",
+        "pattern",
+        "app",
+        "app_name",
+    ] {
+        if let Some(value) = param_str(params, key) {
+            entities.entry(key).or_insert_with(|| json!(value));
+        }
+    }
+
+    if matches!(
+        operation,
+        ActionOperation::ReadFile
+            | ActionOperation::ReadAndSummarizeFile
+            | ActionOperation::WriteFile
+            | ActionOperation::SearchFile
+    ) {
+        if !has_any_entity(
+            &Value::Object(entities.clone()),
+            &["path", "file_name", "filename"],
+        ) {
+            if let Some(file_name) = infer_file_name_from_text(original) {
+                entities.insert("filename".into(), json!(file_name));
+            }
+        }
+        if mentions_desktop(original)
+            && !has_any_entity(&Value::Object(entities.clone()), &["location_hint", "root"])
+        {
+            entities.insert("location_hint".into(), json!("desktop"));
+        }
+    }
+
+    if matches!(operation, ActionOperation::BrowserSearch) {
+        let provider = param_str_any_deep(params, &["provider", "search_provider", "engine"])
+            .or_else(|| infer_search_provider(&original.to_lowercase()))
+            .unwrap_or_else(|| "web".into());
+        entities
+            .entry("provider")
+            .or_insert_with(|| json!(provider.clone()));
+        if !has_any_entity(
+            &Value::Object(entities.clone()),
+            &["query_candidate", "query"],
+        ) {
+            let search_provider = if provider.eq_ignore_ascii_case("youtube")
+                || provider.eq_ignore_ascii_case("you tube")
+            {
+                SearchProvider::YouTube
+            } else {
+                SearchProvider::Google
+            };
+            if let Some(query) = extract_search_query(original, search_provider) {
+                entities.insert("query_candidate".into(), json!(query));
+            }
+        }
+    }
+
+    Value::Object(entities)
+}
+
+fn normalized_post_processing(params: &Value, operation: &ActionOperation) -> Value {
+    let mut post_processing = params
+        .get("post_processing")
+        .filter(|value| value.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if matches!(operation, ActionOperation::ReadAndSummarizeFile) {
+        post_processing["mode"] = json!("summary");
+        post_processing["summary_style"] = post_processing
+            .get("summary_style")
+            .cloned()
+            .unwrap_or_else(|| json!("concise"));
+    }
+    post_processing
+}
+
+fn resolve_file_read_path(entities: &Value, original: &str) -> Option<String> {
+    if let Some(path) = param_str(entities, "path") {
+        return Some(resolve_desktop_relative_path(&path, original));
+    }
+
+    let file_name = param_str_any(entities, &["file_name", "filename", "name"])
+        .or_else(|| infer_file_name_from_text(original))?;
+    Some(resolve_desktop_relative_path(&file_name, original))
+}
+
+fn entity_str_any(resolution: &ActionResolution, keys: &[&str]) -> Option<String> {
+    param_str_any(&resolution.entities, keys)
+}
+
+fn param_str_any_deep(params: &Value, keys: &[&str]) -> Option<String> {
+    param_str_any(params, keys).or_else(|| {
+        params
+            .get("entities")
+            .and_then(|entities| param_str_any(entities, keys))
+    })
+}
+
+fn has_any_entity(entities: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| param_str(entities, key).is_some())
+}
+
+fn infer_query_mode(original: &str, operation: &ActionOperation) -> Option<QueryMode> {
+    if !matches!(operation, ActionOperation::BrowserSearch) {
+        return None;
+    }
+    let lower = original.to_lowercase();
+    if original.contains('"') || original.contains('\'') || lower.contains("esatto") {
+        return Some(QueryMode::Precise);
+    }
+    if lower.contains("una canzone")
+        || lower.contains("un brano")
+        || lower.contains("un video")
+        || lower.contains("qualcosa")
+        || lower.contains("something")
+        || lower.contains("a song")
+        || lower.contains("a video")
+    {
+        return Some(QueryMode::Semantic);
+    }
+    Some(QueryMode::Precise)
+}
+
+fn infer_search_provider(lower: &str) -> Option<String> {
+    if lower.contains("youtube") || lower.contains("you tube") {
+        Some("youtube".into())
+    } else if lower.contains("google") {
+        Some("google".into())
+    } else if lower.contains("web") || lower.contains("internet") || lower.contains("online") {
+        Some("web".into())
+    } else {
+        None
     }
 }
 
@@ -917,6 +1446,18 @@ fn fallback_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
             "screen capability fallback",
         ));
     }
+    if let Some(workflow) = infer_screen_guided_browser_workflow_intent(lower, original) {
+        return Some(workflow);
+    }
+    if let Some(followup) = infer_screen_guided_followup_intent(lower, original) {
+        return Some(followup);
+    }
+    if let Some(navigation) = infer_screen_guided_navigation_intent(lower, original) {
+        return Some(navigation);
+    }
+    if let Some(file_read) = infer_file_read_or_summary_intent(lower, original) {
+        return Some(file_read);
+    }
     if let Some(params) = infer_file_write_params_from_text(original) {
         return Some(intent(
             SemanticIntentKind::ToolActionRequest,
@@ -1221,6 +1762,173 @@ fn infer_file_write_params_from_text(original: &str) -> Option<Value> {
     Some(Value::Object(params))
 }
 
+fn infer_file_read_or_summary_intent(lower: &str, original: &str) -> Option<SemanticIntent> {
+    if !looks_like_file_read_or_summary_request(lower) {
+        return None;
+    }
+
+    let operation = if looks_like_file_summary_request(lower) {
+        "read_and_summarize_file"
+    } else {
+        "read_file"
+    };
+    let mut entities = serde_json::Map::new();
+    if let Some(file_name) = infer_file_name_from_text(original) {
+        entities.insert("filename".into(), json!(file_name));
+    }
+    if mentions_desktop(original) {
+        entities.insert("location_hint".into(), json!("desktop"));
+    }
+
+    Some(intent(
+        SemanticIntentKind::ToolActionRequest,
+        CapabilityTarget::FilesystemRead,
+        SemanticAction::FilesystemRead,
+        json!({
+            "operation": operation,
+            "domain": "filesystem",
+            "entities": Value::Object(entities),
+            "post_processing": if operation == "read_and_summarize_file" {
+                json!({"mode": "summary", "summary_style": "concise"})
+            } else {
+                json!({})
+            },
+        }),
+        0.68,
+        "file read action resolution fallback",
+    ))
+}
+
+fn infer_screen_guided_browser_workflow_intent(
+    lower: &str,
+    original: &str,
+) -> Option<SemanticIntent> {
+    if !looks_like_screen_guided_browser_workflow(lower) {
+        return None;
+    }
+
+    let provider = infer_search_provider(lower).unwrap_or_else(|| "web".into());
+    let query_provider = if provider == "youtube" {
+        SearchProvider::YouTube
+    } else {
+        SearchProvider::Google
+    };
+    let query = extract_search_query(original, query_provider);
+
+    Some(intent(
+        SemanticIntentKind::ToolActionRequest,
+        CapabilityTarget::Browser,
+        SemanticAction::Unknown,
+        json!({
+            "operation": "screen_guided_browser_workflow",
+            "domain": "browser_screen_interaction",
+            "provider": provider.clone(),
+            "query_mode": query.as_ref().map(|_| "semantic"),
+            "entities": {
+                "provider": provider.clone(),
+                "query_candidate": query,
+            },
+            "workflow_steps": [
+                "locate_existing_browser_tab",
+                "focus_search_input",
+                "enter_query",
+                "submit_search",
+                "open_first_result"
+            ],
+            "requires_screen_context": true,
+        }),
+        0.56,
+        "screen-guided browser workflow resolution fallback",
+    ))
+}
+
+fn infer_screen_guided_followup_intent(lower: &str, _original: &str) -> Option<SemanticIntent> {
+    if !looks_like_screen_guided_followup_action(lower) {
+        return None;
+    }
+
+    if looks_like_screen_guided_typing_followup(lower) {
+        let query = extract_screen_typing_value(_original);
+        return Some(intent(
+            SemanticIntentKind::ToolActionRequest,
+            CapabilityTarget::Screen,
+            SemanticAction::Unknown,
+            json!({
+                "operation": "screen_guided_followup_action",
+                "domain": "screen_interaction",
+                "entities": {
+                    "query_candidate": query,
+                    "requires_recent_focus_target": true,
+                },
+                "workflow_steps": ["enter_text"],
+                "requires_screen_context": true,
+            }),
+            0.52,
+            "screen-guided typing follow-up resolution fallback",
+        ));
+    }
+
+    Some(intent(
+        SemanticIntentKind::ToolActionRequest,
+        CapabilityTarget::Screen,
+        SemanticAction::Unknown,
+        json!({
+            "operation": "screen_guided_followup_action",
+            "domain": "screen_interaction",
+            "entities": {
+                "selection_strategy": if lower.contains("primo") || lower.contains("first") {
+                    "first_visible_result"
+                } else {
+                    "referenced_visible_element"
+                }
+            },
+            "workflow_steps": if lower.contains("primo") || lower.contains("first") {
+                json!(["open_ranked_result"])
+            } else {
+                json!(["click_visible_element"])
+            },
+            "requires_screen_context": true,
+        }),
+        0.54,
+        "screen-guided follow-up action resolution fallback",
+    ))
+}
+
+fn infer_screen_guided_navigation_intent(lower: &str, _original: &str) -> Option<SemanticIntent> {
+    if !looks_like_screen_guided_navigation_workflow(lower) {
+        return None;
+    }
+
+    Some(intent(
+        SemanticIntentKind::ToolActionRequest,
+        CapabilityTarget::Screen,
+        SemanticAction::Unknown,
+        json!({
+            "operation": "screen_guided_navigation_workflow",
+            "domain": "screen_navigation",
+            "workflow_steps": ["navigate_back"],
+            "requires_screen_context": true,
+        }),
+        0.52,
+        "screen-guided navigation workflow resolution fallback",
+    ))
+}
+
+fn extract_screen_typing_value(original: &str) -> Option<String> {
+    [
+        "ora scrivi",
+        "adesso scrivi",
+        "scrivi qui",
+        "scrivi nel campo",
+        "now type",
+        "type here",
+    ]
+    .iter()
+    .find_map(|marker| extract_after_marker(original, marker))
+    .map(trim_query_edges)
+    .filter(|value| !value.is_empty())
+}
+
 fn infer_file_content_from_text(original: &str) -> Option<String> {
     let markers = [
         "contenente",
@@ -1388,8 +2096,99 @@ fn looks_like_file_write_action_request(lower: &str) -> bool {
     file && (looks_like_file_create_request(lower) || write)
 }
 
+fn looks_like_file_read_or_summary_request(lower: &str) -> bool {
+    let file = lower.contains("file")
+        || lower.contains(".txt")
+        || lower.contains("documento")
+        || lower.contains("contenuto del");
+    if file && looks_like_file_summary_request(lower) {
+        return true;
+    }
+
+    let read = lower.contains("leggimi")
+        || lower.contains("leggi ")
+        || lower.starts_with("leggi")
+        || lower.contains("read ")
+        || lower.contains("mostrami")
+        || lower.contains("contenuto");
+    file && (read || looks_like_file_summary_request(lower))
+        && !looks_like_file_write_action_request(lower)
+}
+
+fn looks_like_file_summary_request(lower: &str) -> bool {
+    (lower.contains("riassunt")
+        || lower.contains("sintesi")
+        || lower.contains("summar")
+        || lower.contains("summary"))
+        && (lower.contains("file") || lower.contains(".txt") || lower.contains("documento"))
+}
+
+fn looks_like_screen_guided_browser_workflow(lower: &str) -> bool {
+    let browser_context = lower.contains("tab")
+        || lower.contains("scheda")
+        || lower.contains("chrome")
+        || lower.contains("browser");
+    let search_context = lower.contains("youtube")
+        || lower.contains("google")
+        || lower.contains("cerca")
+        || lower.contains("cerchi")
+        || lower.contains("search");
+    let follow_through = lower.contains("primo risultato")
+        || lower.contains("first result")
+        || lower.contains("aprimi il primo")
+        || lower.contains("open the first");
+
+    browser_context && search_context && follow_through
+}
+
+fn looks_like_screen_guided_followup_action(lower: &str) -> bool {
+    if looks_like_screen_guided_typing_followup(lower) {
+        return true;
+    }
+
+    let click_or_open = lower.contains("clicca")
+        || lower.contains("click")
+        || lower.contains("premi")
+        || lower.contains("apri")
+        || lower.contains("open");
+    let visible_reference = lower.contains("primo risultato")
+        || lower.contains("first result")
+        || lower.contains("quello")
+        || lower.contains("quella")
+        || lower.contains("che vedi")
+        || lower.contains("visible");
+
+    click_or_open && visible_reference
+}
+
+fn looks_like_screen_guided_typing_followup(lower: &str) -> bool {
+    let typing = lower.contains("ora scrivi")
+        || lower.contains("adesso scrivi")
+        || lower.contains("scrivi qui")
+        || lower.contains("scrivi nel campo")
+        || lower.contains("type here")
+        || lower.contains("now type");
+    typing && !looks_like_file_write_action_request(lower)
+}
+
+fn looks_like_screen_guided_navigation_workflow(lower: &str) -> bool {
+    (lower.contains("torna")
+        || lower.contains("back")
+        || lower.contains("indietro")
+        || lower.contains("go back"))
+        && (lower.contains("schermata")
+            || lower.contains("screen")
+            || lower.contains("pagina")
+            || lower.contains("prima")
+            || lower.contains("previous"))
+}
+
 fn looks_like_governed_action_request(lower: &str) -> bool {
     if looks_like_file_write_action_request(lower)
+        || looks_like_file_read_or_summary_request(lower)
+        || looks_like_screen_guided_browser_workflow(lower)
+        || looks_like_screen_guided_followup_action(lower)
+        || looks_like_screen_guided_navigation_workflow(lower)
         || looks_like_chrome_launch_request(lower)
         || lower.contains("http://")
         || lower.contains("https://")
@@ -2109,7 +2908,8 @@ fn browser_executable() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_action_request, fallback_intent};
+    use super::{build_action_request, fallback_intent, resolve_action_resolution};
+    use crate::action_resolution::{ActionOperation, QueryMode};
     use crate::semantic_intent::{CapabilityTarget, SemanticAction, SemanticIntentKind};
     use serde_json::json;
 
@@ -2336,6 +3136,98 @@ mod tests {
 
         assert_eq!(action.tool_name, "browser.open");
         assert!(url.contains("youtube.com/results?search_query=shiva+canzone"));
+    }
+
+    #[test]
+    fn file_read_resolution_builds_filesystem_read_action() {
+        let original = "leggimi il contenuto del file test.txt sul desktop";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected file read fallback");
+        let resolution =
+            resolve_action_resolution(&intent, original).expect("expected typed resolution");
+        let action =
+            super::build_action_request_from_resolution(&resolution, original).expect("action");
+
+        assert_eq!(resolution.operation, ActionOperation::ReadFile);
+        assert_eq!(action.tool_name, "filesystem.read_text");
+        assert!(action
+            .params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap()
+            .ends_with("test.txt"));
+    }
+
+    #[test]
+    fn file_summary_resolution_uses_read_tool_with_summary_post_processing() {
+        let original = "fammi un riassunto del contenuto del file test.txt sul desktop";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected file summary fallback");
+        let resolution =
+            resolve_action_resolution(&intent, original).expect("expected typed resolution");
+        let action =
+            super::build_action_request_from_resolution(&resolution, original).expect("action");
+
+        assert_eq!(resolution.operation, ActionOperation::ReadAndSummarizeFile);
+        assert_eq!(intent.action, SemanticAction::FilesystemRead);
+        assert_eq!(action.tool_name, "filesystem.read_text");
+        assert_eq!(
+            action
+                .params
+                .get("post_processing")
+                .and_then(|value| value.get("mode"))
+                .and_then(|value| value.as_str()),
+            Some("summary")
+        );
+    }
+
+    #[test]
+    fn semantic_youtube_search_resolution_uses_semantic_query_mode() {
+        let original = "cercami una canzone di Shiva su YouTube";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let resolution =
+            resolve_action_resolution(&intent, original).expect("expected typed resolution");
+        let action =
+            super::build_action_request_from_resolution(&resolution, original).expect("action");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(resolution.operation, ActionOperation::BrowserSearch);
+        assert_eq!(resolution.query_mode, Some(QueryMode::Semantic));
+        assert_eq!(resolution.provider.as_deref(), Some("youtube"));
+        assert!(url.contains("youtube.com/results?search_query=Shiva+canzone"));
+    }
+
+    #[test]
+    fn precise_youtube_search_resolution_preserves_precise_mode() {
+        let original = "cerca su youtube stella stellina";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let resolution =
+            resolve_action_resolution(&intent, original).expect("expected typed resolution");
+
+        assert_eq!(resolution.operation, ActionOperation::BrowserSearch);
+        assert_eq!(resolution.query_mode, Some(QueryMode::Precise));
+    }
+
+    #[test]
+    fn screen_guided_browser_workflow_is_represented_not_executed_as_simple_search() {
+        let original = "vai sulla tab che ho aperta di google chrome dedicata a youtube, cercami una canzone di shiva e aprimi il primo risultato";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected workflow fallback");
+        let resolution =
+            resolve_action_resolution(&intent, original).expect("expected typed resolution");
+
+        assert_eq!(
+            resolution.operation,
+            ActionOperation::ScreenGuidedBrowserWorkflow
+        );
+        assert!(resolution.requires_screen_context);
+        assert!(!resolution.workflow_steps.is_empty());
     }
 
     #[test]

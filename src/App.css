@@ -185,7 +185,6 @@ input {
     display: flex;
     flex-direction: column;
     gap: 14px;
-    overflow: auto;
 }
 
 .message {
@@ -369,16 +368,6 @@ input {
     display: flex;
     justify-content: center;
     align-items: center;
-}
-
-.desktop-agent-panel {
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-    background: rgb(255, 255, 255);
-    padding: 12px 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    max-height: 42%;
 }
 
 .desktop-agent-panel__header {
