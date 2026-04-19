@@ -1,6 +1,6 @@
 import { IoClose } from "react-icons/io5";
 import { MdOutlineMinimize } from "react-icons/md";
-import { LuMonitor, LuMonitorOff } from "react-icons/lu";
+import { LuBrain, LuMonitor, LuMonitorOff } from "react-icons/lu";
 
 import { Button } from "../ui/buttons/Button";
 
@@ -39,8 +39,8 @@ export function AssistantHeader({
                 </div>
 
                 <div className="flex">
-                    <Button variant="text" radius="full" size="xs" title="Desktop agent panel" onClick={onToggleDesktopPanel}>
-                        {isDesktopPanelOpen ? "Agent −" : "Agent +"}
+                    <Button variant={isDesktopPanelOpen ? "primary" : "text"} radius="full" size="xs" title={`Desktop agent panel: ${isDesktopPanelOpen ? "Open" : "Closed"}`} onClick={onToggleDesktopPanel}>
+                        <LuBrain />
                     </Button>
                     <Button variant="text" radius="full" size="xs" title={isPinned ? "Rimuovi fissaggio" : "Fissa la finestra sempre on top"} onClick={onTogglePin}>
                         {isPinned ? <LuMonitorOff /> : <LuMonitor />}
