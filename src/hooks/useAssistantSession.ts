@@ -27,11 +27,11 @@ import type {
 import type { ConversationRouteDiagnostic } from "../types/desktopAgent";
 
 const INITIAL_MESSAGES: ChatMessage[] = [
-    {
+    /*{
         id: crypto.randomUUID(),
         role: "assistant",
         content: "Ciao. Sono pronta. Dimmi pure cosa vuoi fare.",
-    },
+    },*/
 ];
 
 const EMPTY_RESPONSE_FALLBACK =

@@ -29,13 +29,10 @@ export function AssistantHeader({
 }: AssistantHeaderProps) {
     return (
         <>
-            <header className="overlay-topbar" >
-                <div className="overlay-brand w-full cursor-move"  onMouseDown={startDrag}>
-                    <div>
-                        <p className="overlay-kicker">PERSONAL AI</p>
-                        <h1>Astra</h1>
-                        <p className="assistant-model-label">Model: {activeModel} | {statusLabel}</p>
-                    </div>
+            <header className="overlay-topbar pl-2 pr-1" >
+                <div className="w-fullcursor-move flex w-full space-x-1 cursor-move" onMouseDown={startDrag}>
+                    <span title="Modello attivo" className="p-2 rounded-full text-xs bg-gray-200/80 text-gray-500">{activeModel}</span>
+                    <span title="Stato attuale" className="p-2 rounded-full text-xs bg-gray-200/80 text-gray-500">{statusLabel}</span>
                 </div>
 
                 <div className="flex">
