@@ -5,12 +5,20 @@ import type {
     DesktopAuditEvent,
     DesktopPolicySnapshot,
     PendingApproval,
-    ScreenAnalysisResult,
+    //ScreenAnalysisResult,
     ScreenCaptureResult,
     ScreenObservationStatus,
     ToolDescriptor,
 } from "../types/desktopAgent";
 import { Button } from "../ui/buttons/Button";
+import Switch from "../ui/input/Switch";
+
+import { RxReload } from "react-icons/rx";
+import { IoClose } from "react-icons/io5";
+import { RiScreenshot2Line } from "react-icons/ri";
+import { MdOutlinePolicy } from "react-icons/md";
+import { LuMonitor } from "react-icons/lu";
+import { VscTools } from "react-icons/vsc";
 
 type DesktopAgentPanelProps = {
     isOpen: boolean;
@@ -29,9 +37,9 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
     const [audit, setAudit] = useState<DesktopAuditEvent[]>([]);
     const [screenStatus, setScreenStatus] = useState<ScreenObservationStatus | null>(null);
     const [lastCapture, setLastCapture] = useState<ScreenCaptureResult | null>(null);
-    const [screenQuestion, setScreenQuestion] = useState("What am I looking at right now?");
+    /*const [screenQuestion, setScreenQuestion] = useState("What am I looking at right now?");
     const [screenAnalysis, setScreenAnalysis] = useState<ScreenAnalysisResult | null>(null);
-    const [captureFreshForAnalysis, setCaptureFreshForAnalysis] = useState(true);
+    const [captureFreshForAnalysis, setCaptureFreshForAnalysis] = useState(true);*/
     const [isBusy, setIsBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
@@ -121,7 +129,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
         }
     }, [agent]);
 
-    const handleAnalyzeScreen = useCallback(async () => {
+    /*const handleAnalyzeScreen = useCallback(async () => {
         try {
             setIsBusy(true);
             setError(null);
@@ -147,7 +155,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
         } finally {
             setIsBusy(false);
         }
-    }, [agent, captureFreshForAnalysis, refresh, screenQuestion]);
+    }, [agent, captureFreshForAnalysis, refresh, screenQuestion]);*/
 
     if (!isOpen) {
         return null;
@@ -161,18 +169,18 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                     <h2>Approval Center</h2>
                     <p className="desktop-agent-panel__subtitle">{approvalCountLabel}</p>
                 </div>
-                <div className="desktop-agent-panel__actions">
-                    <Button variant="secondary" radius="full" size="xs" onClick={() => void refresh()}>
-                        Refresh
+                <div>
+                    <Button variant="text" title="Aggiorna i dati" radius="full" size="xs" onClick={() => void refresh()}>
+                        <RxReload />
                     </Button>
-                    <Button variant="text" radius="full" size="xs" onClick={onClose}>
-                        Close
+                    <Button variant="text" title="Chiudi sezione" radius="full" size="xs" onClick={onClose}>
+                        <IoClose />
                     </Button>
                 </div>
             </div>
 
             <div className="desktop-agent-tabs">
-                {(["overview", "screen", "approvals", "audit"] as ViewKey[]).map((key) => (
+                {(["overview", /*"screen",*/ "approvals", "audit"] as ViewKey[]).map((key) => (
                     <button
                         key={key}
                         className={`desktop-agent-tab ${view === key ? "active" : ""}`}
@@ -189,28 +197,33 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             {view === "overview" ? (
                 <div className="desktop-agent-section">
                     <section className="desktop-agent-card-grid">
-                        <article className="desktop-agent-card">
-                            <h3>Policy</h3>
-                            <p>Allowed roots: {policy?.allowed_roots.length ?? 0}</p>
-                            <p>Terminal allowlist: {policy?.terminal_allowed_commands.length ?? 0}</p>
-                            <p>Browser enabled: {policy?.browser_enabled ? "yes" : "no"}</p>
-                            <p>Desktop control: {policy?.desktop_control_enabled ? "yes" : "no"}</p>
-                            <p>Pending approvals: {capabilities?.approvals.pending_count ?? 0}</p>
+                        <article className="desktop-agent-card space-y-2">
+                            <span className="flex items-center text-center gap-1"><MdOutlinePolicy size={20} /><h3 className="text-lg">Policy</h3></span>
+                            <div className="text-sm">
+                                <p>Allowed roots: <strong>{policy?.allowed_roots.length ?? 0}</strong></p>
+                                <p>Terminal allowlist: <strong>{policy?.terminal_allowed_commands.length ?? 0}</strong></p>
+                                <p>Browser enabled: <strong>{policy?.browser_enabled ? "yes" : "no"}</strong></p>
+                                <p>Desktop control: <strong>{policy?.desktop_control_enabled ? "yes" : "no"}</strong></p>
+                                <p>Pending approvals: <strong>{capabilities?.approvals.pending_count ?? 0}</strong></p>
+                            </div>
+
                         </article>
-                        <article className="desktop-agent-card">
-                            <h3>Screen</h3>
-                            <p>Provider: {screenStatus?.provider ?? "unknown"}</p>
-                            <p>Enabled: {screenStatus?.enabled ? "yes" : "no"}</p>
-                            <p>Captures: {screenStatus?.capture_count ?? 0}</p>
-                            <p>Vision: {capabilities?.screen.vision_model_name ?? (capabilities?.screen.analysis_available ? "available" : "unavailable")}</p>
-                            <p className="desktop-agent-muted">{screenStatus?.note ?? "No status available"}</p>
-                            <div className="desktop-agent-inline-actions">
-                                <Button variant="secondary" radius="full" size="xs" disabled={isBusy} onClick={() => void handleToggleObservation()}>
-                                    {screenStatus?.enabled ? "Disable observation" : "Enable observation"}
-                                </Button>
-                                <Button variant="secondary" radius="full" size="xs" disabled={isBusy} onClick={() => void handleCapture()}>
-                                    Capture screen
-                                </Button>
+                        <article className="desktop-agent-card space-y-2">
+                            <span className="flex items-center text-center gap-1"><LuMonitor size={20} /><h3 className="text-lg">Screen</h3></span>
+                            <div className="text-sm">
+                                <h3>Screen</h3>
+                                <p>Provider: <strong>{screenStatus?.provider ?? "unknown"}</strong></p>
+                                <p>Enabled: <strong>{screenStatus?.enabled ? "yes" : "no"}</strong></p>
+                                <p>Captures: <strong>{screenStatus?.capture_count ?? 0}</strong></p>
+                                <p>Vision: <strong>{capabilities?.screen.vision_model_name ?? (capabilities?.screen.analysis_available ? "available" : "unavailable")}</strong></p>
+                                <p className="desktop-agent-muted">{screenStatus?.note ?? "No status available"}</p>
+                                <div className="mt-2 space-x-2">
+                                    <Switch checked={screenStatus?.enabled} onChange={() => void handleToggleObservation()} title={screenStatus?.enabled ? "Disabilita osservazione" : "Abilita osservazione"} disabled={isBusy} />
+                                    <Button variant="text" title="Cattura lo schermo (screenshot)" radius="full" size="xs" disabled={isBusy} onClick={() => void handleCapture()}>
+                                        <RiScreenshot2Line size={18} />
+                                    </Button>
+                                </div>
+
                             </div>
                             {lastCapture ? (
                                 <p className="desktop-agent-muted">Last capture: {lastCapture.image_path}</p>
@@ -218,9 +231,9 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                         </article>
                     </section>
 
-                    <section className="desktop-agent-card">
-                        <h3>Registered tools</h3>
-                        <div className="desktop-agent-tools-list">
+                    <section className="desktop-agent-card space-y-2">
+                        <span className="flex items-center text-center gap-1"><VscTools size={20} /><h3 className="text-lg">Tools</h3></span>
+                        <div className="flex flex-col text-sm pr-2 gap-2">
                             {tools.map((tool) => (
                                 <div key={tool.tool_name} className="desktop-agent-tool-row">
                                     <div>
@@ -236,7 +249,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             ) : null}
 
 
-            {view === "screen" ? (
+            {/*view === "screen" ? (
                 <div className="desktop-agent-section">
                     <section className="desktop-agent-card">
                         <h3>Screen context</h3>
@@ -273,7 +286,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                         ) : null}
                     </section>
                 </div>
-            ) : null}
+            ) : null*/}
 
             {view === "approvals" ? (
                 <div className="desktop-agent-section">
@@ -316,7 +329,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                                 <article key={event.audit_id} className="desktop-agent-card desktop-agent-audit-card">
                                     <div className="desktop-agent-audit-header">
                                         <strong>{event.tool_name}</strong>
-                                        <span>{event.status}</span>
+                                        <span className="border rounded-full px-2 text-sm border-gray-400 text-gray-500">{event.status}</span>
                                     </div>
                                     <p>{event.stage} · {new Date(event.timestamp).toLocaleString()}</p>
                                     <pre className="desktop-agent-json">{JSON.stringify(event.details, null, 2)}</pre>

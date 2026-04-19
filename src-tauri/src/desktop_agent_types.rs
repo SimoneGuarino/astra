@@ -107,7 +107,6 @@ pub struct ScreenCaptureResult {
     pub provider: String,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenAnalysisRequest {
     #[serde(default)]
@@ -152,12 +151,39 @@ pub struct DesktopPolicySnapshot {
     pub desktop_control_enabled: bool,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityToolAvailability {
     pub available: bool,
     pub enabled: bool,
     pub requires_approval: bool,
+    pub state: CapabilityRuntimeState,
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRuntimeState {
+    Unavailable,
+    Disabled,
+    ApprovalGated,
+    Ready,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityToolState {
+    pub tool_name: String,
+    pub category: String,
+    pub description: String,
+    pub required_permissions: Vec<Permission>,
+    pub default_risk: RiskLevel,
+    pub requires_confirmation: bool,
+    pub available: bool,
+    pub enabled: bool,
+    pub requires_approval: bool,
+    pub state: CapabilityRuntimeState,
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +195,9 @@ pub struct CapabilityScreenState {
     pub vision_model_available: bool,
     pub vision_model_name: Option<String>,
     pub recent_capture_available: bool,
+    pub recent_capture_age_ms: Option<u64>,
+    pub fresh_capture_available: bool,
+    pub fresh_capture_requires_observation_enabled: bool,
     pub last_capture_path: Option<String>,
     pub last_frame_at: Option<u64>,
     pub provider: String,
@@ -179,6 +208,17 @@ pub struct CapabilityScreenState {
 pub struct CapabilityApprovalState {
     pub pending_count: usize,
     pub approval_required_for_high_risk: bool,
+    #[serde(default)]
+    pub pending_actions: Vec<CapabilityPendingApprovalSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityPendingApprovalSummary {
+    pub action_id: String,
+    pub tool_name: String,
+    pub risk_level: RiskLevel,
+    pub reason: String,
+    pub requested_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,7 +232,12 @@ pub struct CapabilityPermissionState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapabilityManifest {
+    pub version: String,
+    pub generated_at: u64,
     pub tool_names: Vec<String>,
+    pub enabled_tool_names: Vec<String>,
+    pub disabled_tool_names: Vec<String>,
+    pub tools: Vec<CapabilityToolState>,
     pub filesystem_read: CapabilityToolAvailability,
     pub filesystem_write: CapabilityToolAvailability,
     pub filesystem_search: CapabilityToolAvailability,
@@ -210,4 +255,30 @@ pub struct VisionAvailability {
     pub available: bool,
     pub selected_model: Option<String>,
     pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationRouteDiagnostic {
+    pub message_excerpt: String,
+    pub classifier_source: String,
+    pub intent: String,
+    pub target: Option<String>,
+    pub action: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub extracted_params: Option<Value>,
+    pub confidence: Option<f32>,
+    pub routed_to: String,
+    pub grounded: bool,
+    pub fallback_used: bool,
+    pub submit_action_called: bool,
+    #[serde(default)]
+    pub action_id: Option<String>,
+    #[serde(default)]
+    pub action_status: Option<String>,
+    pub approval_created: bool,
+    pub audit_expected: bool,
+    pub rationale: Option<String>,
+    pub error: Option<String>,
 }

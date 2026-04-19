@@ -76,6 +76,8 @@ pub struct AudioPlaybackEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioSessionCompletedRequest {
     pub request_id: String,
+    #[serde(default)]
+    pub had_failures: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -112,6 +112,28 @@ export type CapabilityToolAvailability = {
     available: boolean;
     enabled: boolean;
     requires_approval: boolean;
+    state: CapabilityRuntimeState;
+    disabled_reason?: string | null;
+};
+
+export type CapabilityRuntimeState =
+    | "unavailable"
+    | "disabled"
+    | "approval_gated"
+    | "ready";
+
+export type CapabilityToolState = {
+    tool_name: string;
+    category: string;
+    description: string;
+    required_permissions: DesktopPermission[];
+    default_risk: DesktopRiskLevel;
+    requires_confirmation: boolean;
+    available: boolean;
+    enabled: boolean;
+    requires_approval: boolean;
+    state: CapabilityRuntimeState;
+    disabled_reason?: string | null;
 };
 
 export type CapabilityScreenState = {
@@ -122,6 +144,9 @@ export type CapabilityScreenState = {
     vision_model_available: boolean;
     vision_model_name: string | null;
     recent_capture_available: boolean;
+    recent_capture_age_ms: number | null;
+    fresh_capture_available: boolean;
+    fresh_capture_requires_observation_enabled: boolean;
     last_capture_path: string | null;
     last_frame_at: number | null;
     provider: string;
@@ -131,6 +156,15 @@ export type CapabilityScreenState = {
 export type CapabilityApprovalState = {
     pending_count: number;
     approval_required_for_high_risk: boolean;
+    pending_actions: CapabilityPendingApprovalSummary[];
+};
+
+export type CapabilityPendingApprovalSummary = {
+    action_id: string;
+    tool_name: string;
+    risk_level: DesktopRiskLevel;
+    reason: string;
+    requested_at: number;
 };
 
 export type CapabilityPermissionState = {
@@ -142,7 +176,12 @@ export type CapabilityPermissionState = {
 };
 
 export type CapabilityManifest = {
+    version: string;
+    generated_at: number;
     tool_names: string[];
+    enabled_tool_names: string[];
+    disabled_tool_names: string[];
+    tools: CapabilityToolState[];
     filesystem_read: CapabilityToolAvailability;
     filesystem_write: CapabilityToolAvailability;
     filesystem_search: CapabilityToolAvailability;
@@ -153,4 +192,25 @@ export type CapabilityManifest = {
     screen: CapabilityScreenState;
     approvals: CapabilityApprovalState;
     permissions: CapabilityPermissionState;
+};
+
+export type ConversationRouteDiagnostic = {
+    message_excerpt: string;
+    classifier_source: string;
+    intent: string;
+    target: string | null;
+    action: string | null;
+    tool_name?: string | null;
+    extracted_params?: unknown;
+    confidence: number | null;
+    routed_to: string;
+    grounded: boolean;
+    fallback_used: boolean;
+    submit_action_called: boolean;
+    action_id?: string | null;
+    action_status?: string | null;
+    approval_created: boolean;
+    audit_expected: boolean;
+    rationale: string | null;
+    error: string | null;
 };

@@ -29,7 +29,6 @@ function App() {
                     onToggleDesktopPanel={() => setIsDesktopPanelOpen((current) => !current)}
                     onTogglePin={windowControls.togglePin}
                     startDrag={windowControls.startDrag}
-                    status={session.status}
                     statusLabel={statusLabel}
                 />
 

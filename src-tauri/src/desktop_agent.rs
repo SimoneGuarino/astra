@@ -14,7 +14,11 @@ use crate::{
     tools_registry::ToolsRegistry,
 };
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -43,7 +47,8 @@ impl DesktopAgentRuntime {
         let policy = DesktopAgentPolicy::load_or_default(&project_root);
         let permissions = PermissionProfile::default_local_agent();
         let audit = AuditLogStore::new(&project_root);
-        let pending_store = crate::pending_approvals_store::PendingApprovalsStore::new(&project_root);
+        let pending_store =
+            crate::pending_approvals_store::PendingApprovalsStore::new(&project_root);
         let pending_entries = pending_store.load();
         let pending = pending_entries
             .into_iter()
@@ -74,39 +79,60 @@ impl DesktopAgentRuntime {
         }
     }
 
-    pub fn list_tools(&self) -> Vec<crate::desktop_agent_types::ToolDescriptor> { self.registry.list() }
+    pub fn list_tools(&self) -> Vec<crate::desktop_agent_types::ToolDescriptor> {
+        self.registry.list()
+    }
 
     pub async fn capability_manifest(&self) -> CapabilityManifest {
         let tools = self.registry.list();
         let policy = self.policy.snapshot(&self.permissions);
         let screen_status = self.screen_capture.status();
-        let pending_count = self.pending.lock().expect("pending approvals mutex poisoned").len();
+        let pending_approvals = self.pending_approvals();
         let vision = self.screen_vision.availability().await;
-        build_capability_manifest(&tools, &policy, &screen_status, pending_count, &vision)
+        build_capability_manifest(&tools, &policy, &screen_status, &pending_approvals, &vision)
     }
-    pub fn policy_snapshot(&self) -> crate::desktop_agent_types::DesktopPolicySnapshot { self.policy.snapshot(&self.permissions) }
-    pub fn recent_audit_events(&self, limit: usize) -> Vec<DesktopAuditEvent> { self.audit.tail(limit) }
-    pub fn screen_status(&self) -> ScreenObservationStatus { self.screen_capture.status() }
-    pub fn set_screen_observation_enabled(&self, enabled: bool) -> ScreenObservationStatus { self.screen_capture.set_enabled(enabled) }
-    pub fn capture_screen_snapshot(&self) -> Result<ScreenCaptureResult, String> { self.screen_capture.capture_snapshot() }
+    pub fn policy_snapshot(&self) -> crate::desktop_agent_types::DesktopPolicySnapshot {
+        self.policy.snapshot(&self.permissions)
+    }
+    pub fn recent_audit_events(&self, limit: usize) -> Vec<DesktopAuditEvent> {
+        self.audit.tail(limit)
+    }
+    pub fn screen_status(&self) -> ScreenObservationStatus {
+        self.screen_capture.status()
+    }
+    pub fn set_screen_observation_enabled(&self, enabled: bool) -> ScreenObservationStatus {
+        self.screen_capture.set_enabled(enabled)
+    }
+    pub fn capture_screen_snapshot(&self) -> Result<ScreenCaptureResult, String> {
+        self.screen_capture.capture_snapshot()
+    }
 
-    pub async fn analyze_screen(&self, request: ScreenAnalysisRequest) -> Result<ScreenAnalysisResult, String> {
-        if !self.permissions.allows(&crate::desktop_agent_types::Permission::DesktopObserve)
-            || !self.policy.permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+    pub async fn analyze_screen(
+        &self,
+        request: ScreenAnalysisRequest,
+    ) -> Result<ScreenAnalysisResult, String> {
+        if !self
+            .permissions
+            .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+            || !self
+                .policy
+                .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
         {
             return Err("Permission denied for desktop observation".into());
         }
 
-        let capture = if request.capture_fresh || self.screen_capture.latest_capture_path().is_none() {
+        let capture = if request.capture_fresh
+            || self.screen_capture.latest_capture_path().is_none()
+        {
             if !self.screen_capture.status().enabled {
                 return Err("Screen observation is disabled. Enable observation before capturing a fresh screen snapshot.".into());
             }
             self.screen_capture.capture_snapshot()?
         } else {
             let status = self.screen_capture.status();
-            let path = status
-                .last_capture_path
-                .ok_or_else(|| "No screen capture available yet. Capture a snapshot first.".to_string())?;
+            let path = status.last_capture_path.ok_or_else(|| {
+                "No screen capture available yet. Capture a snapshot first.".to_string()
+            })?;
             let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             ScreenCaptureResult {
                 capture_id: Uuid::new_v4().to_string(),
@@ -134,8 +160,14 @@ impl DesktopAgentRuntime {
             details: json!({"image_path": capture.image_path, "capture_fresh": request.capture_fresh, "question": question}),
         });
 
-        let result = self.screen_vision
-            .analyze(&capture.image_path, capture.captured_at, &capture.provider, question)
+        let result = self
+            .screen_vision
+            .analyze(
+                &capture.image_path,
+                capture.captured_at,
+                &capture.provider,
+                question,
+            )
             .await;
 
         match result {
@@ -175,12 +207,22 @@ impl DesktopAgentRuntime {
         }
     }
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
-        self.pending.lock().expect("pending approvals mutex poisoned").values().map(|e| e.approval.clone()).collect()
+        self.pending
+            .lock()
+            .expect("pending approvals mutex poisoned")
+            .values()
+            .map(|e| e.approval.clone())
+            .collect()
     }
 
     pub fn reject_pending(&self, action_id: &str, note: Option<String>) -> Result<(), String> {
-        let mut pending = self.pending.lock().expect("pending approvals mutex poisoned");
-        let Some(envelope) = pending.remove(action_id) else { return Err(format!("Pending approval not found: {action_id}")); };
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("pending approvals mutex poisoned");
+        let Some(envelope) = pending.remove(action_id) else {
+            return Err(format!("Pending approval not found: {action_id}"));
+        };
         self.persist_pending_locked(&pending)?;
         self.audit.append(&DesktopAuditEvent {
             audit_id: Uuid::new_v4().to_string(),
@@ -196,10 +238,19 @@ impl DesktopAgentRuntime {
         Ok(())
     }
 
-    pub fn approve_pending(&self, action_id: &str, note: Option<String>) -> Result<DesktopActionResponse, String> {
+    pub fn approve_pending(
+        &self,
+        action_id: &str,
+        note: Option<String>,
+    ) -> Result<DesktopActionResponse, String> {
         let envelope = {
-            let mut pending = self.pending.lock().expect("pending approvals mutex poisoned");
-            let envelope = pending.remove(action_id).ok_or_else(|| format!("Pending approval not found: {action_id}"))?;
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("pending approvals mutex poisoned");
+            let envelope = pending
+                .remove(action_id)
+                .ok_or_else(|| format!("Pending approval not found: {action_id}"))?;
             self.persist_pending_locked(&pending)?;
             envelope
         };
@@ -222,8 +273,15 @@ impl DesktopAgentRuntime {
         )
     }
 
-    pub fn submit_action(&self, request_id: String, request: DesktopActionRequest) -> Result<DesktopActionResponse, String> {
-        let descriptor = self.registry.get(&request.tool_name).ok_or_else(|| format!("Unknown tool: {}", request.tool_name))?;
+    pub fn submit_action(
+        &self,
+        request_id: String,
+        request: DesktopActionRequest,
+    ) -> Result<DesktopActionResponse, String> {
+        let descriptor = self
+            .registry
+            .get(&request.tool_name)
+            .ok_or_else(|| format!("Unknown tool: {}", request.tool_name))?;
         for permission in &descriptor.required_permissions {
             if !self.permissions.allows(permission) || !self.policy.permission_enabled(permission) {
                 return Err(format!("Permission denied for {:?}", permission));
@@ -243,19 +301,33 @@ impl DesktopAgentRuntime {
             });
         }
 
-        if descriptor.requires_confirmation || self.policy.requires_approval(&descriptor.default_risk) {
+        if descriptor.requires_confirmation
+            || self.policy.requires_approval(&descriptor.default_risk)
+        {
             let approval = PendingApproval {
                 action_id: action_id.clone(),
                 request_id: request_id.clone(),
                 tool_name: descriptor.tool_name.clone(),
                 params: request.params.clone(),
                 risk_level: descriptor.default_risk.clone(),
-                reason: request.reason.clone().unwrap_or_else(|| "Confirmation required by policy".into()),
+                reason: request
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "Confirmation required by policy".into()),
                 requested_at: now_ms(),
             };
             {
-                let mut pending = self.pending.lock().expect("pending approvals mutex poisoned");
-                pending.insert(action_id.clone(), PendingActionEnvelope { approval: approval.clone(), request });
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .expect("pending approvals mutex poisoned");
+                pending.insert(
+                    action_id.clone(),
+                    PendingActionEnvelope {
+                        approval: approval.clone(),
+                        request,
+                    },
+                );
                 self.persist_pending_locked(&pending)?;
             }
             self.audit.append(&DesktopAuditEvent {
@@ -283,8 +355,17 @@ impl DesktopAgentRuntime {
         self.execute_internal(request_id, action_id, request, false)
     }
 
-    fn execute_internal(&self, request_id: String, action_id: String, request: DesktopActionRequest, was_approved: bool) -> Result<DesktopActionResponse, String> {
-        let descriptor = self.registry.get(&request.tool_name).ok_or_else(|| format!("Unknown tool: {}", request.tool_name))?;
+    fn execute_internal(
+        &self,
+        request_id: String,
+        action_id: String,
+        request: DesktopActionRequest,
+        was_approved: bool,
+    ) -> Result<DesktopActionResponse, String> {
+        let descriptor = self
+            .registry
+            .get(&request.tool_name)
+            .ok_or_else(|| format!("Unknown tool: {}", request.tool_name))?;
         self.audit.append(&DesktopAuditEvent {
             audit_id: Uuid::new_v4().to_string(),
             action_id: action_id.clone(),
@@ -316,7 +397,11 @@ impl DesktopAgentRuntime {
                     request_id,
                     tool_name: request.tool_name,
                     status: DesktopActionStatus::Executed,
-                    message: Some(if was_approved { "Approved action executed".into() } else { "Action executed".into() }),
+                    message: Some(if was_approved {
+                        "Approved action executed".into()
+                    } else {
+                        "Action executed".into()
+                    }),
                     result: Some(result),
                     risk_level: Some(descriptor.default_risk),
                 })
@@ -338,8 +423,10 @@ impl DesktopAgentRuntime {
         }
     }
 
-
-    fn persist_pending_locked(&self, pending: &HashMap<String, PendingActionEnvelope>) -> Result<(), String> {
+    fn persist_pending_locked(
+        &self,
+        pending: &HashMap<String, PendingActionEnvelope>,
+    ) -> Result<(), String> {
         self.pending_store
             .save(pending.values().map(|entry| entry.approval.clone()))
     }
@@ -347,47 +434,167 @@ impl DesktopAgentRuntime {
     fn dispatch(&self, request: &DesktopActionRequest) -> Result<Value, String> {
         match request.tool_name.as_str() {
             "filesystem.read_text" => {
-                let path = request.params.get("path").and_then(|v| v.as_str()).ok_or_else(|| "filesystem.read_text requires params.path".to_string())?;
+                let path = request
+                    .params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "filesystem.read_text requires params.path".to_string())?;
                 self.filesystem.read_text(path)
             }
             "filesystem.write_text" => {
-                let path = request.params.get("path").and_then(|v| v.as_str()).ok_or_else(|| "filesystem.write_text requires params.path".to_string())?;
-                let content = request.params.get("content").and_then(|v| v.as_str()).ok_or_else(|| "filesystem.write_text requires params.content".to_string())?;
-                let mode = request.params.get("mode").and_then(|v| v.as_str()).unwrap_or("overwrite");
+                let path = request
+                    .params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "filesystem.write_text requires params.path".to_string())?;
+                let create_empty = request
+                    .params
+                    .get("create_empty")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let content = request
+                    .params
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| create_empty.then_some(""))
+                    .ok_or_else(|| "filesystem.write_text requires params.content".to_string())?;
+                let mode = request
+                    .params
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("overwrite");
                 self.filesystem.write_text(path, content, mode)
             }
             "filesystem.search" => {
                 let root = request.params.get("root").and_then(|v| v.as_str());
-                let pattern = request.params.get("pattern").and_then(|v| v.as_str()).ok_or_else(|| "filesystem.search requires params.pattern".to_string())?;
-                let max_results = request.params.get("max_results").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
+                let pattern = request
+                    .params
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "filesystem.search requires params.pattern".to_string())?;
+                let max_results = request
+                    .params
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(25) as usize;
                 self.filesystem.search(root, pattern, max_results)
             }
             "terminal.run" => {
-                let command = request.params.get("command").and_then(|v| v.as_str()).ok_or_else(|| "terminal.run requires params.command".to_string())?;
-                let args = request.params.get("args").and_then(|v| v.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(ToString::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+                let command = request
+                    .params
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "terminal.run requires params.command".to_string())?;
+                let args = request
+                    .params
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(ToString::to_string))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let cwd = request.params.get("cwd").and_then(|v| v.as_str());
                 self.terminal.run(command, &args, cwd)
             }
             "browser.open" => {
-                let url = request.params.get("url").and_then(|v| v.as_str()).ok_or_else(|| "browser.open requires params.url".to_string())?;
+                let url = request
+                    .params
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "browser.open requires params.url".to_string())?;
                 self.browser.open(url)
             }
             "browser.search" => {
-                let query = request.params.get("query").and_then(|v| v.as_str()).ok_or_else(|| "browser.search requires params.query".to_string())?;
+                let query = request
+                    .params
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "browser.search requires params.query".to_string())?;
                 self.browser.search(query)
             }
             "desktop.launch_app" => {
-                let path = request.params.get("path").and_then(|v| v.as_str()).ok_or_else(|| "desktop.launch_app requires params.path".to_string())?;
-                let args = request.params.get("args").and_then(|v| v.as_array()).map(|items| items.iter().filter_map(|item| item.as_str().map(ToString::to_string)).collect::<Vec<_>>()).unwrap_or_default();
-                launch_app(path, &args)
+                let requested =
+                    string_param(&request.params, &["path", "app", "app_name", "application"])
+                        .ok_or_else(|| {
+                            "desktop.launch_app requires params.path or params.app_name".to_string()
+                        })?;
+                let path = resolve_launch_target(&requested);
+                let args = string_array_param(&request.params, &["args", "arguments"]);
+                launch_app(&path, &args)
             }
             _ => Err(format!("Unsupported tool: {}", request.tool_name)),
         }
     }
 }
 
+fn string_param(params: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        params
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn string_array_param(params: &Value, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| {
+            params
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn resolve_launch_target(requested: &str) -> String {
+    let normalized = requested
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_ascii_lowercase()
+        .replace('-', " ");
+    let is_chrome = matches!(
+        normalized.as_str(),
+        "browser" | "chrome" | "google chrome" | "googlechrome"
+    );
+
+    if !is_chrome {
+        return requested.to_string();
+    }
+
+    if cfg!(target_os = "windows") {
+        let candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ];
+        if let Some(path) = candidates
+            .iter()
+            .find(|path| std::path::Path::new(path).exists())
+        {
+            return (*path).to_string();
+        }
+        return "chrome.exe".into();
+    }
+
+    "google-chrome".into()
+}
+
 fn launch_app(path: &str, args: &[String]) -> Result<Value, String> {
-    std::process::Command::new(path).args(args).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(path)
+        .args(args)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     Ok(json!({"path": path, "args": args, "launched": true}))
 }
 
@@ -396,4 +603,61 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DesktopAgentRuntime;
+    use crate::desktop_agent_types::{DesktopActionRequest, DesktopActionStatus, PendingApproval};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    #[test]
+    fn filesystem_write_creates_persisted_pending_approval() {
+        let root = std::env::temp_dir().join(format!("astra_desktop_agent_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let target_path = root.join("test.txt");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        let response = runtime
+            .submit_action(
+                "test-request".into(),
+                DesktopActionRequest {
+                    tool_name: "filesystem.write_text".into(),
+                    params: json!({
+                        "path": target_path.display().to_string(),
+                        "content": "",
+                        "mode": "overwrite",
+                        "create_empty": true,
+                    }),
+                    preview_only: false,
+                    reason: Some("test create empty file".into()),
+                },
+            )
+            .expect("submit action");
+
+        assert!(matches!(
+            response.status,
+            DesktopActionStatus::ApprovalRequired
+        ));
+        let pending_path = root
+            .join(".astra")
+            .join("state")
+            .join("pending_approvals.json");
+        assert!(pending_path.exists());
+        let approvals = serde_json::from_str::<Vec<PendingApproval>>(
+            &std::fs::read_to_string(&pending_path).expect("pending approvals file"),
+        )
+        .expect("pending approval json");
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].tool_name, "filesystem.write_text");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn launch_target_resolves_chrome_alias_without_losing_args_contract() {
+        let target = super::resolve_launch_target("google-chrome");
+        assert!(target.to_ascii_lowercase().contains("chrome"));
+    }
 }

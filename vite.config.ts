@@ -26,8 +26,13 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore backend/runtime outputs that are mutated while the app runs
+      ignored: [
+        "**/src-tauri/**",
+        "**/.astra/**",
+        "**/python_services/tts/generated/**",
+        "**/python_services/stt/recordings/**",
+      ],
     },
   },
 }));

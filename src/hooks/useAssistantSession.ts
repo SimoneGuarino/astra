@@ -23,6 +23,7 @@ import type {
     VoiceSessionTranscriptEvent,
     VoiceTurnMetricsSnapshot,
 } from "../types/assistant";
+import type { ConversationRouteDiagnostic } from "../types/desktopAgent";
 
 const INITIAL_MESSAGES: ChatMessage[] = [
     {
@@ -47,8 +48,14 @@ export function useAssistantSession() {
     const activeAssistantMessageId = useRef<string | null>(null);
     const pendingAssistantMessageIdRef = useRef<string | null>(null);
     const activeRequestIdRef = useRef<string | null>(null);
+    const assistantMessageByRequestRef = useRef<Map<string, string>>(new Map());
+    const bufferedStreamChunksRef = useRef<Map<string, string>>(new Map());
+    const bufferedFinishedEventsRef = useRef<Map<string, AssistantRequestFinishedEvent>>(new Map());
+    const finishedRequestIdsRef = useRef<Set<string>>(new Set());
+    const startedAudioSessionRequestIdsRef = useRef<Set<string>>(new Set());
     const pendingSpeechSegmentsRef = useRef<Set<string>>(new Set());
     const completedAudioSessionsRef = useRef<Set<string>>(new Set());
+    const failedAudioSessionsRef = useRef<Set<string>>(new Set());
     const isStreamingRef = useRef(false);
     const isAudioSpeakingRef = useRef(false);
     const voiceRestStatusRef = useRef<AssistantStatus | null>(null);
@@ -58,11 +65,17 @@ export function useAssistantSession() {
         completedAudioSessionsRef.current.add(requestId);
 
         try {
+            const hadFailures = failedAudioSessionsRef.current.has(requestId);
             await invoke("notify_audio_session_completed", {
-                payload: { request_id: requestId },
+                payload: {
+                    request_id: requestId,
+                    had_failures: hadFailures,
+                },
             });
         } catch (error) {
             console.error("notify_audio_session_completed error:", error);
+        } finally {
+            failedAudioSessionsRef.current.delete(requestId);
         }
     }, []);
 
@@ -122,12 +135,94 @@ export function useAssistantSession() {
         onSessionPlaybackIdle: completeAudioSession,
     });
 
+    const startAudioSessionOnce = useCallback(
+        (requestId: string) => {
+            if (startedAudioSessionRequestIdsRef.current.has(requestId)) return;
+            startedAudioSessionRequestIdsRef.current.add(requestId);
+            startNewRequestAudioSession(requestId);
+        },
+        [startNewRequestAudioSession]
+    );
+
+    const updateAssistantMessage = useCallback(
+        (assistantMessageId: string, text: string, mode: "append" | "replace") => {
+            if (!text) return;
+
+            setMessages((prev) =>
+                prev.map((msg) => {
+                    if (msg.id !== assistantMessageId) return msg;
+                    return {
+                        ...msg,
+                        content: mode === "replace" ? text : msg.content + text,
+                    };
+                })
+            );
+        },
+        []
+    );
+
+    const finishRequestLifecycle = useCallback(
+        (requestId: string) => {
+            isStreamingRef.current = false;
+
+            const assistantMessageId = assistantMessageByRequestRef.current.get(requestId);
+            if (pendingAssistantMessageIdRef.current === assistantMessageId) {
+                pendingAssistantMessageIdRef.current = null;
+            }
+            if (activeAssistantMessageId.current === assistantMessageId) {
+                activeAssistantMessageId.current = null;
+            }
+
+            setIsLoading(false);
+
+            if (
+                !isAudioSpeakingRef.current &&
+                !hasPendingWork() &&
+                pendingSpeechSegmentsRef.current.size === 0
+            ) {
+                settleVisualStatus();
+                void completeAudioSession(requestId);
+            }
+        },
+        [completeAudioSession, hasPendingWork, settleVisualStatus]
+    );
+
+    const applyBufferedResponseEvents = useCallback(
+        (requestId: string, assistantMessageId: string) => {
+            const finished = bufferedFinishedEventsRef.current.get(requestId);
+            if (finished) {
+                bufferedFinishedEventsRef.current.delete(requestId);
+                bufferedStreamChunksRef.current.delete(requestId);
+                finishedRequestIdsRef.current.add(requestId);
+                updateAssistantMessage(assistantMessageId, finished.full_text, "replace");
+                finishRequestLifecycle(requestId);
+                return;
+            }
+
+            const bufferedChunk = bufferedStreamChunksRef.current.get(requestId);
+            if (bufferedChunk) {
+                bufferedStreamChunksRef.current.delete(requestId);
+                updateAssistantMessage(assistantMessageId, bufferedChunk, "append");
+            }
+        },
+        [finishRequestLifecycle, updateAssistantMessage]
+    );
+
+    const bindRequestToAssistantMessage = useCallback(
+        (requestId: string, assistantMessageId: string) => {
+            assistantMessageByRequestRef.current.set(requestId, assistantMessageId);
+            applyBufferedResponseEvents(requestId, assistantMessageId);
+        },
+        [applyBufferedResponseEvents]
+    );
+
     const submitMessage = useCallback(
         async (messageOverride?: string) => {
             const trimmed = (messageOverride ?? inputValue).trim();
             if (!trimmed) return;
 
             stopAllAudio();
+            startedAudioSessionRequestIdsRef.current.clear();
             pendingSpeechSegmentsRef.current.clear();
             isStreamingRef.current = true;
             isAudioSpeakingRef.current = false;
@@ -158,13 +253,18 @@ export function useAssistantSession() {
                 });
 
                 const alreadyActive = activeRequestIdRef.current === started.request_id;
+                bindRequestToAssistantMessage(started.request_id, assistantMessageId);
+                const alreadyFinished = finishedRequestIdsRef.current.has(started.request_id);
                 activeRequestIdRef.current = started.request_id;
-                activeAssistantMessageId.current = assistantMessageId;
+                if (!alreadyFinished) {
+                    activeAssistantMessageId.current = assistantMessageId;
+                }
                 completedAudioSessionsRef.current.delete(started.request_id);
+                failedAudioSessionsRef.current.delete(started.request_id);
                 setActiveModel(started.model);
 
-                if (!alreadyActive) {
-                    startNewRequestAudioSession(started.request_id);
+                if (!alreadyActive && !alreadyFinished) {
+                    startAudioSessionOnce(started.request_id);
                 }
             } catch (error) {
                 console.error("start_chat_message_stream error:", error);
@@ -186,7 +286,7 @@ export function useAssistantSession() {
                 settleVisualStatus();
             }
         },
-        [inputValue, settleVisualStatus, startNewRequestAudioSession, stopAllAudio]
+        [bindRequestToAssistantMessage, inputValue, settleVisualStatus, startAudioSessionOnce, stopAllAudio]
     );
 
     const handleTranscript = useCallback(
@@ -249,35 +349,45 @@ export function useAssistantSession() {
             }
 
             activeRequestIdRef.current = request_id;
-            activeAssistantMessageId.current = assistantMessageId;
+            if (assistantMessageId) {
+                bindRequestToAssistantMessage(request_id, assistantMessageId);
+            }
+            const alreadyFinished = finishedRequestIdsRef.current.has(request_id);
+            activeAssistantMessageId.current = alreadyFinished ? null : assistantMessageId;
             completedAudioSessionsRef.current.delete(request_id);
-            isStreamingRef.current = true;
+            failedAudioSessionsRef.current.delete(request_id);
+            isStreamingRef.current = !alreadyFinished;
             isAudioSpeakingRef.current = false;
             pendingSpeechSegmentsRef.current.clear();
 
             setActiveModel(model);
-            setIsLoading(true);
-            setStatus("thinking");
+            if (!alreadyFinished) {
+                setIsLoading(true);
+                setStatus("thinking");
+            }
 
-            if (!alreadyActive) {
-                startNewRequestAudioSession(request_id);
+            if (!alreadyActive && !alreadyFinished) {
+                startAudioSessionOnce(request_id);
             }
         },
-        [startNewRequestAudioSession]
+        [bindRequestToAssistantMessage, startAudioSessionOnce]
     );
 
     const handleStreamChunk = useCallback(({ request_id, chunk }: StreamChunkEvent) => {
-        if (activeRequestIdRef.current !== request_id) return;
+        if (finishedRequestIdsRef.current.has(request_id)) return;
 
-        setMessages((prev) => {
-            const assistantId = activeAssistantMessageId.current;
-            if (!assistantId) return prev;
+        const assistantId =
+            assistantMessageByRequestRef.current.get(request_id) ??
+            (activeRequestIdRef.current === request_id ? activeAssistantMessageId.current : null);
 
-            return prev.map((msg) =>
-                msg.id === assistantId ? { ...msg, content: msg.content + chunk } : msg
-            );
-        });
-    }, []);
+        if (!assistantId) {
+            const previous = bufferedStreamChunksRef.current.get(request_id) ?? "";
+            bufferedStreamChunksRef.current.set(request_id, previous + chunk);
+            return;
+        }
+
+        updateAssistantMessage(assistantId, chunk, "append");
+    }, [updateAssistantMessage]);
 
     const handleAudioReady = useCallback(
         (event: AudioSegmentReadyEvent) => {
@@ -290,6 +400,7 @@ export function useAssistantSession() {
     const handleAudioFailed = useCallback(
         (event: AudioSegmentFailedEvent) => {
             pendingSpeechSegmentsRef.current.delete(`${event.request_id}:${event.sequence}`);
+            failedAudioSessionsRef.current.add(event.request_id);
             markAudioSegmentFailed(event);
             settleVisualStatus();
         },
@@ -306,24 +417,19 @@ export function useAssistantSession() {
     }, []);
 
     const handleRequestFinished = useCallback(
-        ({ request_id }: AssistantRequestFinishedEvent) => {
-            if (activeRequestIdRef.current !== request_id) return;
-
-            isStreamingRef.current = false;
-            pendingAssistantMessageIdRef.current = null;
-            activeAssistantMessageId.current = null;
-            setIsLoading(false);
-
-            if (
-                !isAudioSpeakingRef.current &&
-                !hasPendingWork() &&
-                pendingSpeechSegmentsRef.current.size === 0
-            ) {
-                settleVisualStatus();
-                void completeAudioSession(request_id);
+        (event: AssistantRequestFinishedEvent) => {
+            const assistantId = assistantMessageByRequestRef.current.get(event.request_id);
+            if (!assistantId) {
+                bufferedFinishedEventsRef.current.set(event.request_id, event);
+                return;
             }
+
+            bufferedStreamChunksRef.current.delete(event.request_id);
+            finishedRequestIdsRef.current.add(event.request_id);
+            updateAssistantMessage(assistantId, event.full_text, "replace");
+            finishRequestLifecycle(event.request_id);
         },
-        [completeAudioSession, hasPendingWork, settleVisualStatus]
+        [finishRequestLifecycle, updateAssistantMessage]
     );
 
     const handleAssistantError = useCallback(
@@ -414,6 +520,10 @@ export function useAssistantSession() {
         setLastVoiceTranscript(event);
     }, []);
 
+    const handleRouteDiagnostic = useCallback((event: ConversationRouteDiagnostic) => {
+        console.info("Astra route diagnostic:", event);
+    }, []);
+
     const handleStatus = useCallback(
         (nextStatus: AssistantStatus) => {
             if (nextStatus === "idle") {
@@ -452,6 +562,7 @@ export function useAssistantSession() {
         onVoiceSessionState: handleVoiceSessionState,
         onVoiceSessionTranscript: handleVoiceSessionTranscript,
         onVoiceTurnMetrics: setLastVoiceMetrics,
+        onRouteDiagnostic: handleRouteDiagnostic,
     });
 
     return {

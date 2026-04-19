@@ -513,7 +513,11 @@ fn addressing_decision(text: &str, active_conversation: bool) -> AddressingDecis
         return AddressingDecision::Ignored("wake_word_required".to_string());
     };
 
-    if wake_match.start > 1 && !tokens[..wake_match.start].iter().all(|token| is_wake_filler(token)) {
+    if wake_match.start > 1
+        && !tokens[..wake_match.start]
+            .iter()
+            .all(|token| is_wake_filler(token))
+    {
         return AddressingDecision::Ignored("wake_word_too_late".to_string());
     }
 
@@ -609,11 +613,17 @@ fn transcript_quality(text: &str) -> TranscriptQuality {
         .filter(|token| !is_low_information_token(token))
         .collect::<Vec<_>>();
 
-    let alphabetic_char_count = normalized.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let alphabetic_char_count = normalized
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
     let repeated_run_len = longest_repeated_char_run(&normalized);
 
     TranscriptQuality {
-        useful_char_count: useful_tokens.iter().map(|token| token.chars().count()).sum(),
+        useful_char_count: useful_tokens
+            .iter()
+            .map(|token| token.chars().count())
+            .sum(),
         useful_token_count: useful_tokens.len(),
         alphabetic_char_count,
         repeated_run_len,
@@ -638,8 +648,8 @@ fn is_transcript_useful_for_passive_command(quality: &TranscriptQuality) -> bool
 fn is_low_information_token(token: &str) -> bool {
     matches!(
         token,
-        "uh"
-            | "eh"
+        "uh" | "eh"
+            | "ehm"
             | "em"
             | "mm"
             | "mmm"
@@ -680,7 +690,13 @@ fn longest_repeated_char_run(value: &str) -> usize {
 fn normalize_for_addressing(text: &str) -> String {
     text.to_lowercase()
         .chars()
-        .map(|ch| if ch.is_alphanumeric() || ch.is_whitespace() { ch } else { ' ' })
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() {
+                ch
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
 }
 

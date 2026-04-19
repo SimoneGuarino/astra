@@ -17,6 +17,7 @@ import type {
     AudioSegmentFailedEvent,
     AudioSegmentReadyEvent,
 } from "./useAssistantAudio";
+import type { ConversationRouteDiagnostic } from "../types/desktopAgent";
 
 type UseAssistantEventsParams = {
     onRequestStarted: (event: AssistantRequestStartedEvent) => void;
@@ -33,6 +34,7 @@ type UseAssistantEventsParams = {
     onVoiceSessionState: (event: VoiceSessionStateEvent) => void;
     onVoiceSessionTranscript: (event: VoiceSessionTranscriptEvent) => void;
     onVoiceTurnMetrics: (metrics: VoiceTurnMetricsSnapshot) => void;
+    onRouteDiagnostic?: (diagnostic: ConversationRouteDiagnostic) => void;
 };
 
 export function useAssistantEvents({
@@ -50,6 +52,7 @@ export function useAssistantEvents({
     onVoiceSessionState,
     onVoiceSessionTranscript,
     onVoiceTurnMetrics,
+    onRouteDiagnostic,
 }: UseAssistantEventsParams) {
     useEffect(() => {
         let cleanupFns: Array<() => void> = [];
@@ -135,6 +138,12 @@ export function useAssistantEvents({
                         if (!disposed) onVoiceTurnMetrics(event.payload);
                     }
                 );
+                const unlistenRouteDiagnostic = await listen<ConversationRouteDiagnostic>(
+                    "assistant-route-diagnostic",
+                    (event) => {
+                        if (!disposed) onRouteDiagnostic?.(event.payload);
+                    }
+                );
 
                 cleanupFns = [
                     unlistenRequestStarted,
@@ -151,6 +160,7 @@ export function useAssistantEvents({
                     unlistenVoiceState,
                     unlistenVoiceTranscript,
                     unlistenVoiceMetrics,
+                    unlistenRouteDiagnostic,
                 ];
             } catch (error) {
                 console.error("Listener registration failed:", error);
@@ -176,5 +186,6 @@ export function useAssistantEvents({
         onVoiceSessionState,
         onVoiceSessionTranscript,
         onVoiceTurnMetrics,
+        onRouteDiagnostic,
     ]);
 }

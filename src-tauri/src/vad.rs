@@ -37,7 +37,7 @@ impl Default for VadConfig {
             rms_smoothing_alpha: 0.35,
             min_speech_ms: 90,
             min_trailing_silence_ms: 180,
-            end_silence_ms: 620,
+            end_silence_ms: 600,
             min_utterance_ms: 240,
             max_utterance_ms: 14_000,
             pre_roll_ms: 280,
@@ -201,7 +201,7 @@ impl AdaptiveEnergyVad {
     fn update_in_speech(&mut self, rms: f32, duration_ms: u64, end_threshold: f32) -> VadEvent {
         self.utterance_ms += duration_ms;
 
-        let silence_like = self.smoothed_rms <= end_threshold && rms <= end_threshold * 1.08;
+        let silence_like = rms <= end_threshold * 1.08 || self.smoothed_rms <= end_threshold;
         if silence_like {
             self.silence_ms += duration_ms;
         } else {

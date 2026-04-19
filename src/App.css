@@ -419,20 +419,6 @@ input {
     padding: 12px;
 }
 
-.desktop-agent-card h3,
-.desktop-agent-approval-header h3 {
-    margin: 0 0 6px 0;
-    font-size: 14px;
-}
-
-.desktop-agent-inline-actions,
-.desktop-agent-panel__actions {
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
-}
-
-.desktop-agent-tools-list,
 .desktop-agent-json {
     max-height: 180px;
     overflow: auto;

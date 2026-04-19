@@ -1,4 +1,3 @@
-import type { AssistantStatus } from "../types/assistant";
 import { IoClose } from "react-icons/io5";
 import { MdOutlineMinimize } from "react-icons/md";
 import { LuMonitor, LuMonitorOff } from "react-icons/lu";
@@ -14,7 +13,6 @@ type AssistantHeaderProps = {
     onTogglePin: () => void;
     onToggleDesktopPanel: () => void;
     startDrag: (e: React.MouseEvent) => void;
-    status: AssistantStatus;
     statusLabel: string;
 };
 
@@ -27,7 +25,6 @@ export function AssistantHeader({
     onToggleDesktopPanel,
     onTogglePin,
     startDrag,
-    status,
     statusLabel,
 }: AssistantHeaderProps) {
     return (

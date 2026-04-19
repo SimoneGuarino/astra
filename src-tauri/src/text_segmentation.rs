@@ -59,6 +59,10 @@ impl SentenceSegmenter {
                 sequence,
                 text,
             });
+
+            if !flush {
+                break;
+            }
         }
 
         if flush {
