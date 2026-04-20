@@ -1,3 +1,4 @@
+use crate::ui_target_grounding::UITargetCandidate;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -107,6 +108,41 @@ pub struct ScreenCaptureResult {
     pub provider: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PageEvidenceSource {
+    StructuredVision,
+    TargetCandidate,
+    CandidateLabel,
+    RecentWorkflowContext,
+    CaptureMetadata,
+    Heuristic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageSemanticEvidence {
+    #[serde(default)]
+    pub browser_app_hint: Option<String>,
+    #[serde(default)]
+    pub content_provider_hint: Option<String>,
+    #[serde(default)]
+    pub page_kind_hint: Option<String>,
+    #[serde(default)]
+    pub query_hint: Option<String>,
+    #[serde(default)]
+    pub result_list_visible: Option<bool>,
+    #[serde(default)]
+    pub confidence: f32,
+    #[serde(default)]
+    pub evidence_sources: Vec<PageEvidenceSource>,
+    #[serde(default)]
+    pub capture_backend: Option<String>,
+    #[serde(default)]
+    pub observation_source: Option<String>,
+    #[serde(default)]
+    pub uncertainty: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenAnalysisRequest {
     #[serde(default)]
@@ -125,6 +161,10 @@ pub struct ScreenAnalysisResult {
     pub provider: String,
     pub question: String,
     pub answer: String,
+    #[serde(default)]
+    pub ui_candidates: Vec<UITargetCandidate>,
+    #[serde(default)]
+    pub structured_candidates_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

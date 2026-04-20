@@ -16,6 +16,9 @@ use crate::{
         classify_intent, CapabilityTarget, SemanticAction, SemanticIntent, SemanticIntentKind,
         SemanticScreenRequest,
     },
+    workflow_continuation::{
+        is_contextual_followup_message, render_continuation_refusal, WorkflowContinuationResolution,
+    },
 };
 
 const MIN_CLASSIFIER_CONFIDENCE: f32 = 0.45;
@@ -50,6 +53,15 @@ pub async fn route_message(
 ) -> Result<ConversationRouteResult, String> {
     let normalized = message.trim();
     let lower = normalized.to_lowercase();
+    let followup_language = response_language_from_message(normalized);
+    if is_contextual_followup_message(normalized) {
+        if let Some(route_result) =
+            route_workflow_continuation(runtime, manifest, normalized, followup_language).await
+        {
+            return Ok(route_result);
+        }
+    }
+
     let classifier = classify_intent(normalized, manifest).await;
 
     let (intent, source, fallback_used, classifier_error) = match classifier {
@@ -157,6 +169,20 @@ pub async fn route_message(
         }
     };
 
+    if is_model_contextual_followup_intent(&intent) {
+        if let Some(route_result) = route_model_assisted_workflow_continuation(
+            runtime,
+            manifest,
+            normalized,
+            followup_language,
+            &intent,
+        )
+        .await
+        {
+            return Ok(route_result);
+        }
+    }
+
     let language = response_language(&intent, normalized);
     let mut diagnostic = ConversationRouteDiagnostic {
         message_excerpt: normalized.chars().take(160).collect(),
@@ -190,6 +216,167 @@ pub async fn route_message(
     )
     .await;
     Ok(ConversationRouteResult { route, diagnostic })
+}
+
+async fn route_workflow_continuation(
+    runtime: &DesktopAgentRuntime,
+    manifest: &CapabilityManifest,
+    normalized: &str,
+    language: ResponseLanguage,
+) -> Option<ConversationRouteResult> {
+    match runtime.resolve_followup_continuation(manifest, normalized)? {
+        WorkflowContinuationResolution::Workflow(workflow) => {
+            let run = runtime.execute_screen_workflow(workflow).await;
+            let diagnostic = ConversationRouteDiagnostic {
+                message_excerpt: normalized.chars().take(160).collect(),
+                classifier_source: "recent_workflow_continuation".into(),
+                intent: "workflow_followup".into(),
+                target: Some("recent_workflow".into()),
+                action: Some("continue_screen_workflow".into()),
+                tool_name: Some("screen.workflow".into()),
+                extracted_params: Some(run.diagnostic_value()),
+                confidence: run
+                    .workflow
+                    .continuation
+                    .as_ref()
+                    .map(|continuation| continuation.followup.confidence),
+                routed_to: "recent_workflow_continuation_executed".into(),
+                grounded: true,
+                fallback_used: false,
+                submit_action_called: false,
+                action_id: None,
+                action_status: Some(run.status.as_str().into()),
+                approval_created: false,
+                audit_expected: true,
+                rationale: Some(
+                    "Resolved the request against Rust-owned recent workflow context before normal chat routing."
+                        .into(),
+                ),
+                error: None,
+            };
+            Some(ConversationRouteResult {
+                route: ConversationRoute::DirectResponse(render_screen_workflow_run_response(
+                    &run,
+                    matches!(language, ResponseLanguage::Italian),
+                )),
+                diagnostic,
+            })
+        }
+        WorkflowContinuationResolution::Refusal(refusal) => {
+            let diagnostic = ConversationRouteDiagnostic {
+                message_excerpt: normalized.chars().take(160).collect(),
+                classifier_source: "recent_workflow_continuation".into(),
+                intent: "workflow_followup".into(),
+                target: Some("recent_workflow".into()),
+                action: Some(format!("{:?}", refusal.followup.action_kind)),
+                tool_name: Some("screen.workflow".into()),
+                extracted_params: Some(refusal.diagnostic_value()),
+                confidence: Some(refusal.followup.confidence),
+                routed_to: "recent_workflow_continuation_refused".into(),
+                grounded: true,
+                fallback_used: false,
+                submit_action_called: false,
+                action_id: None,
+                action_status: Some(format!("{:?}", refusal.policy.status)),
+                approval_created: false,
+                audit_expected: false,
+                rationale: Some(
+                    "The request was recognized as a continuation, but policy did not allow execution."
+                        .into(),
+                ),
+                error: None,
+            };
+            Some(ConversationRouteResult {
+                route: ConversationRoute::DirectResponse(render_continuation_refusal(
+                    &refusal,
+                    matches!(language, ResponseLanguage::Italian),
+                )),
+                diagnostic,
+            })
+        }
+    }
+}
+
+async fn route_model_assisted_workflow_continuation(
+    runtime: &DesktopAgentRuntime,
+    manifest: &CapabilityManifest,
+    normalized: &str,
+    language: ResponseLanguage,
+    intent: &SemanticIntent,
+) -> Option<ConversationRouteResult> {
+    let params = effective_params(&intent.params);
+    match runtime.resolve_followup_continuation_with_model_params(
+        manifest,
+        normalized,
+        &params,
+        intent.confidence,
+    )? {
+        WorkflowContinuationResolution::Workflow(workflow) => {
+            let run = runtime.execute_screen_workflow(workflow).await;
+            let diagnostic = ConversationRouteDiagnostic {
+                message_excerpt: normalized.chars().take(160).collect(),
+                classifier_source: "model_assisted_workflow_continuation".into(),
+                intent: "workflow_followup".into(),
+                target: Some("recent_workflow".into()),
+                action: Some("continue_screen_workflow".into()),
+                tool_name: Some("screen.workflow".into()),
+                extracted_params: Some(run.diagnostic_value()),
+                confidence: Some(intent.confidence),
+                routed_to: "model_assisted_workflow_continuation_executed".into(),
+                grounded: true,
+                fallback_used: false,
+                submit_action_called: false,
+                action_id: None,
+                action_status: Some(run.status.as_str().into()),
+                approval_created: false,
+                audit_expected: true,
+                rationale: Some(
+                    "Classifier supplied contextual follow-up roles; Rust normalized, merged, grounded, and executed them."
+                        .into(),
+                ),
+                error: None,
+            };
+            Some(ConversationRouteResult {
+                route: ConversationRoute::DirectResponse(render_screen_workflow_run_response(
+                    &run,
+                    matches!(language, ResponseLanguage::Italian),
+                )),
+                diagnostic,
+            })
+        }
+        WorkflowContinuationResolution::Refusal(refusal) => {
+            let diagnostic = ConversationRouteDiagnostic {
+                message_excerpt: normalized.chars().take(160).collect(),
+                classifier_source: "model_assisted_workflow_continuation".into(),
+                intent: "workflow_followup".into(),
+                target: Some("recent_workflow".into()),
+                action: Some(format!("{:?}", refusal.followup.action_kind)),
+                tool_name: Some("screen.workflow".into()),
+                extracted_params: Some(refusal.diagnostic_value()),
+                confidence: Some(intent.confidence),
+                routed_to: "model_assisted_workflow_continuation_refused".into(),
+                grounded: true,
+                fallback_used: false,
+                submit_action_called: false,
+                action_id: None,
+                action_status: Some(format!("{:?}", refusal.policy.status)),
+                approval_created: false,
+                audit_expected: false,
+                rationale: Some(
+                    "Classifier supplied contextual follow-up roles, but Rust policy refused execution."
+                        .into(),
+                ),
+                error: None,
+            };
+            Some(ConversationRouteResult {
+                route: ConversationRoute::DirectResponse(render_continuation_refusal(
+                    &refusal,
+                    matches!(language, ResponseLanguage::Italian),
+                )),
+                diagnostic,
+            })
+        }
+    }
 }
 
 async fn route_intent(
@@ -228,7 +415,7 @@ async fn route_intent(
             .await
         }
         SemanticIntentKind::ToolActionRequest => {
-            route_tool_action(runtime, manifest, normalized, intent, language, diagnostic)
+            route_tool_action(runtime, manifest, normalized, intent, language, diagnostic).await
         }
         SemanticIntentKind::NormalChat => ConversationRoute::Continue,
     }
@@ -323,7 +510,7 @@ async fn route_screen_analysis(
     }
 }
 
-fn route_tool_action(
+async fn route_tool_action(
     runtime: &DesktopAgentRuntime,
     manifest: &CapabilityManifest,
     normalized: &str,
@@ -348,7 +535,7 @@ fn route_tool_action(
         ) {
             diagnostic.routed_to = "screen_grounded_workflow_planned".into();
             if let Some(workflow) = resolve_screen_workflow(resolution, manifest, normalized) {
-                let run = runtime.execute_screen_workflow(workflow);
+                let run = runtime.execute_screen_workflow(workflow).await;
                 diagnostic.routed_to = "screen_grounded_workflow_executed".into();
                 diagnostic.extracted_params = Some(run.diagnostic_value());
                 return ConversationRoute::DirectResponse(render_screen_workflow_run_response(
@@ -789,6 +976,7 @@ fn normalized_resolution_entities(
         "pattern",
         "app",
         "app_name",
+        "browser_app",
     ] {
         if let Some(value) = param_str(params, key) {
             entities.entry(key).or_insert_with(|| json!(value));
@@ -908,15 +1096,47 @@ fn infer_query_mode(original: &str, operation: &ActionOperation) -> Option<Query
 }
 
 fn infer_search_provider(lower: &str) -> Option<String> {
-    if lower.contains("youtube") || lower.contains("you tube") {
+    let mut provider_scope = lower
+        .replace("google chrome", " ")
+        .replace("chrome", " ")
+        .replace("microsoft edge", " ")
+        .replace("firefox", " ")
+        .replace("safari", " ");
+    if looks_like_edge_browser_reference(lower) {
+        provider_scope = provider_scope.replace("edge", " ");
+    }
+    if provider_scope.contains("youtube") || provider_scope.contains("you tube") {
         Some("youtube".into())
-    } else if lower.contains("google") {
+    } else if provider_scope.contains("google") {
         Some("google".into())
-    } else if lower.contains("web") || lower.contains("internet") || lower.contains("online") {
+    } else if provider_scope.contains("web")
+        || provider_scope.contains("internet")
+        || provider_scope.contains("online")
+    {
         Some("web".into())
     } else {
         None
     }
+}
+
+fn looks_like_edge_browser_reference(lower: &str) -> bool {
+    lower.contains("microsoft edge")
+        || [
+            "browser edge",
+            "edge browser",
+            "app edge",
+            "apri edge",
+            "aprimi edge",
+            "open edge",
+            "in edge",
+            "su edge",
+            "scheda edge",
+            "tab edge",
+            "finestra edge",
+            "window edge",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 fn build_action_request(
@@ -1360,6 +1580,10 @@ fn response_language(intent: &SemanticIntent, message: &str) -> ResponseLanguage
         }
     }
 
+    response_language_from_message(message)
+}
+
+fn response_language_from_message(message: &str) -> ResponseLanguage {
     let lower = message.to_lowercase();
     let italian_markers = [
         "puoi",
@@ -1375,6 +1599,12 @@ fn response_language(intent: &SemanticIntent, message: &str) -> ResponseLanguage
         "vedendo",
         "adesso",
         "esegui",
+        "clicca",
+        "primo",
+        "secondo",
+        "continua",
+        "torna",
+        "scrivi",
     ];
     if italian_markers.iter().any(|marker| lower.contains(marker)) {
         ResponseLanguage::Italian
@@ -1403,6 +1633,27 @@ fn should_override_normal_chat_with_action(intent: &SemanticIntent) -> bool {
     matches!(
         intent.kind,
         SemanticIntentKind::NormalChat | SemanticIntentKind::CapabilityQuestion
+    )
+}
+
+fn is_model_contextual_followup_intent(intent: &SemanticIntent) -> bool {
+    if !matches!(intent.kind, SemanticIntentKind::ToolActionRequest) {
+        return false;
+    }
+    let params = effective_params(&intent.params);
+    let operation = param_str(&params, "operation")
+        .or_else(|| {
+            params
+                .get("entities")
+                .and_then(|entities| param_str(entities, "operation"))
+        })
+        .unwrap_or_default()
+        .replace('-', "_")
+        .to_ascii_lowercase();
+
+    matches!(
+        operation.as_str(),
+        "screen_guided_followup_action" | "screen_guided_navigation_workflow"
     )
 }
 

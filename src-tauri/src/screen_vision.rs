@@ -1,4 +1,9 @@
-use crate::desktop_agent_types::{ScreenAnalysisResult, VisionAvailability};
+use crate::{
+    desktop_agent_types::{
+        PageEvidenceSource, PageSemanticEvidence, ScreenAnalysisResult, VisionAvailability,
+    },
+    structured_vision::{parse_structured_vision_candidates, StructuredVisionExtraction},
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -102,7 +107,119 @@ impl ScreenVisionRuntime {
             provider: provider.to_string(),
             question,
             answer,
+            ui_candidates: Vec::new(),
+            structured_candidates_error: None,
         })
+    }
+
+    pub async fn extract_ui_candidates(
+        &self,
+        image_path: &str,
+        captured_at: u64,
+        provider: &str,
+        requested_roles: &[String],
+        app_hint: Option<&str>,
+        provider_hint: Option<&str>,
+    ) -> Result<StructuredVisionExtraction, String> {
+        let installed_models = self.fetch_installed_models().await.unwrap_or_default();
+        let model = select_vision_model(&installed_models)
+            .ok_or_else(|| "No compatible Ollama vision model found. Install one of: qwen2.5vl, llava, llava-phi3, moondream".to_string())?;
+
+        let image_bytes = fs::read(image_path).map_err(|error| {
+            format!("structured screen candidate extraction failed to read capture: {error}")
+        })?;
+        let image_b64 = BASE64_STANDARD.encode(image_bytes);
+        let requested_roles = if requested_roles.is_empty() {
+            "search_input, ranked_result, button, link, text_input".to_string()
+        } else {
+            requested_roles.join(", ")
+        };
+        let app_hint = app_hint.unwrap_or("unknown");
+        let provider_hint = provider_hint.unwrap_or("unknown");
+
+        let system = concat!(
+            "You are Astra Vision Target Grounding. Return only strict JSON, no markdown. ",
+            "Your task is to propose visible UI element candidates for safe desktop automation. ",
+            "Only include an element if you can provide an explicit rectangular region in screen pixel coordinates. ",
+            "Use coordinate_space=\"screen\". Do not infer hidden elements. Do not include vague prose-only candidates. ",
+            "Allowed roles: search_input, ranked_result, button, link, text_input. ",
+            "Each candidate must include candidate_id, role, region {x,y,width,height,coordinate_space}, confidence 0..1, ",
+            "supports_focus, supports_click, optional label, optional browser_app_hint/app_hint, optional content_provider_hint/provider_hint, optional page_kind_hint, optional rank, and rationale. ",
+            "Also include optional page_evidence with browser_app_hint, content_provider_hint, page_kind_hint, query_hint, result_list_visible, confidence, and uncertainty. ",
+            "content_provider_hint/provider_hint means the visible site or content provider such as youtube, google, github, or amazon. ",
+            "Never copy observation backend or screenshot backend identifiers into provider_hint/content_provider_hint. ",
+            "If uncertain, return {\"page_evidence\":{\"confidence\":0.0,\"uncertainty\":[\"inconclusive\"]},\"ui_candidates\":[]}."
+        );
+        let user = format!(
+            "Extract UI candidates for requested roles: {requested_roles}. Browser/app hint: {app_hint}. Expected content provider hint: {provider_hint}. Observation backend: {provider} (technical capture metadata only; it is not the website/provider). Return JSON with keys page_evidence and ui_candidates."
+        );
+
+        let payload = json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "options": {
+                "temperature": 0.0,
+                "num_ctx": 8192,
+            },
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user, "images": [image_b64]}
+            ]
+        });
+
+        let response = self
+            .client
+            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| format!("Ollama structured vision request failed: {error}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Ollama structured vision HTTP error {status}: {body}"
+            ));
+        }
+
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Ollama structured vision parse failed: {error}"))?;
+        let content = body
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Ollama structured vision returned an empty response".to_string())?;
+
+        let mut extraction = parse_structured_vision_candidates(content, captured_at)?;
+        let page_evidence = extraction
+            .page_evidence
+            .get_or_insert_with(|| PageSemanticEvidence {
+                browser_app_hint: None,
+                content_provider_hint: None,
+                page_kind_hint: None,
+                query_hint: None,
+                result_list_visible: None,
+                confidence: 0.0,
+                evidence_sources: vec![PageEvidenceSource::CaptureMetadata],
+                capture_backend: Some(provider.to_string()),
+                observation_source: Some("structured_vision".into()),
+                uncertainty: vec!["vision_model_returned_no_page_evidence".into()],
+            });
+        page_evidence.capture_backend = page_evidence
+            .capture_backend
+            .clone()
+            .or_else(|| Some(provider.to_string()));
+        page_evidence.observation_source = page_evidence
+            .observation_source
+            .clone()
+            .or_else(|| Some("structured_vision".into()));
+        Ok(extraction)
     }
 
     async fn fetch_installed_models(&self) -> Result<Vec<String>, String> {

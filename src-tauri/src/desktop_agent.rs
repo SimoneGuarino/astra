@@ -3,6 +3,9 @@ use crate::{
     audit_log::AuditLogStore,
     browser_agent::BrowserAgent,
     capability_manifest::build_capability_manifest,
+    contextual_learning::{
+        store_verified_continuation, VerifiedContinuationLearningEvent, VerifiedContinuationOutcome,
+    },
     desktop_agent_types::{
         CapabilityManifest, DesktopActionRequest, DesktopActionResponse, DesktopActionStatus,
         DesktopAuditEvent, PendingApproval, ScreenAnalysisRequest, ScreenAnalysisResult,
@@ -12,11 +15,20 @@ use crate::{
     permissions::PermissionProfile,
     screen_workflow::{
         execute_screen_workflow, refresh_screen_workflow_plan, ScreenWorkflow, ScreenWorkflowRun,
+        StepSupportStatus, WorkflowStepKind,
     },
+    structured_vision::StructuredVisionExtraction,
     terminal_runner::TerminalRunner,
     tools_registry::ToolsRegistry,
     ui_control::{UIControlRuntime, UIPrimitiveCapabilitySet},
     ui_target_grounding::UITargetCandidate,
+    workflow_continuation::{
+        build_context_from_action_response, build_context_from_screen_workflow_run,
+        resolve_workflow_continuation, resolve_workflow_continuation_with_model_params,
+        scroll_policy_for_regrounding, validate_continuation_page,
+        ContinuationRegroundingDiagnostics, RecentWorkflowContext, RegroundingAttemptDiagnostic,
+        ScrollContinuationStatus, WorkflowContinuationResolution, MAX_RECENT_SCREEN_AGE_MS,
+    },
 };
 use serde_json::{json, Value};
 use std::{
@@ -41,6 +53,7 @@ pub struct DesktopAgentRuntime {
     screen_vision: crate::screen_vision::ScreenVisionRuntime,
     ui_control: UIControlRuntime,
     recent_workflow_targets: Arc<Mutex<Vec<UITargetCandidate>>>,
+    recent_workflow_context: Arc<Mutex<Option<RecentWorkflowContext>>>,
 }
 
 #[derive(Clone)]
@@ -86,6 +99,7 @@ impl DesktopAgentRuntime {
             screen_vision,
             ui_control,
             recent_workflow_targets: Arc::new(Mutex::new(Vec::new())),
+            recent_workflow_context: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -196,6 +210,8 @@ impl DesktopAgentRuntime {
                         "provider": result.provider,
                         "image_path": result.image_path,
                         "question": result.question,
+                        "ui_candidate_count": result.ui_candidates.len(),
+                        "structured_candidates_error": result.structured_candidates_error,
                     }),
                 });
                 Ok(result)
@@ -227,12 +243,15 @@ impl DesktopAgentRuntime {
         self.ui_control.capabilities(enabled)
     }
 
-    pub fn execute_screen_workflow(&self, mut workflow: ScreenWorkflow) -> ScreenWorkflowRun {
+    pub async fn execute_screen_workflow(&self, mut workflow: ScreenWorkflow) -> ScreenWorkflowRun {
         let request_id = Uuid::new_v4().to_string();
         let action_id = Uuid::new_v4().to_string();
         let capabilities = self.ui_primitive_capabilities();
+        let previous_context = self.recent_workflow_context();
         workflow.grounding.recent_target_candidates = self.recent_workflow_targets();
         refresh_screen_workflow_plan(&mut workflow);
+        self.prepare_continuation_grounding(&mut workflow, &capabilities)
+            .await;
         self.audit.append(&DesktopAuditEvent {
             audit_id: Uuid::new_v4().to_string(),
             action_id: action_id.clone(),
@@ -250,6 +269,27 @@ impl DesktopAgentRuntime {
 
         let run = execute_screen_workflow(workflow, &self.ui_control, capabilities);
         self.remember_workflow_targets(&run);
+        self.remember_screen_workflow_context(&run, &request_id, &action_id, previous_context);
+        if let Some(receipt) =
+            verified_continuation_learning_event(&run).map(store_verified_continuation)
+        {
+            self.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: action_id.clone(),
+                request_id: request_id.clone(),
+                tool_name: "screen.workflow".into(),
+                stage: "contextual_learning".into(),
+                status: if receipt.accepted {
+                    "accepted"
+                } else {
+                    "ignored"
+                }
+                .into(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Low,
+                details: receipt.summary,
+            });
+        }
         self.audit.append(&DesktopAuditEvent {
             audit_id: Uuid::new_v4().to_string(),
             action_id,
@@ -262,6 +302,46 @@ impl DesktopAgentRuntime {
             details: run.diagnostic_value(),
         });
         run
+    }
+
+    pub fn recent_workflow_context(&self) -> Option<RecentWorkflowContext> {
+        let now = now_ms();
+        let mut memory = self
+            .recent_workflow_context
+            .lock()
+            .expect("recent workflow context memory poisoned");
+        if memory
+            .as_ref()
+            .is_some_and(|context| now > context.expires_at_ms)
+        {
+            *memory = None;
+        }
+        memory.clone()
+    }
+
+    pub fn resolve_followup_continuation(
+        &self,
+        manifest: &CapabilityManifest,
+        message: &str,
+    ) -> Option<WorkflowContinuationResolution> {
+        resolve_workflow_continuation(self.recent_workflow_context(), manifest, message, now_ms())
+    }
+
+    pub fn resolve_followup_continuation_with_model_params(
+        &self,
+        manifest: &CapabilityManifest,
+        message: &str,
+        model_params: &Value,
+        model_confidence: f32,
+    ) -> Option<WorkflowContinuationResolution> {
+        resolve_workflow_continuation_with_model_params(
+            self.recent_workflow_context(),
+            manifest,
+            message,
+            model_params,
+            model_confidence,
+            now_ms(),
+        )
     }
 
     fn recent_workflow_targets(&self) -> Vec<UITargetCandidate> {
@@ -305,6 +385,287 @@ impl DesktopAgentRuntime {
         }
         memory.sort_by(|left, right| right.observed_at_ms.cmp(&left.observed_at_ms));
         memory.truncate(12);
+    }
+
+    fn remember_action_workflow_context(
+        &self,
+        request_id: &str,
+        action_id: &str,
+        request: &DesktopActionRequest,
+        result: &Value,
+    ) {
+        let Some(context) =
+            build_context_from_action_response(request_id, action_id, request, result, now_ms())
+        else {
+            return;
+        };
+        self.store_recent_workflow_context(context);
+    }
+
+    fn remember_screen_workflow_context(
+        &self,
+        run: &ScreenWorkflowRun,
+        request_id: &str,
+        action_id: &str,
+        previous_context: Option<RecentWorkflowContext>,
+    ) {
+        let Some(context) = build_context_from_screen_workflow_run(
+            run,
+            request_id,
+            action_id,
+            previous_context,
+            now_ms(),
+        ) else {
+            return;
+        };
+        self.store_recent_workflow_context(context);
+    }
+
+    fn store_recent_workflow_context(&self, context: RecentWorkflowContext) {
+        let mut memory = self
+            .recent_workflow_context
+            .lock()
+            .expect("recent workflow context memory poisoned");
+        *memory = Some(context);
+    }
+
+    async fn prepare_continuation_grounding(
+        &self,
+        workflow: &mut ScreenWorkflow,
+        capabilities: &UIPrimitiveCapabilitySet,
+    ) {
+        let max_attempts = if workflow.continuation.is_some() {
+            2
+        } else {
+            1
+        };
+        let mut attempts = Vec::new();
+        if !self
+            .permissions
+            .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+            || !self
+                .policy
+                .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+        {
+            workflow
+                .grounding
+                .uncertainty
+                .push("structured_grounding_permission_denied".into());
+            return;
+        }
+
+        for attempt_index in 0..max_attempts {
+            if workflow.continuation.is_none() && !workflow_needs_target_grounding(workflow) {
+                break;
+            }
+            if !workflow_needs_target_grounding(workflow)
+                && workflow.grounding.page_validation.is_some()
+            {
+                break;
+            }
+
+            let capture = match self.capture_for_structured_grounding() {
+                Ok(capture) => capture,
+                Err(error) => {
+                    workflow
+                        .grounding
+                        .uncertainty
+                        .push(format!("structured_grounding_capture_unavailable: {error}"));
+                    break;
+                }
+            };
+
+            let extraction = self
+                .extract_structured_candidates_for_workflow_capture(workflow, &capture)
+                .await;
+            match extraction {
+                Ok(extraction) => {
+                    if let Some(page_evidence) = extraction.page_evidence {
+                        workflow.grounding.page_evidence.push(page_evidence);
+                    }
+                    if !extraction.candidates.is_empty() {
+                        workflow
+                            .grounding
+                            .visible_target_candidates
+                            .extend(extraction.candidates);
+                    } else {
+                        workflow
+                            .grounding
+                            .uncertainty
+                            .push("structured_vision_returned_no_candidates".into());
+                    }
+                }
+                Err(error) => {
+                    workflow
+                        .grounding
+                        .uncertainty
+                        .push(format!("structured_vision_unavailable: {error}"));
+                }
+            }
+
+            if let Some(descriptor) = workflow.continuation.clone() {
+                let page_validation = validate_continuation_page(
+                    &descriptor,
+                    Some(&capture),
+                    &workflow.grounding.page_evidence,
+                    &workflow.grounding.visible_target_candidates,
+                    now_ms(),
+                );
+                workflow.grounding.page_validation = Some(page_validation.clone());
+                refresh_screen_workflow_plan(workflow);
+                let selected = workflow.step_plans.iter().any(|plan| {
+                    plan.target_selection
+                        .as_ref()
+                        .is_some_and(|selection| selection.selected_candidate.is_some())
+                });
+                let scroll_decision = scroll_policy_for_regrounding(
+                    &descriptor,
+                    capabilities,
+                    attempt_index,
+                    max_attempts,
+                    &page_validation,
+                    workflow.grounding.visible_target_candidates.len(),
+                    selected,
+                );
+                attempts.push(RegroundingAttemptDiagnostic {
+                    attempt_index,
+                    page_validation,
+                    visible_candidate_count: workflow.grounding.visible_target_candidates.len(),
+                    selected_candidate_id: workflow
+                        .step_plans
+                        .iter()
+                        .find_map(|plan| plan.target_selection.as_ref())
+                        .and_then(|selection| selection.selected_candidate.as_ref())
+                        .map(|candidate| candidate.candidate_id.clone()),
+                    target_selection_status: workflow
+                        .step_plans
+                        .iter()
+                        .find_map(|plan| plan.target_selection.as_ref())
+                        .map(|selection| format!("{:?}", selection.status)),
+                    scroll_decision: scroll_decision.clone(),
+                    notes: workflow.grounding.uncertainty.clone(),
+                });
+
+                if selected
+                    || matches!(
+                        scroll_decision.status,
+                        ScrollContinuationStatus::Unsupported
+                            | ScrollContinuationStatus::RetryBudgetExhausted
+                            | ScrollContinuationStatus::PageMismatch
+                            | ScrollContinuationStatus::NotNeeded
+                            | ScrollContinuationStatus::NotApplicable
+                    )
+                {
+                    break;
+                }
+
+                workflow.grounding.uncertainty.push(
+                    "scroll_regrounding_requested_but_scroll_execution_is_not_enabled".into(),
+                );
+                break;
+            } else {
+                refresh_screen_workflow_plan(workflow);
+                break;
+            }
+        }
+
+        if let Some(descriptor) = workflow.continuation.as_mut() {
+            if let Some(page_validation) = workflow.grounding.page_validation.clone() {
+                descriptor.page_validation = Some(page_validation);
+            }
+            if !attempts.is_empty() {
+                let final_status = attempts
+                    .last()
+                    .map(|attempt| attempt.scroll_decision.status.clone())
+                    .unwrap_or(ScrollContinuationStatus::NotApplicable);
+                let final_reason = attempts
+                    .last()
+                    .map(|attempt| attempt.scroll_decision.reason.clone())
+                    .unwrap_or_else(|| "no re-grounding attempts were recorded".into());
+                let diagnostics = ContinuationRegroundingDiagnostics {
+                    max_attempts,
+                    attempts,
+                    final_status,
+                    final_reason,
+                };
+                descriptor.regrounding = Some(diagnostics.clone());
+                workflow.grounding.regrounding = Some(diagnostics);
+            }
+        }
+
+        refresh_screen_workflow_plan(workflow);
+    }
+
+    async fn extract_structured_candidates_for_workflow_capture(
+        &self,
+        workflow: &ScreenWorkflow,
+        capture: &ScreenCaptureResult,
+    ) -> Result<StructuredVisionExtraction, String> {
+        if !self
+            .permissions
+            .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+            || !self
+                .policy
+                .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+        {
+            return Err("Permission denied for desktop observation".into());
+        }
+
+        let requested_roles = requested_roles_for_workflow(workflow);
+        let app_hint = workflow
+            .steps
+            .iter()
+            .find_map(|step| value_str(&step.target, "app"));
+        let provider_hint = workflow.steps.iter().find_map(|step| {
+            value_str(&step.target, "provider").or_else(|| value_str(&step.selection, "provider"))
+        });
+        let extraction = self
+            .screen_vision
+            .extract_ui_candidates(
+                &capture.image_path,
+                capture.captured_at,
+                &capture.provider,
+                &requested_roles,
+                app_hint,
+                provider_hint,
+            )
+            .await?;
+
+        Ok(extraction)
+    }
+
+    fn capture_for_structured_grounding(&self) -> Result<ScreenCaptureResult, String> {
+        let status = self.screen_capture.status();
+        if let Some(path) = status.last_capture_path.clone() {
+            let capture_age_ms = status
+                .last_frame_at
+                .map(|captured_at| now_ms().saturating_sub(captured_at));
+            if status.enabled
+                && capture_age_ms
+                    .map(|age| age > MAX_RECENT_SCREEN_AGE_MS)
+                    .unwrap_or(false)
+            {
+                return self.screen_capture.capture_snapshot();
+            }
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            return Ok(ScreenCaptureResult {
+                capture_id: Uuid::new_v4().to_string(),
+                captured_at: status.last_frame_at.unwrap_or_else(now_ms),
+                image_path: path,
+                width: None,
+                height: None,
+                bytes,
+                provider: status.provider,
+            });
+        }
+
+        if !status.enabled {
+            return Err(
+                "No recent screen capture is available and screen observation is disabled.".into(),
+            );
+        }
+
+        self.screen_capture.capture_snapshot()
     }
 
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
@@ -482,6 +843,7 @@ impl DesktopAgentRuntime {
         let result = self.dispatch(&request);
         match result {
             Ok(result) => {
+                self.remember_action_workflow_context(&request_id, &action_id, &request, &result);
                 self.audit.append(&DesktopAuditEvent {
                     audit_id: Uuid::new_v4().to_string(),
                     action_id: action_id.clone(),
@@ -491,7 +853,7 @@ impl DesktopAgentRuntime {
                     status: "completed".into(),
                     timestamp: now_ms(),
                     risk_level: descriptor.default_risk.clone(),
-                    details: json!({"result": result}),
+                    details: json!({"result": result.clone()}),
                 });
                 Ok(DesktopActionResponse {
                     action_id,
@@ -704,6 +1066,66 @@ fn launch_app(path: &str, args: &[String]) -> Result<Value, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(json!({"path": path, "args": args, "launched": true}))
+}
+
+fn workflow_needs_target_grounding(workflow: &ScreenWorkflow) -> bool {
+    workflow
+        .step_plans
+        .iter()
+        .any(|plan| plan.support == StepSupportStatus::NeedsTargetGrounding)
+}
+
+fn requested_roles_for_workflow(workflow: &ScreenWorkflow) -> Vec<String> {
+    let mut roles = Vec::new();
+    for step in &workflow.steps {
+        let role = match step.step_kind {
+            WorkflowStepKind::FocusSearchInput => Some("search_input"),
+            WorkflowStepKind::OpenRankedResult => Some("ranked_result"),
+            WorkflowStepKind::ClickVisibleElement => Some("button"),
+            WorkflowStepKind::EnterText => Some("search_input"),
+            _ => None,
+        };
+        if let Some(role) = role {
+            if !roles.iter().any(|existing| existing == role) {
+                roles.push(role.to_string());
+            }
+        }
+    }
+    roles
+}
+
+fn verified_continuation_learning_event(
+    run: &ScreenWorkflowRun,
+) -> Option<VerifiedContinuationLearningEvent> {
+    if !matches!(
+        run.status,
+        crate::screen_workflow::WorkflowRunStatus::Completed
+    ) {
+        return None;
+    }
+    let continuation = run.workflow.continuation.as_ref()?;
+    let interpretation = continuation.followup.interpretation.clone()?;
+    let phrase = interpretation.utterance.clone();
+    Some(VerifiedContinuationLearningEvent {
+        phrase,
+        interpretation,
+        merge: continuation.followup.merge_diagnostic.clone(),
+        page_validation: continuation.page_validation.clone(),
+        regrounding: continuation.regrounding.clone(),
+        outcome: VerifiedContinuationOutcome {
+            run_id: run.run_id.clone(),
+            status: run.status.as_str().into(),
+            completed_steps: run.completed_steps,
+            verifier_status: run
+                .continuation_verification
+                .as_ref()
+                .map(|verification| format!("{:?}", verification.status)),
+        },
+    })
+}
+
+fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
 }
 
 fn now_ms() -> u64 {

@@ -31,7 +31,8 @@ impl UITargetRole {
 
         match normalize_label(value).as_str() {
             "search_input" | "search_box" | "searchbar" | "search_bar" => Self::SearchInput,
-            "ranked_result" | "first_result" | "result" | "search_result" => Self::RankedResult,
+            "ranked_result" | "first_result" | "result" | "search_result" | "video"
+            | "video_result" => Self::RankedResult,
             "button" | "submit_button" => Self::Button,
             "link" | "anchor" => Self::Link,
             "text_input" | "input" | "field" | "textbox" => Self::TextInput,
@@ -99,7 +100,19 @@ pub struct UITargetCandidate {
     #[serde(default)]
     pub app_hint: Option<String>,
     #[serde(default)]
+    pub browser_app_hint: Option<String>,
+    #[serde(default)]
     pub provider_hint: Option<String>,
+    #[serde(default)]
+    pub content_provider_hint: Option<String>,
+    #[serde(default)]
+    pub page_kind_hint: Option<String>,
+    #[serde(default)]
+    pub capture_backend: Option<String>,
+    #[serde(default)]
+    pub observation_source: Option<String>,
+    #[serde(default)]
+    pub result_kind: Option<String>,
     pub confidence: f32,
     pub source: TargetGroundingSource,
     #[serde(default)]
@@ -139,7 +152,13 @@ impl UITargetCandidate {
             "center_x": center_x,
             "center_y": center_y,
             "app_hint": self.app_hint,
+            "browser_app_hint": self.browser_app_hint,
             "provider_hint": self.provider_hint,
+            "content_provider_hint": self.content_provider_hint,
+            "page_kind_hint": self.page_kind_hint,
+            "capture_backend": self.capture_backend,
+            "observation_source": self.observation_source,
+            "result_kind": self.result_kind,
             "confidence": self.confidence,
             "source": self.source,
             "label": self.label,
@@ -176,6 +195,8 @@ pub struct TargetGroundingRequest {
     #[serde(default)]
     pub rank_hint: Option<u32>,
     #[serde(default)]
+    pub result_kind_hint: Option<String>,
+    #[serde(default)]
     pub allow_recent_reuse: bool,
     #[serde(default)]
     pub now_ms: Option<u64>,
@@ -186,6 +207,14 @@ pub struct TargetGroundingRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetGroundingState {
     pub requested_role: UITargetRole,
+    #[serde(default)]
+    pub rank_hint: Option<u32>,
+    #[serde(default)]
+    pub result_kind_hint: Option<String>,
+    #[serde(default)]
+    pub now_ms: Option<u64>,
+    #[serde(default = "default_recent_target_max_age_ms")]
+    pub max_recent_age_ms: u64,
     pub candidates: Vec<UITargetCandidate>,
     #[serde(default)]
     pub current_app_hint: Option<String>,
@@ -218,10 +247,55 @@ impl Default for TargetSelectionPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum TargetSelectionStatus {
     Selected,
-    NoCandidates,
+    NoCandidatesPresent,
+    CandidatesFilteredOut,
+    RankMismatch,
+    ProviderMismatch,
+    KindMismatch,
     LowConfidence,
     Ambiguous,
     UnsupportedTarget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetCandidateFilterPhase {
+    Presence,
+    Role,
+    Provider,
+    App,
+    ResultKind,
+    ExecutableMetadata,
+    Freshness,
+    Rank,
+    Confidence,
+    Ambiguity,
+    Selected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TargetSelectionDiagnostics {
+    pub raw_candidate_count: usize,
+    pub role_match_count: usize,
+    pub provider_match_count: usize,
+    pub app_match_count: usize,
+    pub result_kind_match_count: usize,
+    pub executable_metadata_count: usize,
+    pub freshness_match_count: usize,
+    pub rank_match_count: usize,
+    pub eligible_candidate_count: usize,
+    #[serde(default)]
+    pub requested_rank: Option<u32>,
+    #[serde(default)]
+    pub requested_provider: Option<String>,
+    #[serde(default)]
+    pub requested_app: Option<String>,
+    #[serde(default)]
+    pub requested_result_kind: Option<String>,
+    #[serde(default)]
+    pub rejected_phase: Option<TargetCandidateFilterPhase>,
+    #[serde(default)]
+    pub rejection_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +307,8 @@ pub struct TargetSelection {
     pub considered_candidates: Vec<UITargetCandidate>,
     pub required_confidence: f32,
     pub reason: String,
+    #[serde(default)]
+    pub diagnostics: TargetSelectionDiagnostics,
 }
 
 impl TargetSelection {
@@ -240,7 +316,10 @@ impl TargetSelection {
         candidate: UITargetCandidate,
         considered: Vec<UITargetCandidate>,
         required_confidence: f32,
+        mut diagnostics: TargetSelectionDiagnostics,
     ) -> Self {
+        diagnostics.eligible_candidate_count = considered.len();
+        diagnostics.rejected_phase = Some(TargetCandidateFilterPhase::Selected);
         Self {
             status: TargetSelectionStatus::Selected,
             selected_candidate: Some(candidate),
@@ -248,6 +327,7 @@ impl TargetSelection {
             required_confidence,
             reason: "A single high-confidence target candidate satisfied the selection policy."
                 .into(),
+            diagnostics,
         }
     }
 
@@ -263,7 +343,29 @@ impl TargetSelection {
             considered_candidates: considered,
             required_confidence,
             reason: reason.into(),
+            diagnostics: TargetSelectionDiagnostics::default(),
         }
+    }
+}
+
+fn rejected_with_diagnostics(
+    status: TargetSelectionStatus,
+    considered: Vec<UITargetCandidate>,
+    required_confidence: f32,
+    reason: impl Into<String>,
+    mut diagnostics: TargetSelectionDiagnostics,
+    phase: TargetCandidateFilterPhase,
+    rejection_reason: impl Into<String>,
+) -> TargetSelection {
+    diagnostics.rejected_phase = Some(phase);
+    diagnostics.rejection_reasons.push(rejection_reason.into());
+    TargetSelection {
+        status,
+        selected_candidate: None,
+        considered_candidates: considered,
+        required_confidence,
+        reason: reason.into(),
+        diagnostics,
     }
 }
 
@@ -309,7 +411,6 @@ pub fn ground_targets_for_request(request: &TargetGroundingRequest) -> TargetGro
         request
             .screen_candidates
             .iter()
-            .filter(|candidate| candidate_context_matches(candidate, request))
             .cloned()
             .map(|candidate| candidate.with_source(TargetGroundingSource::ScreenAnalysis)),
     );
@@ -319,8 +420,6 @@ pub fn ground_targets_for_request(request: &TargetGroundingRequest) -> TargetGro
             request
                 .recent_candidates
                 .iter()
-                .filter(|candidate| candidate_context_matches(candidate, request))
-                .filter(|candidate| recent_candidate_is_reusable(candidate, request))
                 .cloned()
                 .map(|candidate| candidate.with_source(TargetGroundingSource::RecentContext)),
         );
@@ -328,7 +427,9 @@ pub fn ground_targets_for_request(request: &TargetGroundingRequest) -> TargetGro
 
     if let Some(rank_hint) = request.rank_hint {
         for candidate in &mut candidates {
-            if candidate.rank.is_none() {
+            if candidate.rank.is_none()
+                && matches!(candidate.source, TargetGroundingSource::WorkflowMetadata)
+            {
                 candidate.rank = Some(rank_hint);
             }
         }
@@ -341,6 +442,10 @@ pub fn ground_targets_for_request(request: &TargetGroundingRequest) -> TargetGro
 
     TargetGroundingState {
         requested_role: request.requested_role.clone(),
+        rank_hint: request.rank_hint,
+        result_kind_hint: request.result_kind_hint.clone(),
+        now_ms: request.now_ms,
+        max_recent_age_ms: request.max_recent_age_ms,
         sufficient_for_selection: !candidates.is_empty(),
         ambiguous: false,
         candidates,
@@ -359,36 +464,193 @@ pub fn select_target_candidate(
         TargetAction::Focus => policy.min_focus_confidence,
         TargetAction::Click => policy.min_click_confidence,
     };
+    let mut diagnostics = TargetSelectionDiagnostics {
+        raw_candidate_count: state.candidates.len(),
+        requested_rank: state.rank_hint,
+        requested_provider: state.provider_hint.clone(),
+        requested_app: state.current_app_hint.clone(),
+        requested_result_kind: state.result_kind_hint.clone(),
+        ..Default::default()
+    };
 
     if state.candidates.is_empty() {
-        return TargetSelection::rejected(
-            TargetSelectionStatus::NoCandidates,
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::NoCandidatesPresent,
             Vec::new(),
             required_confidence,
             "No structured target candidates are available for this step.",
+            diagnostics,
+            TargetCandidateFilterPhase::Presence,
+            "candidate_pool_empty",
         );
     }
 
-    let mut considered = state
+    let role_matched = state
         .candidates
         .iter()
         .filter(|candidate| candidate.role.matches_requested(&state.requested_role))
-        .filter(|candidate| match action {
-            TargetAction::Focus => candidate.supports_focus,
-            TargetAction::Click => candidate.supports_click,
-        })
-        .filter(|candidate| candidate.has_point())
         .cloned()
         .collect::<Vec<_>>();
-
-    if considered.is_empty() {
-        return TargetSelection::rejected(
-            TargetSelectionStatus::UnsupportedTarget,
+    diagnostics.role_match_count = role_matched.len();
+    if role_matched.is_empty() {
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::CandidatesFilteredOut,
             state.candidates.clone(),
             required_confidence,
-            "Candidates exist, but none match the requested role with executable target metadata.",
+            "Structured candidates are present, but none match the requested target role.",
+            diagnostics,
+            TargetCandidateFilterPhase::Role,
+            "role_mismatch",
         );
     }
+
+    let provider_matched = role_matched
+        .iter()
+        .filter(|candidate| candidate_provider_matches(candidate, state.provider_hint.as_deref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.provider_match_count = provider_matched.len();
+    if provider_matched.is_empty() {
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::ProviderMismatch,
+            role_matched,
+            required_confidence,
+            "Structured candidates are present, but their provider hints do not match the requested provider.",
+            diagnostics,
+            TargetCandidateFilterPhase::Provider,
+            "provider_mismatch",
+        );
+    }
+
+    let app_matched = provider_matched
+        .iter()
+        .filter(|candidate| candidate_app_matches(candidate, state.current_app_hint.as_deref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.app_match_count = app_matched.len();
+    if app_matched.is_empty() {
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::CandidatesFilteredOut,
+            provider_matched,
+            required_confidence,
+            "Structured candidates are present, but their app hints do not match the current app context.",
+            diagnostics,
+            TargetCandidateFilterPhase::App,
+            "app_mismatch",
+        );
+    }
+
+    let kind_matched = app_matched
+        .iter()
+        .filter(|candidate| candidate_kind_matches(candidate, state.result_kind_hint.as_deref()))
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.result_kind_match_count = kind_matched.len();
+    if kind_matched.is_empty() {
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::KindMismatch,
+            app_matched,
+            required_confidence,
+            "Structured candidates are present, but their result kind does not match the requested result kind.",
+            diagnostics,
+            TargetCandidateFilterPhase::ResultKind,
+            "result_kind_mismatch",
+        );
+    }
+
+    let executable_matched = kind_matched
+        .iter()
+        .filter(|candidate| candidate_is_executable(candidate, &action))
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.executable_metadata_count = executable_matched.len();
+    if executable_matched.is_empty() {
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::UnsupportedTarget,
+            kind_matched,
+            required_confidence,
+            "Structured candidates are present, but none expose executable target metadata for this action.",
+            diagnostics,
+            TargetCandidateFilterPhase::ExecutableMetadata,
+            "missing_executable_target_metadata",
+        );
+    }
+
+    let freshness_matched = executable_matched
+        .iter()
+        .filter(|candidate| candidate_is_fresh_for_selection(candidate, state))
+        .cloned()
+        .collect::<Vec<_>>();
+    diagnostics.freshness_match_count = freshness_matched.len();
+    if freshness_matched.is_empty() {
+        return rejected_with_diagnostics(
+            TargetSelectionStatus::CandidatesFilteredOut,
+            executable_matched,
+            required_confidence,
+            "Structured candidates are present, but the reusable candidates are stale or not eligible for reuse.",
+            diagnostics,
+            TargetCandidateFilterPhase::Freshness,
+            "stale_or_non_reusable_candidate",
+        );
+    }
+
+    let mut considered = freshness_matched;
+    if let Some(rank_hint) = state.rank_hint {
+        let exact_ranked = considered
+            .iter()
+            .filter(|candidate| candidate.rank == Some(rank_hint))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !exact_ranked.is_empty() {
+            considered = exact_ranked;
+        } else if rank_hint == 1 {
+            let unranked = considered
+                .iter()
+                .filter(|candidate| candidate.rank.is_none())
+                .cloned()
+                .collect::<Vec<_>>();
+            if unranked.len() == 1 {
+                considered = unranked;
+            } else if !unranked.is_empty() {
+                diagnostics.rank_match_count = 0;
+                return rejected_with_diagnostics(
+                    TargetSelectionStatus::Ambiguous,
+                    considered,
+                    required_confidence,
+                    "Multiple result candidates are visible, but none has rank metadata for the requested first result.",
+                    diagnostics,
+                    TargetCandidateFilterPhase::Rank,
+                    "multiple_unranked_candidates_for_first_result",
+                );
+            } else {
+                diagnostics.rank_match_count = 0;
+                return rejected_with_diagnostics(
+                    TargetSelectionStatus::RankMismatch,
+                    considered,
+                    required_confidence,
+                    format!("No target candidate matches requested result rank {rank_hint}."),
+                    diagnostics,
+                    TargetCandidateFilterPhase::Rank,
+                    "rank_mismatch",
+                );
+            }
+        } else {
+            diagnostics.rank_match_count = 0;
+            return rejected_with_diagnostics(
+                TargetSelectionStatus::RankMismatch,
+                considered,
+                required_confidence,
+                format!("No target candidate matches requested result rank {rank_hint}."),
+                diagnostics,
+                TargetCandidateFilterPhase::Rank,
+                "rank_mismatch",
+            );
+        }
+        diagnostics.rank_match_count = considered.len();
+    } else {
+        diagnostics.rank_match_count = considered.len();
+    }
+    diagnostics.eligible_candidate_count = considered.len();
 
     considered.sort_by(|left, right| {
         candidate_score(right, state)
@@ -404,7 +666,7 @@ pub fn select_target_candidate(
     let best = considered[0].clone();
     let best_score = candidate_score(&best, state);
     if best_score < required_confidence {
-        return TargetSelection::rejected(
+        return rejected_with_diagnostics(
             TargetSelectionStatus::LowConfidence,
             considered,
             required_confidence,
@@ -412,21 +674,27 @@ pub fn select_target_candidate(
                 "Best target score {:.2} is below the required {:.2}.",
                 best_score, required_confidence
             ),
+            diagnostics,
+            TargetCandidateFilterPhase::Confidence,
+            "below_confidence_threshold",
         );
     }
 
     if let Some(second) = considered.get(1) {
         if (best_score - candidate_score(second, state)).abs() < policy.ambiguity_margin {
-            return TargetSelection::rejected(
+            return rejected_with_diagnostics(
                 TargetSelectionStatus::Ambiguous,
                 considered,
                 required_confidence,
                 "Multiple target candidates are too close in confidence to click safely.",
+                diagnostics,
+                TargetCandidateFilterPhase::Ambiguity,
+                "candidate_scores_too_close",
             );
         }
     }
 
-    TargetSelection::selected(best, considered, required_confidence)
+    TargetSelection::selected(best, considered, required_confidence, diagnostics)
 }
 
 fn collect_candidates_from_value(
@@ -544,18 +812,72 @@ fn candidate_from_value(
         .get("supports_click")
         .and_then(Value::as_bool)
         .unwrap_or(has_point);
-    let app_hint = value
-        .get("app_hint")
+    let raw_app_hint = value
+        .get("browser_app_hint")
+        .or_else(|| value.get("browser_app"))
+        .or_else(|| value.get("browser"))
+        .or_else(|| value.get("app_hint"))
         .or_else(|| value.get("app"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| app_hint.map(ToOwned::to_owned));
-    let provider_hint = value
-        .get("provider_hint")
+        .and_then(Value::as_str);
+    let browser_app_hint = raw_app_hint
+        .and_then(normalize_browser_app_hint)
+        .or_else(|| app_hint.and_then(normalize_browser_app_hint));
+    let app_hint = browser_app_hint
+        .clone()
+        .or_else(|| app_hint.and_then(normalize_browser_app_hint));
+    let raw_provider_hint = value
+        .get("content_provider_hint")
+        .or_else(|| value.get("site_provider_hint"))
+        .or_else(|| value.get("site_provider"))
+        .or_else(|| value.get("site_hint"))
+        .or_else(|| value.get("site"))
+        .or_else(|| value.get("provider_hint"))
         .or_else(|| value.get("provider"))
+        .and_then(Value::as_str);
+    let content_provider_hint = raw_provider_hint
+        .and_then(normalize_content_provider_hint)
+        .or_else(|| provider_hint.and_then(normalize_content_provider_hint));
+    let provider_hint = content_provider_hint.clone();
+    let capture_backend = value
+        .get("capture_backend")
+        .or_else(|| value.get("observation_backend"))
+        .or_else(|| value.get("capture_provider"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| provider_hint.map(ToOwned::to_owned));
+        .map(normalize_label)
+        .or_else(|| {
+            raw_provider_hint
+                .filter(|value| is_technical_capture_backend(value))
+                .map(normalize_label)
+        });
+    let observation_source = value
+        .get("observation_source")
+        .or_else(|| value.get("source_backend"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let page_kind_hint = value
+        .get("page_kind_hint")
+        .or_else(|| value.get("page_kind"))
+        .or_else(|| value.get("page_type"))
+        .and_then(Value::as_str)
+        .map(normalize_label);
+
+    let app_hint = app_hint.or_else(|| {
+        value
+            .get("app_hint")
+            .or_else(|| value.get("app"))
+            .and_then(Value::as_str)
+            .and_then(normalize_browser_app_hint)
+    });
+    let provider_hint = provider_hint.or_else(|| {
+        value
+            .get("provider_hint")
+            .or_else(|| value.get("provider"))
+            .and_then(Value::as_str)
+            .and_then(normalize_content_provider_hint)
+    });
+    let content_provider_hint = content_provider_hint.or_else(|| provider_hint.clone());
+    let browser_app_hint = browser_app_hint.or_else(|| app_hint.clone());
+    let app_hint = app_hint.or_else(|| browser_app_hint.clone());
 
     Some(UITargetCandidate {
         candidate_id: value
@@ -569,7 +891,19 @@ fn candidate_from_value(
         center_x,
         center_y,
         app_hint,
+        browser_app_hint,
         provider_hint,
+        content_provider_hint,
+        page_kind_hint,
+        capture_backend,
+        observation_source,
+        result_kind: value
+            .get("result_kind")
+            .or_else(|| value.get("kind"))
+            .or_else(|| value.get("item_kind"))
+            .or_else(|| value.get("content_kind"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         confidence,
         source,
         label: value
@@ -601,63 +935,97 @@ fn candidate_from_value(
     })
 }
 
-fn candidate_context_matches(
-    candidate: &UITargetCandidate,
-    request: &TargetGroundingRequest,
-) -> bool {
-    if let (Some(request_provider), Some(candidate_provider)) = (
-        request.provider_hint.as_deref(),
-        candidate.provider_hint.as_deref(),
-    ) {
-        if !labels_match(request_provider, candidate_provider) {
-            return false;
-        }
-    }
+fn candidate_provider_matches(candidate: &UITargetCandidate, provider_hint: Option<&str>) -> bool {
+    let Some(provider_hint) = provider_hint else {
+        return true;
+    };
+    let Some(candidate_provider) = candidate_content_provider_hint(candidate) else {
+        return true;
+    };
 
-    if let (Some(request_app), Some(candidate_app)) =
-        (request.app_hint.as_deref(), candidate.app_hint.as_deref())
-    {
-        if !labels_match(request_app, candidate_app) {
-            return false;
-        }
-    }
-
-    true
+    labels_match(provider_hint, &candidate_provider)
 }
 
-fn recent_candidate_is_reusable(
+fn candidate_app_matches(candidate: &UITargetCandidate, app_hint: Option<&str>) -> bool {
+    let Some(app_hint) = app_hint else {
+        return true;
+    };
+    let Some(candidate_app) = candidate_browser_app_hint(candidate) else {
+        return true;
+    };
+
+    labels_match(app_hint, &candidate_app)
+}
+
+fn candidate_kind_matches(candidate: &UITargetCandidate, result_kind_hint: Option<&str>) -> bool {
+    let Some(result_kind_hint) = result_kind_hint else {
+        return true;
+    };
+    if is_generic_result_kind(result_kind_hint) {
+        return true;
+    }
+    let Some(candidate_kind) = candidate.result_kind.as_deref() else {
+        return true;
+    };
+    if is_generic_result_kind(candidate_kind) {
+        return true;
+    }
+
+    labels_match(result_kind_hint, candidate_kind)
+}
+
+fn candidate_is_executable(candidate: &UITargetCandidate, action: &TargetAction) -> bool {
+    let supports_action = match action {
+        TargetAction::Focus => candidate.supports_focus,
+        TargetAction::Click => candidate.supports_click,
+    };
+
+    supports_action && candidate.has_point()
+}
+
+fn candidate_is_fresh_for_selection(
     candidate: &UITargetCandidate,
-    request: &TargetGroundingRequest,
+    state: &TargetGroundingState,
 ) -> bool {
+    if candidate.source != TargetGroundingSource::RecentContext {
+        return true;
+    }
     if !candidate.reuse_eligible {
         return false;
     }
 
-    let Some(now_ms) = request.now_ms else {
+    let Some(now_ms) = state.now_ms else {
         return true;
     };
     let Some(observed_at_ms) = candidate.observed_at_ms else {
         return false;
     };
 
-    now_ms.saturating_sub(observed_at_ms) <= request.max_recent_age_ms
+    now_ms.saturating_sub(observed_at_ms) <= state.max_recent_age_ms
+}
+
+fn is_generic_result_kind(value: &str) -> bool {
+    matches!(
+        normalize_label(value).as_str(),
+        "result" | "search_result" | "ranked_result" | "item" | "generic" | "unknown"
+    )
 }
 
 fn candidate_score(candidate: &UITargetCandidate, state: &TargetGroundingState) -> f32 {
     let mut score = candidate.confidence;
     if let (Some(provider), Some(candidate_provider)) = (
         state.provider_hint.as_deref(),
-        candidate.provider_hint.as_deref(),
+        candidate_content_provider_hint(candidate),
     ) {
-        if labels_match(provider, candidate_provider) {
+        if labels_match(provider, &candidate_provider) {
             score += 0.03;
         }
     }
     if let (Some(app), Some(candidate_app)) = (
         state.current_app_hint.as_deref(),
-        candidate.app_hint.as_deref(),
+        candidate_browser_app_hint(candidate),
     ) {
-        if labels_match(app, candidate_app) {
+        if labels_match(app, &candidate_app) {
             score += 0.02;
         }
     }
@@ -672,6 +1040,32 @@ fn candidate_score(candidate: &UITargetCandidate, state: &TargetGroundingState) 
     }
 
     score.clamp(0.0, 1.0)
+}
+
+pub fn candidate_content_provider_hint(candidate: &UITargetCandidate) -> Option<String> {
+    candidate
+        .content_provider_hint
+        .as_deref()
+        .and_then(normalize_content_provider_hint)
+        .or_else(|| {
+            candidate
+                .provider_hint
+                .as_deref()
+                .and_then(normalize_content_provider_hint)
+        })
+}
+
+pub fn candidate_browser_app_hint(candidate: &UITargetCandidate) -> Option<String> {
+    candidate
+        .browser_app_hint
+        .as_deref()
+        .and_then(normalize_browser_app_hint)
+        .or_else(|| {
+            candidate
+                .app_hint
+                .as_deref()
+                .and_then(normalize_browser_app_hint)
+        })
 }
 
 fn labels_match(left: &str, right: &str) -> bool {
@@ -733,6 +1127,52 @@ fn normalize_label(value: &str) -> String {
         .replace(' ', "_")
 }
 
+pub fn normalize_browser_app_hint(value: &str) -> Option<String> {
+    match normalize_label(value).as_str() {
+        "chrome" | "google_chrome" => Some("chrome".into()),
+        "firefox" | "mozilla_firefox" => Some("firefox".into()),
+        "edge" | "microsoft_edge" => Some("edge".into()),
+        "safari" | "apple_safari" => Some("safari".into()),
+        "browser" | "web_browser" => Some("browser".into()),
+        _ => None,
+    }
+}
+
+pub fn normalize_content_provider_hint(value: &str) -> Option<String> {
+    let normalized = normalize_label(value);
+    if is_technical_capture_backend(&normalized) {
+        return None;
+    }
+    match normalized.as_str() {
+        "" | "unknown" | "none" | "null" | "n_a" | "na" => None,
+        "youtube" | "you_tube" | "youtube_com" | "www_youtube_com" => Some("youtube".into()),
+        "google" | "google_search" | "google_com" | "www_google_com" => Some("google".into()),
+        "github" | "github_com" => Some("github".into()),
+        "amazon" | "amazon_com" => Some("amazon".into()),
+        _ => Some(normalized),
+    }
+}
+
+pub fn is_technical_capture_backend(value: &str) -> bool {
+    let normalized = normalize_label(value);
+    matches!(
+        normalized.as_str(),
+        "powershell_gdi"
+            | "gdi"
+            | "windows_gdi"
+            | "windows_capture"
+            | "screenshot"
+            | "screen_capture"
+            | "capture_backend"
+            | "observation_backend"
+            | "vision_json"
+            | "desktop_observation"
+    ) || normalized.ends_with("_gdi")
+        || normalized.ends_with("_capture")
+        || normalized.contains("capture_backend")
+        || normalized.contains("observation_backend")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +1195,7 @@ mod tests {
             app_hint: Some("chrome".into()),
             provider_hint: Some("youtube".into()),
             rank_hint: None,
+            result_kind_hint: None,
             allow_recent_reuse: false,
             now_ms: None,
             max_recent_age_ms: default_recent_target_max_age_ms(),
@@ -784,6 +1225,7 @@ mod tests {
             app_hint: None,
             provider_hint: Some("youtube".into()),
             rank_hint: Some(1),
+            result_kind_hint: Some("video".into()),
             allow_recent_reuse: false,
             now_ms: None,
             max_recent_age_ms: default_recent_target_max_age_ms(),
@@ -826,6 +1268,7 @@ mod tests {
             app_hint: None,
             provider_hint: Some("youtube".into()),
             rank_hint: Some(1),
+            result_kind_hint: Some("video".into()),
             allow_recent_reuse: false,
             now_ms: None,
             max_recent_age_ms: default_recent_target_max_age_ms(),
@@ -838,6 +1281,172 @@ mod tests {
 
         assert_eq!(selection.status, TargetSelectionStatus::Selected);
         assert_eq!(selection.selected_candidate.unwrap().rank, Some(1));
+    }
+
+    #[test]
+    fn reports_rank_mismatch_when_ranked_candidates_are_present() {
+        let state = ground_targets_for_request(&TargetGroundingRequest {
+            requested_role: UITargetRole::RankedResult,
+            target: json!({}),
+            selection: json!({
+                "candidate": {
+                    "role": "ranked_result",
+                    "center_x": 400,
+                    "center_y": 360,
+                    "confidence": 0.95,
+                    "provider": "youtube",
+                    "result_kind": "video",
+                    "rank": 2
+                }
+            }),
+            screen_candidates: Vec::new(),
+            recent_candidates: Vec::new(),
+            app_hint: None,
+            provider_hint: Some("youtube".into()),
+            rank_hint: Some(1),
+            result_kind_hint: Some("video".into()),
+            allow_recent_reuse: false,
+            now_ms: None,
+            max_recent_age_ms: default_recent_target_max_age_ms(),
+        });
+        let selection = select_target_candidate(
+            &state,
+            TargetAction::Click,
+            &TargetSelectionPolicy::default(),
+        );
+
+        assert_eq!(selection.status, TargetSelectionStatus::RankMismatch);
+        assert_eq!(selection.diagnostics.raw_candidate_count, 1);
+        assert_eq!(selection.diagnostics.rank_match_count, 0);
+        assert_eq!(
+            selection.diagnostics.rejected_phase,
+            Some(TargetCandidateFilterPhase::Rank)
+        );
+    }
+
+    #[test]
+    fn reports_provider_mismatch_without_collapsing_to_no_candidates() {
+        let state = ground_targets_for_request(&TargetGroundingRequest {
+            requested_role: UITargetRole::RankedResult,
+            target: json!({}),
+            selection: json!({
+                "candidate": {
+                    "role": "ranked_result",
+                    "center_x": 400,
+                    "center_y": 260,
+                    "confidence": 0.95,
+                    "provider": "vimeo",
+                    "result_kind": "video",
+                    "rank": 1
+                }
+            }),
+            screen_candidates: Vec::new(),
+            recent_candidates: Vec::new(),
+            app_hint: None,
+            provider_hint: Some("youtube".into()),
+            rank_hint: Some(1),
+            result_kind_hint: Some("video".into()),
+            allow_recent_reuse: false,
+            now_ms: None,
+            max_recent_age_ms: default_recent_target_max_age_ms(),
+        });
+        let selection = select_target_candidate(
+            &state,
+            TargetAction::Click,
+            &TargetSelectionPolicy::default(),
+        );
+
+        assert_eq!(selection.status, TargetSelectionStatus::ProviderMismatch);
+        assert_eq!(selection.diagnostics.raw_candidate_count, 1);
+        assert_eq!(selection.diagnostics.provider_match_count, 0);
+        assert_eq!(
+            selection.diagnostics.rejected_phase,
+            Some(TargetCandidateFilterPhase::Provider)
+        );
+    }
+
+    #[test]
+    fn technical_capture_backend_provider_hint_does_not_create_provider_mismatch() {
+        let state = ground_targets_for_request(&TargetGroundingRequest {
+            requested_role: UITargetRole::RankedResult,
+            target: json!({}),
+            selection: json!({
+                "candidate": {
+                    "role": "ranked_result",
+                    "center_x": 400,
+                    "center_y": 260,
+                    "confidence": 0.95,
+                    "provider": "powershell_gdi",
+                    "result_kind": "video",
+                    "rank": 1
+                }
+            }),
+            screen_candidates: Vec::new(),
+            recent_candidates: Vec::new(),
+            app_hint: None,
+            provider_hint: Some("youtube".into()),
+            rank_hint: Some(1),
+            result_kind_hint: Some("video".into()),
+            allow_recent_reuse: false,
+            now_ms: None,
+            max_recent_age_ms: default_recent_target_max_age_ms(),
+        });
+        let selection = select_target_candidate(
+            &state,
+            TargetAction::Click,
+            &TargetSelectionPolicy::default(),
+        );
+
+        assert_eq!(selection.status, TargetSelectionStatus::Selected);
+        assert_eq!(selection.diagnostics.provider_match_count, 1);
+        assert_eq!(
+            selection
+                .selected_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.capture_backend.as_deref()),
+            Some("powershell_gdi")
+        );
+    }
+
+    #[test]
+    fn reports_result_kind_mismatch_without_hiding_candidates() {
+        let state = ground_targets_for_request(&TargetGroundingRequest {
+            requested_role: UITargetRole::RankedResult,
+            target: json!({}),
+            selection: json!({
+                "candidate": {
+                    "role": "ranked_result",
+                    "center_x": 400,
+                    "center_y": 260,
+                    "confidence": 0.95,
+                    "provider": "youtube",
+                    "result_kind": "playlist",
+                    "rank": 1
+                }
+            }),
+            screen_candidates: Vec::new(),
+            recent_candidates: Vec::new(),
+            app_hint: None,
+            provider_hint: Some("youtube".into()),
+            rank_hint: Some(1),
+            result_kind_hint: Some("video".into()),
+            allow_recent_reuse: false,
+            now_ms: None,
+            max_recent_age_ms: default_recent_target_max_age_ms(),
+        });
+        let selection = select_target_candidate(
+            &state,
+            TargetAction::Click,
+            &TargetSelectionPolicy::default(),
+        );
+
+        assert_eq!(selection.status, TargetSelectionStatus::KindMismatch);
+        assert_eq!(selection.diagnostics.raw_candidate_count, 1);
+        assert_eq!(selection.diagnostics.result_kind_match_count, 0);
+        assert_eq!(
+            selection.diagnostics.rejected_phase,
+            Some(TargetCandidateFilterPhase::ResultKind)
+        );
     }
 
     #[test]
@@ -866,6 +1475,7 @@ mod tests {
             app_hint: None,
             provider_hint: None,
             rank_hint: None,
+            result_kind_hint: None,
             allow_recent_reuse: false,
             now_ms: None,
             max_recent_age_ms: default_recent_target_max_age_ms(),
@@ -898,7 +1508,13 @@ mod tests {
                 center_x: None,
                 center_y: None,
                 app_hint: Some("chrome".into()),
+                browser_app_hint: Some("chrome".into()),
                 provider_hint: Some("youtube".into()),
+                content_provider_hint: Some("youtube".into()),
+                page_kind_hint: None,
+                capture_backend: None,
+                observation_source: None,
+                result_kind: None,
                 confidence: 0.90,
                 source: TargetGroundingSource::ScreenAnalysis,
                 label: Some("Search".into()),
@@ -913,6 +1529,7 @@ mod tests {
             app_hint: Some("chrome".into()),
             provider_hint: Some("youtube".into()),
             rank_hint: None,
+            result_kind_hint: None,
             allow_recent_reuse: false,
             now_ms: Some(1_100),
             max_recent_age_ms: default_recent_target_max_age_ms(),
@@ -944,7 +1561,13 @@ mod tests {
                 center_x: Some(250.0),
                 center_y: Some(90.0),
                 app_hint: Some("chrome".into()),
+                browser_app_hint: Some("chrome".into()),
                 provider_hint: Some("youtube".into()),
+                content_provider_hint: Some("youtube".into()),
+                page_kind_hint: None,
+                capture_backend: None,
+                observation_source: None,
+                result_kind: None,
                 confidence: 0.86,
                 source: TargetGroundingSource::RecentContext,
                 label: Some("YouTube search".into()),
@@ -958,6 +1581,7 @@ mod tests {
             app_hint: Some("chrome".into()),
             provider_hint: Some("youtube".into()),
             rank_hint: None,
+            result_kind_hint: None,
             allow_recent_reuse: true,
             now_ms: Some(2_500),
             max_recent_age_ms: default_recent_target_max_age_ms(),
@@ -989,7 +1613,13 @@ mod tests {
                 center_x: Some(250.0),
                 center_y: Some(90.0),
                 app_hint: Some("chrome".into()),
+                browser_app_hint: Some("chrome".into()),
                 provider_hint: Some("youtube".into()),
+                content_provider_hint: Some("youtube".into()),
+                page_kind_hint: None,
+                capture_backend: None,
+                observation_source: None,
+                result_kind: None,
                 confidence: 0.92,
                 source: TargetGroundingSource::RecentContext,
                 label: None,
@@ -1003,11 +1633,25 @@ mod tests {
             app_hint: Some("chrome".into()),
             provider_hint: Some("youtube".into()),
             rank_hint: None,
+            result_kind_hint: None,
             allow_recent_reuse: true,
             now_ms: Some(200_000),
             max_recent_age_ms: 1_000,
         });
 
-        assert!(state.candidates.is_empty());
+        let selection = select_target_candidate(
+            &state,
+            TargetAction::Focus,
+            &TargetSelectionPolicy::default(),
+        );
+
+        assert_eq!(
+            selection.status,
+            TargetSelectionStatus::CandidatesFilteredOut
+        );
+        assert_eq!(
+            selection.diagnostics.rejected_phase,
+            Some(TargetCandidateFilterPhase::Freshness)
+        );
     }
 }

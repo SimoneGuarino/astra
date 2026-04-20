@@ -1,6 +1,6 @@
 use crate::{
     action_resolution::{ActionOperation, ActionResolution, ResolutionSource},
-    desktop_agent_types::CapabilityManifest,
+    desktop_agent_types::{CapabilityManifest, PageSemanticEvidence},
     ui_control::{
         UIControlRuntime, UIPrimitiveCapabilitySet, UIPrimitiveKind, UIPrimitiveRequest,
         UIPrimitiveResult, UIPrimitiveStatus,
@@ -9,6 +9,11 @@ use crate::{
         ground_targets_for_request, select_target_candidate, structured_candidates_from_value,
         TargetAction, TargetGroundingRequest, TargetGroundingSource, TargetSelection,
         TargetSelectionPolicy, TargetSelectionStatus, UITargetCandidate, UITargetRole,
+    },
+    workflow_continuation::{
+        build_continuation_verification_result, ContinuationRegroundingDiagnostics,
+        ContinuationVerificationResult, SemanticPageValidationResult, SemanticPageValidationStatus,
+        WorkflowContinuationDescriptor,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -126,9 +131,15 @@ pub struct ScreenGroundingState {
     #[serde(default)]
     pub visible_target_candidates: Vec<UITargetCandidate>,
     #[serde(default)]
+    pub page_evidence: Vec<PageSemanticEvidence>,
+    #[serde(default)]
     pub recent_target_candidates: Vec<UITargetCandidate>,
     #[serde(default)]
     pub generated_at_ms: Option<u64>,
+    #[serde(default)]
+    pub page_validation: Option<SemanticPageValidationResult>,
+    #[serde(default)]
+    pub regrounding: Option<ContinuationRegroundingDiagnostics>,
     #[serde(default)]
     pub uncertainty: Vec<String>,
 }
@@ -178,6 +189,8 @@ pub struct ScreenWorkflow {
     pub domain: ScreenWorkflowDomain,
     pub requires_screen_context: bool,
     pub depends_on_recent_screen_context: bool,
+    #[serde(default)]
+    pub continuation: Option<WorkflowContinuationDescriptor>,
     pub grounding: ScreenGroundingState,
     pub steps: Vec<WorkflowStep>,
     pub step_plans: Vec<WorkflowStepPlan>,
@@ -195,6 +208,7 @@ impl ScreenWorkflow {
             "domain": self.domain.as_str(),
             "requires_screen_context": self.requires_screen_context,
             "depends_on_recent_screen_context": self.depends_on_recent_screen_context,
+            "continuation": self.continuation,
             "grounding": self.grounding,
             "steps": self.steps,
             "step_plans": self.step_plans,
@@ -271,6 +285,8 @@ pub struct ScreenWorkflowRun {
     pub completed_steps: usize,
     #[serde(default)]
     pub stopped_reason: Option<String>,
+    #[serde(default)]
+    pub continuation_verification: Option<ContinuationVerificationResult>,
 }
 
 impl ScreenWorkflowRun {
@@ -283,6 +299,7 @@ impl ScreenWorkflowRun {
             "step_runs": self.step_runs,
             "completed_steps": self.completed_steps,
             "stopped_reason": self.stopped_reason,
+            "continuation_verification": self.continuation_verification,
         })
     }
 }
@@ -298,7 +315,33 @@ pub fn execute_screen_workflow(
     let mut status = WorkflowRunStatus::Completed;
     let mut stopped_reason = None;
 
+    if let Some(validation) = workflow
+        .grounding
+        .page_validation
+        .as_ref()
+        .filter(|validation| {
+            matches!(
+                validation.status,
+                SemanticPageValidationStatus::Mismatched
+                    | SemanticPageValidationStatus::NeedsFreshCapture
+                    | SemanticPageValidationStatus::Unsupported
+            )
+        })
+    {
+        status = WorkflowRunStatus::NeedsScreenContext;
+        stopped_reason = Some(format!(
+            "Semantic page validation did not confirm the expected continuation context: {}",
+            validation
+                .mismatch_reason
+                .as_deref()
+                .unwrap_or("page state is not trustworthy enough")
+        ));
+    }
+
     for plan in &workflow.step_plans {
+        if stopped_reason.is_some() {
+            break;
+        }
         let step = plan.step.clone();
         let target_selection = target_selection_for_step(
             &step,
@@ -327,15 +370,24 @@ pub fn execute_screen_workflow(
                 .is_some_and(|selection| selection.status == TargetSelectionStatus::Selected)
         {
             status = WorkflowRunStatus::NeedsTargetGrounding;
-            stopped_reason = Some(
-                target_selection
-                    .as_ref()
-                    .map(|selection| selection.reason.clone())
-                    .unwrap_or_else(|| {
-                        "No high-confidence grounded target candidate is available for this step."
-                            .into()
-                    }),
-            );
+            let mut reason = target_selection
+                .as_ref()
+                .map(|selection| selection.reason.clone())
+                .unwrap_or_else(|| {
+                    "No high-confidence grounded target candidate is available for this step."
+                        .into()
+                });
+            if let Some(regrounding_reason) = workflow
+                .grounding
+                .regrounding
+                .as_ref()
+                .map(|regrounding| regrounding.final_reason.as_str())
+                .filter(|reason| !reason.is_empty())
+            {
+                reason.push_str(" Re-grounding diagnostic: ");
+                reason.push_str(regrounding_reason);
+            }
+            stopped_reason = Some(reason);
             step_runs.push(WorkflowStepRun {
                 step,
                 primitive: None,
@@ -429,6 +481,16 @@ pub fn execute_screen_workflow(
         status = WorkflowRunStatus::PartiallyCompleted;
     }
 
+    let continuation_verification = workflow.continuation.as_ref().map(|descriptor| {
+        build_continuation_verification_result(
+            descriptor,
+            &status,
+            completed_steps,
+            workflow.steps.len(),
+            stopped_reason.as_deref(),
+        )
+    });
+
     ScreenWorkflowRun {
         run_id,
         status,
@@ -437,6 +499,7 @@ pub fn execute_screen_workflow(
         step_runs,
         completed_steps,
         stopped_reason,
+        continuation_verification,
     }
 }
 
@@ -467,6 +530,7 @@ pub fn resolve_screen_workflow(
         domain: domain_for_operation(&resolution.operation),
         requires_screen_context: true,
         depends_on_recent_screen_context,
+        continuation: None,
         grounding,
         steps,
         step_plans,
@@ -478,6 +542,10 @@ pub fn resolve_screen_workflow(
 }
 
 pub fn render_screen_workflow_run_response(run: &ScreenWorkflowRun, italian: bool) -> String {
+    if let Some(continuation) = run.workflow.continuation.as_ref() {
+        return render_continuation_workflow_run_response(run, continuation, italian);
+    }
+
     let planned = run.workflow.steps.len();
     let completed = run.completed_steps;
     let stopped = run.stopped_reason.as_deref().unwrap_or("");
@@ -565,6 +633,120 @@ pub fn render_screen_workflow_run_response(run: &ScreenWorkflowRun, italian: boo
     }
 }
 
+fn render_continuation_workflow_run_response(
+    run: &ScreenWorkflowRun,
+    continuation: &WorkflowContinuationDescriptor,
+    italian: bool,
+) -> String {
+    let planned = run.workflow.steps.len();
+    let completed = run.completed_steps;
+    let stopped = run.stopped_reason.as_deref().unwrap_or("");
+    let provider = continuation
+        .source_context
+        .provider
+        .as_deref()
+        .unwrap_or("screen");
+    let query = continuation
+        .source_context
+        .query
+        .as_deref()
+        .unwrap_or("contesto recente");
+    let rank = continuation
+        .followup
+        .result_reference
+        .as_ref()
+        .and_then(|reference| reference.rank)
+        .map(|rank| rank.to_string())
+        .unwrap_or_else(|| "referenced".into());
+    let verification = run
+        .continuation_verification
+        .as_ref()
+        .map(|verification| format!("{:?}", verification.status))
+        .unwrap_or_else(|| "not_recorded".into());
+
+    match run.status {
+        WorkflowRunStatus::Completed => {
+            if italian {
+                if continuation.verifier.requires_post_step_screen_check {
+                    format!(
+                        "Ho continuato il workflow recente ({provider}, {query}) e ho eseguito {completed}/{planned} passaggi. Ho cliccato il risultato {rank}; la verifica e' a livello primitiva e la prossima cattura dovra' confermare la navigazione."
+                    )
+                } else {
+                    format!(
+                        "Ho continuato il workflow recente ({provider}, {query}) e ho eseguito {completed}/{planned} passaggi con verifica: {verification}."
+                    )
+                }
+            } else if continuation.verifier.requires_post_step_screen_check {
+                format!(
+                    "I continued the recent workflow ({provider}, {query}) and executed {completed}/{planned} steps. I clicked result {rank}; verification is primitive-level and the next capture should confirm navigation."
+                )
+            } else {
+                format!(
+                    "I continued the recent workflow ({provider}, {query}) and executed {completed}/{planned} steps with verification: {verification}."
+                )
+            }
+        }
+        WorkflowRunStatus::NeedsTargetGrounding => {
+            if italian {
+                format!(
+                    "Ho capito la richiesta come continuazione del workflow recente ({provider}, {query}), ma non ho identificato un candidato abbastanza sicuro per il passaggio richiesto: {stopped}"
+                )
+            } else {
+                format!(
+                    "I understood this as a continuation of the recent workflow ({provider}, {query}), but I could not identify a safe enough candidate for the requested step: {stopped}"
+                )
+            }
+        }
+        WorkflowRunStatus::NeedsScreenContext => {
+            if italian {
+                format!(
+                    "Ho capito la continuazione del workflow recente ({provider}, {query}), ma serve una schermata verificabile prima di scegliere il target: {stopped}"
+                )
+            } else {
+                format!(
+                    "I understood the continuation of the recent workflow ({provider}, {query}), but I need verifiable screen context before choosing the target: {stopped}"
+                )
+            }
+        }
+        WorkflowRunStatus::StepUnsupported => {
+            if italian {
+                format!(
+                    "Ho capito la continuazione del workflow recente ({provider}, {query}), ma il runtime non espone ancora una primitiva sicura per completarla: {stopped}"
+                )
+            } else {
+                format!(
+                    "I understood the continuation of the recent workflow ({provider}, {query}), but this runtime does not yet expose a safe primitive to complete it: {stopped}"
+                )
+            }
+        }
+        WorkflowRunStatus::StepFailed => {
+            if italian {
+                format!(
+                    "Ho iniziato la continuazione del workflow recente ({provider}, {query}), ma uno step e' fallito dopo {completed}/{planned} passaggi: {stopped}"
+                )
+            } else {
+                format!(
+                    "I started continuing the recent workflow ({provider}, {query}), but one step failed after {completed}/{planned} steps: {stopped}"
+                )
+            }
+        }
+        WorkflowRunStatus::PartiallyCompleted
+        | WorkflowRunStatus::Planned
+        | WorkflowRunStatus::Executing
+        | WorkflowRunStatus::Aborted => {
+            if italian {
+                format!(
+                    "La continuazione del workflow recente ({provider}, {query}) non e' stata completata: {completed}/{planned} passaggi. Motivo: {stopped}"
+                )
+            } else {
+                format!(
+                    "The continuation of the recent workflow ({provider}, {query}) was not completed: {completed}/{planned} steps. Reason: {stopped}"
+                )
+            }
+        }
+    }
+}
+
 pub fn screen_grounding_state(manifest: &CapabilityManifest) -> ScreenGroundingState {
     let freshness =
         if manifest.screen.observation_enabled && manifest.screen.fresh_capture_available {
@@ -602,8 +784,11 @@ pub fn screen_grounding_state(manifest: &CapabilityManifest) -> ScreenGroundingS
         sufficient_for_workflow: manifest.screen.analysis_available
             && (manifest.screen.observation_enabled || manifest.screen.recent_capture_available),
         visible_target_candidates: Vec::new(),
+        page_evidence: Vec::new(),
         recent_target_candidates: Vec::new(),
         generated_at_ms: Some(now_ms()),
+        page_validation: None,
+        regrounding: None,
         uncertainty,
     }
 }
@@ -729,6 +914,9 @@ fn enrich_steps(steps: &mut [WorkflowStep], resolution: &ActionResolution) {
     let provider = value_str(&resolution.entities, "provider")
         .or(resolution.provider.as_deref())
         .unwrap_or("unknown");
+    let browser_app = value_str(&resolution.entities, "browser_app")
+        .or_else(|| value_str(&resolution.entities, "app"))
+        .unwrap_or("chrome");
     let query = value_str(&resolution.entities, "query_candidate")
         .or_else(|| value_str(&resolution.entities, "query"));
 
@@ -736,13 +924,17 @@ fn enrich_steps(steps: &mut [WorkflowStep], resolution: &ActionResolution) {
         match step.step_kind {
             WorkflowStepKind::LocateBrowserContext => {
                 step.target = json!({
-                    "app": "chrome",
+                    "app": browser_app,
                     "provider": provider,
                 });
                 step.expected_outcome = Some("visible browser context located".into());
             }
             WorkflowStepKind::FocusSearchInput => {
-                let mut target = json!({"element_role": "search_input", "provider": provider});
+                let mut target = json!({
+                    "element_role": "search_input",
+                    "provider": provider,
+                    "app": browser_app,
+                });
                 if let Some(candidate) = target_candidate_from_entities(
                     &resolution.entities,
                     &["search_input_candidate", "target_candidate"],
@@ -761,6 +953,7 @@ fn enrich_steps(steps: &mut [WorkflowStep], resolution: &ActionResolution) {
                     step.target = json!({
                         "element_role": "search_input",
                         "provider": provider,
+                        "app": browser_app,
                         "requires_recent_focus_target": true,
                     });
                 }
@@ -770,7 +963,17 @@ fn enrich_steps(steps: &mut [WorkflowStep], resolution: &ActionResolution) {
                 step.expected_outcome = Some("search results visible".into());
             }
             WorkflowStepKind::OpenRankedResult => {
-                let mut selection = json!({"strategy": "first_result"});
+                let rank = value_u32(&resolution.entities, "rank").unwrap_or(1);
+                let mut selection = json!({
+                    "strategy": value_str(&resolution.entities, "selection_strategy")
+                        .unwrap_or("ranked_result"),
+                    "rank": rank,
+                    "provider": provider,
+                    "app": browser_app,
+                    "query": query,
+                    "result_kind": value_str(&resolution.entities, "result_kind")
+                        .unwrap_or("result"),
+                });
                 if let Some(candidate) = target_candidate_from_entities(
                     &resolution.entities,
                     &[
@@ -947,11 +1150,17 @@ fn target_selection_for_step(
         selection: step.selection.clone(),
         screen_candidates: grounding.visible_target_candidates.clone(),
         recent_candidates: grounding.recent_target_candidates.clone(),
-        app_hint: value_str(&step.target, "app").map(ToOwned::to_owned),
+        app_hint: value_str(&step.target, "app")
+            .or_else(|| value_str(&step.selection, "app"))
+            .or_else(|| value_str(&step.selection, "browser_app"))
+            .map(ToOwned::to_owned),
         provider_hint: value_str(&step.target, "provider")
             .or_else(|| value_str(&step.selection, "provider"))
             .map(ToOwned::to_owned),
         rank_hint: rank_hint_for_step(step),
+        result_kind_hint: value_str(&step.selection, "result_kind")
+            .or_else(|| value_str(&step.target, "result_kind"))
+            .map(ToOwned::to_owned),
         allow_recent_reuse,
         now_ms: Some(now_ms()),
         max_recent_age_ms: 120_000,
@@ -959,7 +1168,7 @@ fn target_selection_for_step(
     let state = ground_targets_for_request(&request);
     if !grounding.sufficient_for_workflow && state.candidates.is_empty() {
         return Some(TargetSelection::rejected(
-            TargetSelectionStatus::NoCandidates,
+            TargetSelectionStatus::NoCandidatesPresent,
             Vec::new(),
             TargetSelectionPolicy::default().min_click_confidence,
             "Screen context is not sufficient and no structured target candidates are available.",
@@ -1008,7 +1217,11 @@ fn target_action_for_step(step: &WorkflowStep) -> TargetAction {
 
 fn rank_hint_for_step(step: &WorkflowStep) -> Option<u32> {
     if step.step_kind == WorkflowStepKind::OpenRankedResult {
-        Some(1)
+        step.selection
+            .get("rank")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32)
+            .or(Some(1))
     } else {
         step.selection
             .get("rank")
@@ -1036,6 +1249,7 @@ fn verify_executed_step(
         UIPrimitiveKind::TypeText | UIPrimitiveKind::PressEnter | UIPrimitiveKind::NavigateBack => {
             StepVerificationStatus::Satisfied
         }
+        UIPrimitiveKind::ScrollViewport => StepVerificationStatus::PartiallySatisfied,
         UIPrimitiveKind::ActivateWindowOrApp
         | UIPrimitiveKind::FocusCurrentInput
         | UIPrimitiveKind::ClickTargetCandidate => StepVerificationStatus::PartiallySatisfied,
@@ -1071,6 +1285,13 @@ fn value_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
 
 fn value_bool(value: &Value, key: &str) -> Option<bool> {
     value.get(key).and_then(Value::as_bool)
+}
+
+fn value_u32(value: &Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
 }
 
 fn target_candidate_from_entities<'a>(entities: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -1302,6 +1523,13 @@ mod tests {
 
         assert_eq!(run.status, WorkflowRunStatus::Completed);
         assert_eq!(run.completed_steps, 1);
+        assert_eq!(
+            run.step_runs
+                .first()
+                .and_then(|step| step.target_selection.as_ref())
+                .map(|selection| selection.status.clone()),
+            Some(TargetSelectionStatus::Selected)
+        );
     }
 
     #[test]
@@ -1510,7 +1738,13 @@ mod tests {
             center_x: None,
             center_y: None,
             app_hint: Some("chrome".into()),
+            browser_app_hint: Some("chrome".into()),
             provider_hint: Some("youtube".into()),
+            content_provider_hint: Some("youtube".into()),
+            page_kind_hint: None,
+            capture_backend: None,
+            observation_source: None,
+            result_kind: None,
             confidence: 0.88,
             source: TargetGroundingSource::RecentContext,
             label: Some("YouTube search".into()),

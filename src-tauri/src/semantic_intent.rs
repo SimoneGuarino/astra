@@ -188,7 +188,8 @@ fn classifier_system_prompt() -> &'static str {
         "\"params\":{\"query\":null,\"url\":null,\"path\":null,\"pattern\":null,\"content\":null,\"mode\":null,\"command\":null,\"args\":[],\"cwd\":null,\"app\":null},",
         "\"operation\":\"read_file|read_and_summarize_file|write_file|search_file|browser_search|browser_open|desktop_launch_app|screen_guided_browser_workflow|screen_guided_followup_action|screen_guided_navigation_workflow|unknown\",",
         "\"domain\":\"filesystem|browser|desktop|terminal|browser_screen_interaction|screen_interaction|screen_navigation|screen|unknown\",",
-        "\"provider\":\"google|youtube|web|chrome|null\",",
+        "\"provider\":\"google|youtube|web|null\",",
+        "\"browser_app\":\"chrome|firefox|safari|edge|null\",",
         "\"query_mode\":\"precise|semantic|null\",",
         "\"entities\":{},\"post_processing\":{},\"workflow_steps\":[],\"requires_screen_context\":false,\"ambiguity\":null,",
         "\"screen\":{\"capture_fresh\":null,\"reuse_recent\":null,\"state_question\":null},",
@@ -198,7 +199,8 @@ fn classifier_system_prompt() -> &'static str {
         "For open-ended searches such as 'una canzone di Shiva su YouTube', use browser_search with provider youtube and query_mode semantic. ",
         "For exact quoted or explicitly named searches, use query_mode precise. ",
         "For future screen-guided browser workflows, use screen_guided_browser_workflow and workflow_steps, but Rust still validates whether execution is supported. ",
-        "For follow-up visible-screen commands such as clicking the first visible result, use screen_guided_followup_action. ",
+        "For follow-up visible-screen commands such as clicking the first visible result, opening the first video, opening the second result, 'now type', 'open that', or 'continue', use screen_guided_followup_action when they depend on recent screen/browser context. ",
+        "Keep browser containers separate from content providers: 'google chrome' means browser_app chrome, not provider google and not query google chrome. ",
         "For requests to go back to a previous screen, use screen_guided_navigation_workflow. ",
         "Use capability_question when the user asks what Astra can do. ",
         "Use screen_question for screen access/state questions such as whether Astra can see, observe, capture, or analyze the screen. ",
@@ -220,6 +222,7 @@ struct RawIntent {
     operation: Option<String>,
     domain: Option<String>,
     provider: Option<String>,
+    browser_app: Option<String>,
     query_mode: Option<String>,
     entities: Option<Value>,
     post_processing: Option<Value>,
@@ -297,6 +300,7 @@ fn merge_action_resolution_hints(params: &mut Value, raw: &RawIntent) {
         ("operation", raw.operation.as_deref()),
         ("domain", raw.domain.as_deref()),
         ("provider", raw.provider.as_deref()),
+        ("browser_app", raw.browser_app.as_deref()),
         ("query_mode", raw.query_mode.as_deref()),
         ("ambiguity", raw.ambiguity.as_deref()),
     ] {
@@ -466,4 +470,48 @@ fn select_first_available(candidates: &[String], installed_models: &[String]) ->
                 .then(|| installed.clone())
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifier_schema_separates_provider_from_browser_app() {
+        let prompt = classifier_system_prompt();
+        assert!(prompt.contains("\"provider\":\"google|youtube|web|null\""));
+        assert!(prompt.contains("\"browser_app\":\"chrome|firefox|safari|edge|null\""));
+        assert!(!prompt.contains("\"provider\":\"google|youtube|web|chrome|null\""));
+    }
+
+    #[test]
+    fn parsed_intent_preserves_browser_app_hint() {
+        let intent = parse_intent_json(
+            r#"{
+                "intent":"tool_action_request",
+                "target":"screen",
+                "action":"unknown",
+                "params":{},
+                "operation":"screen_guided_followup_action",
+                "domain":"screen_interaction",
+                "provider":null,
+                "browser_app":"chrome",
+                "query_mode":null,
+                "entities":{"rank":1,"result_kind":"video"},
+                "workflow_steps":["open_ranked_result"],
+                "requires_screen_context":true,
+                "screen":{"capture_fresh":null,"reuse_recent":null,"state_question":null},
+                "confidence":0.84,
+                "language":"it",
+                "rationale":"follow-up"
+            }"#,
+        )
+        .expect("intent");
+
+        assert_eq!(
+            intent.params.get("browser_app").and_then(Value::as_str),
+            Some("chrome")
+        );
+        assert_eq!(intent.params.get("provider").and_then(Value::as_str), None);
+    }
 }

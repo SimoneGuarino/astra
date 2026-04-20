@@ -11,6 +11,7 @@ pub enum UIPrimitiveKind {
     TypeText,
     PressEnter,
     NavigateBack,
+    ScrollViewport,
     ClickTargetCandidate,
 }
 
@@ -98,6 +99,15 @@ impl UIPrimitiveCapabilitySet {
                     false,
                     false,
                     keyboard_note,
+                ),
+                capability(
+                    UIPrimitiveKind::ScrollViewport,
+                    false,
+                    false,
+                    true,
+                    false,
+                    false,
+                    "Scroll viewport primitive is not safely implemented in this runtime yet.",
                 ),
                 capability(
                     UIPrimitiveKind::ClickTargetCandidate,
@@ -222,6 +232,7 @@ impl UIControlRuntime {
             }
             UIPrimitiveKind::PressEnter => send_keys_windows("{ENTER}"),
             UIPrimitiveKind::NavigateBack => send_keys_windows("%{LEFT}"),
+            UIPrimitiveKind::ScrollViewport => Err(capability.platform_note.clone()),
             UIPrimitiveKind::FocusCurrentInput | UIPrimitiveKind::ClickTargetCandidate => {
                 let Some(target) = pointer_target else {
                     return primitive_result(

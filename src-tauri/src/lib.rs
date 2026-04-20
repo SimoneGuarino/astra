@@ -7,6 +7,7 @@ mod audio_files;
 mod audit_log;
 mod browser_agent;
 mod capability_manifest;
+mod contextual_learning;
 mod conversation_history;
 mod conversation_router;
 mod desktop_agent;
@@ -21,6 +22,7 @@ mod screen_vision;
 mod screen_workflow;
 mod semantic_intent;
 mod speech_events;
+mod structured_vision;
 mod stt_client;
 mod terminal_runner;
 mod text_segmentation;
@@ -31,6 +33,7 @@ mod ui_target_grounding;
 mod vad;
 mod voice_metrics;
 mod voice_session;
+mod workflow_continuation;
 
 use assistant_context::build_capability_context;
 use assistant_memory::RecentArtifactMemory;
@@ -306,23 +309,6 @@ async fn start_assistant_response(
     let history = runtime.conversation_history.recent_messages(10);
     let manifest = runtime.desktop_agent.capability_manifest().await;
 
-    if let Some(memory_response) = runtime.recent_artifacts.answer_followup(&message) {
-        emit_route_diagnostic(
-            &window,
-            &recent_artifact_diagnostic(&message, "recent_artifact_memory"),
-        );
-        return start_grounded_response(
-            window,
-            runtime,
-            message,
-            display_user_message,
-            source,
-            RenderedAssistantResponse::from_display(memory_response),
-            "artifact-memory",
-        )
-        .await;
-    }
-
     let route_result = route_message(&runtime.desktop_agent, &manifest, &message).await?;
     emit_route_diagnostic(&window, &route_result.diagnostic);
 
@@ -371,6 +357,23 @@ async fn start_assistant_response(
             .await;
         }
         ConversationRoute::Continue => {}
+    }
+
+    if let Some(memory_response) = runtime.recent_artifacts.answer_followup(&message) {
+        emit_route_diagnostic(
+            &window,
+            &recent_artifact_diagnostic(&message, "recent_artifact_memory"),
+        );
+        return start_grounded_response(
+            window,
+            runtime,
+            message,
+            display_user_message,
+            source,
+            RenderedAssistantResponse::from_display(memory_response),
+            "artifact-memory",
+        )
+        .await;
     }
 
     let request_id = Uuid::new_v4().to_string();
