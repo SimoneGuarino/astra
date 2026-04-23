@@ -2734,9 +2734,11 @@ fn clean_search_query_candidate(candidate: &str, provider: SearchProvider) -> Op
         return None;
     }
 
+    query = strip_conversational_query_prefixes(&query);
     query = strip_search_command_prefixes(&query);
     query = strip_provider_location_prefixes(&query, provider);
     query = truncate_search_query_suffixes(&query, provider);
+    query = strip_conversational_query_prefixes(&query);
     query = strip_search_command_prefixes(&query);
     query = strip_provider_location_prefixes(&query, provider);
     query = trim_query_edges(&query);
@@ -2747,6 +2749,35 @@ fn clean_search_query_candidate(candidate: &str, provider: SearchProvider) -> Op
 
     query = trim_query_edges(&query);
     is_valid_search_query(&query).then_some(query)
+}
+
+fn strip_conversational_query_prefixes(value: &str) -> String {
+    let mut query = trim_query_edges(value);
+    loop {
+        let before = query.clone();
+        for prefix in [
+            "ciao",
+            "ehi",
+            "hey",
+            "hi",
+            "hello",
+            "per favore",
+            "per piacere",
+            "please",
+            "scusa",
+            "scusami",
+            "astra",
+            "astrami",
+        ] {
+            if let Some(stripped) = strip_case_insensitive_prefix(&query, prefix) {
+                query = trim_query_edges(stripped);
+                break;
+            }
+        }
+        if query == before {
+            return query;
+        }
+    }
 }
 
 fn truncate_search_query_suffixes(query: &str, provider: SearchProvider) -> String {
@@ -3132,7 +3163,13 @@ fn is_pending_approval_question(lower: &str) -> bool {
 }
 fn is_screen_analysis_request(lower: &str) -> bool {
     lower.contains("what am i looking at")
+        || lower.contains("what do you see")
+        || lower.contains("what can you see")
         || lower.contains("cosa sto vedendo")
+        || lower.contains("cosa vedi")
+        || lower.contains("che cosa vedi")
+        || lower.contains("cosa c'e sullo schermo")
+        || lower.contains("cosa c'è sullo schermo")
         || lower.contains("what's wrong here")
         || lower.contains("what is wrong here")
         || lower.contains("what should i click")
@@ -3159,7 +3196,10 @@ fn browser_executable() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_action_request, fallback_intent, resolve_action_resolution};
+    use super::{
+        build_action_request, extract_search_query, fallback_intent, resolve_action_resolution,
+        SearchProvider,
+    };
     use crate::action_resolution::{ActionOperation, QueryMode};
     use crate::semantic_intent::{CapabilityTarget, SemanticAction, SemanticIntentKind};
     use serde_json::json;
@@ -3339,6 +3379,51 @@ mod tests {
 
         assert_eq!(action.tool_name, "browser.open");
         assert!(url.contains("youtube.com/results?search_query=shiva"));
+    }
+
+    #[test]
+    fn youtube_search_wrapped_with_greeting_extracts_clean_query() {
+        let original = "ciao, cercami shiva su youtube";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected youtube search fallback");
+        let action = build_action_request(&intent, original).expect("expected browser open");
+        let url = action
+            .params
+            .get("url")
+            .and_then(|value| value.as_str())
+            .expect("url");
+
+        assert_eq!(action.tool_name, "browser.open");
+        assert!(url.contains("youtube.com/results?search_query=shiva"));
+        assert!(!url.contains("ciao"));
+        assert!(!url.contains("cercami"));
+    }
+
+    #[test]
+    fn youtube_search_wrapped_with_polite_prefix_extracts_clean_query() {
+        let original = "per favore cercami shiva su youtube";
+        let query =
+            extract_search_query(original, SearchProvider::YouTube).expect("expected query");
+
+        assert_eq!(query, "shiva");
+    }
+
+    #[test]
+    fn youtube_search_wrapped_with_greeting_and_imperative_extracts_clean_query() {
+        let original = "ehi, cerca shiva su youtube";
+        let query =
+            extract_search_query(original, SearchProvider::YouTube).expect("expected query");
+
+        assert_eq!(query, "shiva");
+    }
+
+    #[test]
+    fn youtube_search_mi_cerchi_phrase_still_extracts_clean_query() {
+        let original = "mi cerchi shiva su youtube?";
+        let query =
+            extract_search_query(original, SearchProvider::YouTube).expect("expected query");
+
+        assert_eq!(query, "shiva");
     }
 
     #[test]
@@ -3593,6 +3678,17 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(false)
         );
+    }
+
+    #[test]
+    fn short_italian_screen_question_uses_screen_analysis_fallback() {
+        let original = "cosa vedi?";
+        let lower = original.to_lowercase();
+        let intent = fallback_intent(&lower, original).expect("expected screen analysis fallback");
+
+        assert_eq!(intent.kind, SemanticIntentKind::ScreenAnalysisRequest);
+        assert_eq!(intent.target, CapabilityTarget::Screen);
+        assert_eq!(intent.action, SemanticAction::None);
     }
 
     #[test]

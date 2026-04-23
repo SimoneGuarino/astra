@@ -4,8 +4,9 @@ import type {
     CapabilityManifest,
     DesktopAuditEvent,
     DesktopPolicySnapshot,
+    GoalLoopRun,
     PendingApproval,
-    //ScreenAnalysisResult,
+    ScreenAnalysisResult,
     ScreenCaptureResult,
     ScreenObservationStatus,
     ToolDescriptor,
@@ -37,22 +38,24 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
     const [audit, setAudit] = useState<DesktopAuditEvent[]>([]);
     const [screenStatus, setScreenStatus] = useState<ScreenObservationStatus | null>(null);
     const [lastCapture, setLastCapture] = useState<ScreenCaptureResult | null>(null);
-    /*const [screenQuestion, setScreenQuestion] = useState("What am I looking at right now?");
+    const [recentGoalLoop, setRecentGoalLoop] = useState<GoalLoopRun | null>(null);
+    const [screenQuestion, setScreenQuestion] = useState("What am I looking at right now?");
     const [screenAnalysis, setScreenAnalysis] = useState<ScreenAnalysisResult | null>(null);
-    const [captureFreshForAnalysis, setCaptureFreshForAnalysis] = useState(true);*/
+    const [captureFreshForAnalysis, setCaptureFreshForAnalysis] = useState(true);
     const [isBusy, setIsBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
         try {
             setError(null);
-            const [nextTools, nextPolicy, nextApprovals, nextAudit, nextScreenStatus, nextCapabilities] = await Promise.all([
+            const [nextTools, nextPolicy, nextApprovals, nextAudit, nextScreenStatus, nextCapabilities, nextGoalLoop] = await Promise.all([
                 agent.listTools(),
                 agent.getPolicySnapshot(),
                 agent.getPendingApprovals(),
                 agent.getRecentAuditEvents(60),
                 agent.getScreenObservationStatus(),
                 agent.getCapabilityManifest(),
+                agent.getRecentGoalLoop(),
             ]);
             setTools(nextTools);
             setPolicy(nextPolicy);
@@ -60,6 +63,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             setAudit(nextAudit);
             setScreenStatus(nextScreenStatus);
             setCapabilities(nextCapabilities);
+            setRecentGoalLoop(nextGoalLoop);
         } catch (err) {
             setError(err instanceof Error ? err.message : String(err));
         }
@@ -79,6 +83,23 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
         if (approvals.length === 1) return "1 pending approval";
         return `${approvals.length} pending approvals`;
     }, [approvals.length]);
+
+    const lastPlannerDiagnostic = recentGoalLoop?.planner_diagnostics?.length
+        ? recentGoalLoop.planner_diagnostics[recentGoalLoop.planner_diagnostics.length - 1]
+        : null;
+    const handoffVerification = recentGoalLoop?.browser_handoff?.verification;
+    const lastActionability = lastPlannerDiagnostic?.visible_actionability;
+    const lastTargetConfidence = lastPlannerDiagnostic?.target_confidence;
+    const actionabilityGaps = lastActionability?.gaps?.length
+        ? lastActionability.gaps.join(", ")
+        : null;
+    const lastFocusedRequest = recentGoalLoop?.focused_perception_requests?.length
+        ? recentGoalLoop.focused_perception_requests[recentGoalLoop.focused_perception_requests.length - 1]
+        : null;
+    const lastExecution = recentGoalLoop?.executed_steps?.length
+        ? recentGoalLoop.executed_steps[recentGoalLoop.executed_steps.length - 1]
+        : null;
+    const lastGeometry = lastExecution?.geometry;
 
     const handleApproval = useCallback(
         async (actionId: string, decision: "approve" | "reject") => {
@@ -129,7 +150,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
         }
     }, [agent]);
 
-    /*const handleAnalyzeScreen = useCallback(async () => {
+    const handleAnalyzeScreen = useCallback(async () => {
         try {
             setIsBusy(true);
             setError(null);
@@ -155,7 +176,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
         } finally {
             setIsBusy(false);
         }
-    }, [agent, captureFreshForAnalysis, refresh, screenQuestion]);*/
+    }, [agent, captureFreshForAnalysis, refresh, screenQuestion]);
 
     if (!isOpen) {
         return null;
@@ -181,7 +202,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             </div>
 
             <div className="desktop-agent-tabs">
-                {(["overview", /*"screen",*/ "approvals", "audit"] as ViewKey[]).map((key) => (
+                {(["overview", "screen", "approvals", "audit"] as ViewKey[]).map((key) => (
                     <button
                         key={key}
                         className={`desktop-agent-tab ${view === key ? "active" : ""}`}
@@ -230,6 +251,72 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                                 <p className="desktop-agent-muted">Last capture: {lastCapture.image_path}</p>
                             ) : null}
                         </article>
+                        <article className="desktop-agent-card space-y-2">
+                            <span className="flex items-center text-center gap-1"><LuMonitor size={20} /><h3 className="text-lg">Goal loop</h3></span>
+                            {recentGoalLoop ? (
+                                <div className="text-sm">
+                                    <p>Status: <strong>{recentGoalLoop.status}</strong></p>
+                                    <p>Iteration: <strong>{recentGoalLoop.iteration_count}</strong></p>
+                                    <p>Retries: <strong>{recentGoalLoop.retries_used}/{recentGoalLoop.retry_budget}</strong></p>
+                                    <p>Strategy: <strong>{recentGoalLoop.current_strategy ?? "none"}</strong></p>
+                                    <p>Planner: <strong>{lastPlannerDiagnostic?.source ?? "unknown"}</strong></p>
+                                    <p>Handoff: <strong>{recentGoalLoop.browser_handoff?.status ?? "not recorded"}</strong></p>
+                                    <p>Page verified: <strong>{recentGoalLoop.browser_handoff?.page_verified ? "yes" : "no"}</strong></p>
+                                    <p>Handoff page kind: <strong>{recentGoalLoop.browser_handoff?.page_kind_hint ?? "unknown"}</strong></p>
+                                    <p>Normalized page kind: <strong>{handoffVerification?.normalized_page_kind ?? "unknown"}</strong></p>
+                                    <p>Handoff decision: <strong>{handoffVerification?.decision ?? "unknown"}</strong></p>
+                                    <p>Decision: <strong>{lastPlannerDiagnostic?.decision_status ?? "unknown"}</strong></p>
+                                    <p>Visibility: <strong>{lastPlannerDiagnostic?.visibility_assessment ?? "unknown"}</strong></p>
+                                    <p>Scroll: <strong>{lastPlannerDiagnostic?.scroll_intent ?? "unknown"}</strong></p>
+                                    <p>Actionability: <strong>{lastActionability?.status ?? "unknown"}</strong></p>
+                                    <p>Refinement: <strong>{recentGoalLoop.visible_refinement_used ? "yes" : "no"}</strong></p>
+                                    <p>Refinement strategy: <strong>{lastActionability?.refinement_strategy ?? "none"}</strong></p>
+                                    <p>Fallback available: <strong>{lastActionability?.safe_fallback_available ? "yes" : "no"}</strong></p>
+                                    <p>Fallback used: <strong>{lastActionability?.fallback_source_used ?? "none"}</strong></p>
+                                    <p>Off-screen stage: <strong>{lastActionability?.offscreen_inference_stage ?? "not_applicable"}</strong></p>
+                                    <p>Target confidence: <strong>{lastTargetConfidence ? lastTargetConfidence.derived_confidence.toFixed(2) : "unknown"}</strong></p>
+                                    <p>Confidence threshold: <strong>{lastTargetConfidence ? lastTargetConfidence.required_threshold.toFixed(2) : "unknown"}</strong></p>
+                                    <p>Confidence derived: <strong>{lastTargetConfidence ? (lastTargetConfidence.confidence_was_derived ? "yes" : "no") : "unknown"}</strong></p>
+                                    <p>Item confidence: <strong>{lastTargetConfidence?.raw_item_confidence?.toFixed(2) ?? "missing"}</strong></p>
+                                    <p>Region confidence: <strong>{lastTargetConfidence?.raw_region_confidence?.toFixed(2) ?? "missing"}</strong></p>
+                                    <p>Page confidence: <strong>{lastTargetConfidence?.raw_page_confidence?.toFixed(2) ?? "missing"}</strong></p>
+                                    <p>Signal states: <strong>{lastTargetConfidence ? `${lastTargetConfidence.item_confidence_state ?? "missing"} / ${lastTargetConfidence.region_confidence_state ?? "missing"} / ${lastTargetConfidence.page_confidence_state ?? "missing"}` : "unknown"}</strong></p>
+                                    <p>Last perception mode: <strong>{lastFocusedRequest?.mode ?? "none"}</strong></p>
+                                    <p>Last routing decision: <strong>{lastFocusedRequest?.routing_decision ?? "none"}</strong></p>
+                                    <p>Target anchor present: <strong>{lastFocusedRequest?.target_region_anchor_present ? "yes" : "no"}</strong></p>
+                                    <p>Fresh recapture enforced: <strong>{lastExecution?.fresh_capture_required ? "yes" : "no"}</strong></p>
+                                    <p>Fresh recapture used: <strong>{lastExecution?.fresh_capture_used ? "yes" : "no"}</strong></p>
+                                    <p>Stale reuse prevented: <strong>{recentGoalLoop.stale_capture_reuse_prevented ? "yes" : "no"}</strong></p>
+                                    <p>Geometry interpretation: <strong>{lastGeometry?.interpretation ?? "unknown"}</strong></p>
+                                    <p>Geometry valid: <strong>{lastGeometry ? (lastGeometry.validation_passed ? "yes" : "no") : "unknown"}</strong></p>
+                                    <p>Geometry translated: <strong>{lastGeometry ? (lastGeometry.translation_applied ? "yes" : "no") : "unknown"}</strong></p>
+                                    <p>Final click point: <strong>{lastGeometry?.final_x != null && lastGeometry?.final_y != null ? `${lastGeometry.final_x}, ${lastGeometry.final_y}` : "unknown"}</strong></p>
+                                    <p>Browser recovery: <strong>{recentGoalLoop.browser_recovery_status ?? "not_needed"}</strong></p>
+                                    <p>Browser reacquired: <strong>{recentGoalLoop.browser_recovery_used ? "yes" : "no"}</strong></p>
+                                    <p>Repeated-click protection: <strong>{recentGoalLoop.repeated_click_protection_triggered ? "yes" : "no"}</strong></p>
+                                    {handoffVerification?.reason ? (
+                                        <p>Handoff reason: <strong>{handoffVerification.reason}</strong></p>
+                                    ) : null}
+                                    {lastPlannerDiagnostic?.rejection_code ? (
+                                        <p>Planner reason: <strong>{lastPlannerDiagnostic.rejection_code}</strong></p>
+                                    ) : null}
+                                    {actionabilityGaps ? (
+                                        <p>Grounding gaps: <strong>{actionabilityGaps}</strong></p>
+                                    ) : null}
+                                    {lastTargetConfidence?.reason ? (
+                                        <p>Confidence reason: <strong>{lastTargetConfidence.reason}</strong></p>
+                                    ) : null}
+                                    {lastGeometry?.reason ? (
+                                        <p>Geometry reason: <strong>{lastGeometry.reason}</strong></p>
+                                    ) : null}
+                                    <p>Focused perception: <strong>{recentGoalLoop.focused_perception_used ? "yes" : "no"}</strong></p>
+                                    <p>Verifier: <strong>{recentGoalLoop.verifier_status ?? "unknown"}</strong></p>
+                                    {recentGoalLoop.failure_reason ? <p className="desktop-agent-muted">{recentGoalLoop.failure_reason}</p> : null}
+                                </div>
+                            ) : (
+                                <p className="desktop-agent-muted">No goal loop recorded yet.</p>
+                            )}
+                        </article>
                     </section>
 
                     <section className="desktop-agent-card space-y-2">
@@ -250,7 +337,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             ) : null}
 
 
-            {/*view === "screen" ? (
+            {view === "screen" ? (
                 <div className="desktop-agent-section">
                     <section className="desktop-agent-card">
                         <h3>Screen context</h3>
@@ -283,11 +370,33 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                                 <p><strong>Capture:</strong> {screenAnalysis.image_path}</p>
                                 <p><strong>Question:</strong> {screenAnalysis.question}</p>
                                 <div className="desktop-agent-screen-answer">{screenAnalysis.answer}</div>
+                                {screenAnalysis.semantic_frame ? (
+                                    <div className="desktop-agent-screen-answer">
+                                        <p><strong>Semantic frame:</strong> {screenAnalysis.semantic_frame.scene_summary}</p>
+                                        <p><strong>Provider:</strong> {screenAnalysis.semantic_frame.page_evidence.content_provider_hint ?? "unknown"}</p>
+                                        <p><strong>Page kind:</strong> {screenAnalysis.semantic_frame.page_evidence.page_kind_hint ?? "unknown"}</p>
+                                        <p><strong>Visible results:</strong> {screenAnalysis.semantic_frame.visible_result_items?.length ?? 0}</p>
+                                        <pre className="desktop-agent-json">{JSON.stringify(screenAnalysis.semantic_frame, null, 2)}</pre>
+                                    </div>
+                                ) : null}
+                                {recentGoalLoop ? (
+                                    <div className="desktop-agent-screen-answer">
+                                        <p><strong>Recent goal loop:</strong> {recentGoalLoop.status}</p>
+                                        <p><strong>Strategy:</strong> {recentGoalLoop.current_strategy ?? "none"}</p>
+                                        <p><strong>Planner source:</strong> {lastPlannerDiagnostic?.source ?? "unknown"}</p>
+                                        <p><strong>Last planner step:</strong> {recentGoalLoop.planner_steps?.length ?? 0}</p>
+                                        <p><strong>Visible actionability:</strong> {lastActionability?.status ?? "unknown"}</p>
+                                        <p><strong>Refinement strategy:</strong> {lastActionability?.refinement_strategy ?? "none"}</p>
+                                        <p><strong>Grounding gaps:</strong> {actionabilityGaps ?? "none"}</p>
+                                        <p><strong>Verification:</strong> {recentGoalLoop.verifier_status ?? "unknown"}</p>
+                                        <pre className="desktop-agent-json">{JSON.stringify(recentGoalLoop, null, 2)}</pre>
+                                    </div>
+                                ) : null}
                             </div>
                         ) : null}
                     </section>
                 </div>
-            ) : null*/}
+            ) : null}
 
             {view === "approvals" ? (
                 <div className="desktop-agent-section">

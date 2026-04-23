@@ -965,7 +965,7 @@ fn candidate_kind_matches(candidate: &UITargetCandidate, result_kind_hint: Optio
         return true;
     }
     let Some(candidate_kind) = candidate.result_kind.as_deref() else {
-        return true;
+        return false;
     };
     if is_generic_result_kind(candidate_kind) {
         return true;
@@ -1217,6 +1217,7 @@ mod tests {
                     "center_x": 400,
                     "center_y": 260,
                     "confidence": 0.55,
+                    "result_kind": "video",
                     "rank": 1
                 }
             }),
@@ -1252,6 +1253,7 @@ mod tests {
                         "center_x": 400,
                         "center_y": 260,
                         "confidence": 0.93,
+                        "result_kind": "video",
                         "rank": 1
                     },
                     {
@@ -1259,6 +1261,7 @@ mod tests {
                         "center_x": 400,
                         "center_y": 360,
                         "confidence": 0.70,
+                        "result_kind": "video",
                         "rank": 2
                     }
                 ]

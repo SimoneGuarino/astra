@@ -3333,6 +3333,7 @@ mod tests {
             page_kind_hint: Some("search_results".into()),
             query_hint: Some("shiva".into()),
             result_list_visible: Some(true),
+            raw_confidence: Some(0.88),
             confidence: 0.88,
             evidence_sources: vec![
                 PageEvidenceSource::StructuredVision,

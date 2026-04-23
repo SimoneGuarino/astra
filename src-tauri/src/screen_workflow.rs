@@ -1,6 +1,8 @@
 use crate::{
     action_resolution::{ActionOperation, ActionResolution, ResolutionSource},
-    desktop_agent_types::{CapabilityManifest, PageSemanticEvidence},
+    desktop_agent_types::{
+        CapabilityManifest, GoalLoopRun, PageSemanticEvidence, SemanticScreenFrame,
+    },
     ui_control::{
         UIControlRuntime, UIPrimitiveCapabilitySet, UIPrimitiveKind, UIPrimitiveRequest,
         UIPrimitiveResult, UIPrimitiveStatus,
@@ -132,6 +134,10 @@ pub struct ScreenGroundingState {
     pub visible_target_candidates: Vec<UITargetCandidate>,
     #[serde(default)]
     pub page_evidence: Vec<PageSemanticEvidence>,
+    #[serde(default)]
+    pub semantic_frame: Option<SemanticScreenFrame>,
+    #[serde(default)]
+    pub goal_loop: Option<GoalLoopRun>,
     #[serde(default)]
     pub recent_target_candidates: Vec<UITargetCandidate>,
     #[serde(default)]
@@ -785,6 +791,8 @@ pub fn screen_grounding_state(manifest: &CapabilityManifest) -> ScreenGroundingS
             && (manifest.screen.observation_enabled || manifest.screen.recent_capture_available),
         visible_target_candidates: Vec::new(),
         page_evidence: Vec::new(),
+        semantic_frame: None,
+        goal_loop: None,
         recent_target_candidates: Vec::new(),
         generated_at_ms: Some(now_ms()),
         page_validation: None,

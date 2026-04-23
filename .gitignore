@@ -40,3 +40,7 @@ python_services/tts/generated/
 python_services/stt/recordings/
 .DS_Store
 Thumbs.db
+
+.astra/audit/*
+.astra/screen/*
+.astra/state/*

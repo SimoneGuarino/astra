@@ -1,5 +1,6 @@
 use crate::{
     desktop_agent_types::{PageEvidenceSource, PageSemanticEvidence},
+    semantic_frame::{semantic_frame_from_candidates, semantic_frame_from_vision_value},
     ui_target_grounding::{
         is_technical_capture_backend, normalize_browser_app_hint, normalize_content_provider_hint,
         structured_candidates_from_value, TargetGroundingSource, UITargetCandidate, UITargetRole,
@@ -16,6 +17,8 @@ pub struct StructuredVisionExtraction {
     pub candidates: Vec<UITargetCandidate>,
     #[serde(default)]
     pub page_evidence: Option<PageSemanticEvidence>,
+    #[serde(default)]
+    pub semantic_frame: Option<crate::desktop_agent_types::SemanticScreenFrame>,
     pub rejected: Vec<StructuredVisionRejectedCandidate>,
 }
 
@@ -34,11 +37,18 @@ pub fn parse_structured_vision_candidates(
         .ok_or_else(|| "structured vision response did not contain a JSON object".to_string())?;
     let parsed: Value = serde_json::from_str(json_text)
         .map_err(|error| format!("structured vision JSON parse failed: {error}"))?;
+    parse_structured_vision_candidates_from_value(&parsed, captured_at_ms)
+}
+
+pub fn parse_structured_vision_candidates_from_value(
+    parsed: &Value,
+    captured_at_ms: u64,
+) -> Result<StructuredVisionExtraction, String> {
     let candidates_value = parsed
         .get("ui_candidates")
         .or_else(|| parsed.get("candidates"))
         .ok_or_else(|| "structured vision JSON missing ui_candidates".to_string())?;
-    let page_evidence = parse_page_semantic_evidence(&parsed);
+    let page_evidence = parse_page_semantic_evidence(parsed);
 
     let raw_candidates = candidates_value.as_array().cloned().unwrap_or_else(|| {
         if candidates_value.is_object() {
@@ -74,9 +84,26 @@ pub fn parse_structured_vision_candidates(
         });
     }
 
+    let semantic_frame = semantic_frame_from_vision_value(
+        &parsed,
+        captured_at_ms,
+        None,
+        page_evidence.clone(),
+        candidates.clone(),
+    )
+    .or_else(|| {
+        Some(semantic_frame_from_candidates(
+            captured_at_ms,
+            None,
+            page_evidence.clone(),
+            candidates.clone(),
+        ))
+    });
+
     Ok(StructuredVisionExtraction {
         candidates,
         page_evidence,
+        semantic_frame,
         rejected,
     })
 }
@@ -139,6 +166,10 @@ fn parse_page_semantic_evidence(parsed: &Value) -> Option<PageSemanticEvidence> 
             .get("result_list_visible")
             .or_else(|| object.get("results_visible"))
             .and_then(Value::as_bool),
+        raw_confidence: object
+            .get("confidence")
+            .and_then(Value::as_f64)
+            .map(|value| value.clamp(0.0, 1.0) as f32),
         confidence: object
             .get("confidence")
             .and_then(Value::as_f64)

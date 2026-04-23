@@ -6,6 +6,7 @@ import type {
     DesktopActionResponse,
     DesktopAuditEvent,
     DesktopPolicySnapshot,
+    GoalLoopRun,
     PendingApproval,
     ScreenAnalysisRequest,
     ScreenAnalysisResult,
@@ -81,6 +82,11 @@ export function useDesktopAgent() {
         []
     );
 
+    const getRecentGoalLoop = useCallback(
+        () => invoke<GoalLoopRun | null>("get_recent_goal_loop"),
+        []
+    );
+
     return useMemo(
         () => ({
             analyzeScreenContext,
@@ -90,6 +96,7 @@ export function useDesktopAgent() {
             getCapabilityManifest,
             getPendingApprovals,
             getPolicySnapshot,
+            getRecentGoalLoop,
             getRecentAuditEvents,
             getScreenObservationStatus,
             listTools,
@@ -104,6 +111,7 @@ export function useDesktopAgent() {
             getCapabilityManifest,
             getPendingApprovals,
             getPolicySnapshot,
+            getRecentGoalLoop,
             getRecentAuditEvents,
             getScreenObservationStatus,
             listTools,

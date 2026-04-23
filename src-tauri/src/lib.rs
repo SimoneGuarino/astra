@@ -14,12 +14,15 @@ mod desktop_agent;
 mod desktop_agent_types;
 mod filesystem_service;
 mod metrics;
+mod model_assisted_planner;
 mod model_routing;
 mod pending_approvals_store;
 mod permissions;
+mod planner_evaluation;
 mod screen_capture;
 mod screen_vision;
 mod screen_workflow;
+mod semantic_frame;
 mod semantic_intent;
 mod speech_events;
 mod structured_vision;
@@ -47,7 +50,7 @@ use conversation_router::{route_message, ConversationRoute};
 use desktop_agent::DesktopAgentRuntime;
 use desktop_agent_types::{
     ApprovalDecisionRequest, CapabilityManifest, ConversationRouteDiagnostic, DesktopActionRequest,
-    DesktopActionResponse, DesktopAuditEvent, DesktopPolicySnapshot, PendingApproval,
+    DesktopActionResponse, DesktopAuditEvent, DesktopPolicySnapshot, GoalLoopRun, PendingApproval,
     ScreenAnalysisRequest, ScreenAnalysisResult, ScreenCaptureResult, ScreenObservationStatus,
     ToolDescriptor,
 };
@@ -1617,6 +1620,11 @@ async fn analyze_screen_context(
 }
 
 #[tauri::command]
+fn get_recent_goal_loop(state: State<'_, AssistantRuntime>) -> Result<Option<GoalLoopRun>, String> {
+    Ok(state.desktop_agent.recent_goal_loop())
+}
+
+#[tauri::command]
 fn minimize_window(window: WebviewWindow) -> Result<(), String> {
     window.minimize().map_err(|error| error.to_string())
 }
@@ -1701,6 +1709,7 @@ pub fn run() {
             set_screen_observation_enabled,
             capture_screen_snapshot,
             analyze_screen_context,
+            get_recent_goal_loop,
             minimize_window,
             toggle_always_on_top,
             close_window,

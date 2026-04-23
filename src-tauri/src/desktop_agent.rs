@@ -7,27 +7,45 @@ use crate::{
         store_verified_continuation, VerifiedContinuationLearningEvent, VerifiedContinuationOutcome,
     },
     desktop_agent_types::{
-        CapabilityManifest, DesktopActionRequest, DesktopActionResponse, DesktopActionStatus,
-        DesktopAuditEvent, PendingApproval, ScreenAnalysisRequest, ScreenAnalysisResult,
-        ScreenCaptureResult, ScreenObservationStatus,
+        BrowserHandoffActivationStatus, BrowserHandoffFailureReason, BrowserHandoffStatus,
+        BrowserHandoffVerificationDiagnostic, BrowserVisualHandoffRecord,
+        BrowserVisualHandoffResult, CapabilityManifest, DesktopActionRequest,
+        DesktopActionResponse, DesktopActionStatus, DesktopAuditEvent, GoalConstraints,
+        GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, PendingApproval, PlannerContractDecision,
+        PlannerContractInput, PlannerStep, PlannerStepExecutionRecord, PlannerStepExecutionStatus,
+        PlannerStepKind, ScreenAnalysisRequest, ScreenAnalysisResult, ScreenCaptureResult,
+        ScreenObservationStatus, SemanticScreenFrame, VisibleResultKind,
     },
     filesystem_service::FilesystemService,
+    model_assisted_planner::ModelAssistedPlanner,
     permissions::PermissionProfile,
     screen_workflow::{
         execute_screen_workflow, refresh_screen_workflow_plan, ScreenWorkflow, ScreenWorkflowRun,
-        StepSupportStatus, WorkflowStepKind,
+        StepSupportStatus, StepVerificationStatus, WorkflowRunStatus, WorkflowStep,
+        WorkflowStepKind, WorkflowStepRun,
+    },
+    semantic_frame::{
+        goal_for_open_media_result, planner_candidate_from_step, run_goal_loop_once,
+        verify_browser_handoff_page, verify_goal_state, GoalLoopDriver, GoalLoopDriverFuture,
+        GoalLoopRuntime, GoalLoopRuntimeConfig,
     },
     structured_vision::StructuredVisionExtraction,
     terminal_runner::TerminalRunner,
     tools_registry::ToolsRegistry,
-    ui_control::{UIControlRuntime, UIPrimitiveCapabilitySet},
-    ui_target_grounding::UITargetCandidate,
+    ui_control::{
+        UIControlRuntime, UIPrimitiveCapabilitySet, UIPrimitiveKind, UIPrimitiveRequest,
+        UIPrimitiveResult, UIPrimitiveStatus,
+    },
+    ui_target_grounding::{
+        TargetSelection, TargetSelectionDiagnostics, TargetSelectionPolicy, UITargetCandidate,
+    },
     workflow_continuation::{
         build_context_from_action_response, build_context_from_screen_workflow_run,
         resolve_workflow_continuation, resolve_workflow_continuation_with_model_params,
         scroll_policy_for_regrounding, validate_continuation_page,
-        ContinuationRegroundingDiagnostics, RecentWorkflowContext, RegroundingAttemptDiagnostic,
-        ScrollContinuationStatus, WorkflowContinuationResolution, MAX_RECENT_SCREEN_AGE_MS,
+        ContinuationRegroundingDiagnostics, FollowupActionKind, RecentWorkflowContext,
+        RegroundingAttemptDiagnostic, ResultListItemKind, ScrollContinuationStatus,
+        WorkflowContinuationResolution, MAX_RECENT_SCREEN_AGE_MS,
     },
 };
 use serde_json::{json, Value};
@@ -36,6 +54,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -52,14 +71,722 @@ pub struct DesktopAgentRuntime {
     screen_capture: crate::screen_capture::ScreenCaptureRuntime,
     screen_vision: crate::screen_vision::ScreenVisionRuntime,
     ui_control: UIControlRuntime,
+    planner: ModelAssistedPlanner,
     recent_workflow_targets: Arc<Mutex<Vec<UITargetCandidate>>>,
     recent_workflow_context: Arc<Mutex<Option<RecentWorkflowContext>>>,
+    recent_goal_loop: Arc<Mutex<Option<GoalLoopRun>>>,
 }
 
 #[derive(Clone)]
 struct PendingActionEnvelope {
     approval: PendingApproval,
     request: DesktopActionRequest,
+}
+
+struct ProductionGoalLoopDriver<'a> {
+    runtime: &'a DesktopAgentRuntime,
+    capabilities: UIPrimitiveCapabilitySet,
+    request_id: String,
+    action_id: String,
+}
+
+struct VerifiedBrowserPage {
+    frame: SemanticScreenFrame,
+    verification: BrowserHandoffVerificationDiagnostic,
+}
+
+struct BrowserPageVerificationFailure {
+    reason: String,
+    verification: Option<BrowserHandoffVerificationDiagnostic>,
+}
+
+const BROWSER_HANDOFF_VERIFICATION_ATTEMPTS: usize = 2;
+const BROWSER_HANDOFF_STABILIZATION_MS: u64 = 650;
+
+impl<'a> ProductionGoalLoopDriver<'a> {
+    fn new(
+        runtime: &'a DesktopAgentRuntime,
+        capabilities: UIPrimitiveCapabilitySet,
+        request_id: String,
+        action_id: String,
+    ) -> Self {
+        Self {
+            runtime,
+            capabilities,
+            request_id,
+            action_id,
+        }
+    }
+
+    async fn verify_current_browser_page(
+        &self,
+        goal: &GoalSpec,
+        attempt_label: &str,
+    ) -> Result<VerifiedBrowserPage, BrowserPageVerificationFailure> {
+        let capture = self
+            .runtime
+            .screen_capture
+            .capture_snapshot()
+            .map_err(|reason| BrowserPageVerificationFailure {
+                reason,
+                verification: None,
+            })?;
+        let mut frame = self
+            .runtime
+            .screen_vision
+            .perceive_semantic_frame(
+                &capture.image_path,
+                capture.captured_at,
+                &capture.provider,
+                Some(&goal.utterance),
+                None,
+                goal.constraints.provider.as_deref(),
+            )
+            .await
+            .map_err(|reason| BrowserPageVerificationFailure {
+                reason,
+                verification: None,
+            })?;
+        frame.page_evidence.observation_source = Some(attempt_label.into());
+        let verification = verify_browser_handoff_page(goal, &frame).map_err(|verification| {
+            BrowserPageVerificationFailure {
+                reason: verification
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "browser page verification failed".into()),
+                verification: Some(verification),
+            }
+        })?;
+        Ok(VerifiedBrowserPage {
+            frame,
+            verification,
+        })
+    }
+
+    fn expected_browser_app(&self, goal: &GoalSpec) -> String {
+        self.runtime
+            .recent_workflow_context()
+            .and_then(|context| context.app)
+            .filter(|app| !app.trim().is_empty())
+            .unwrap_or_else(|| {
+                if goal.constraints.provider.is_some() {
+                    "browser".into()
+                } else {
+                    "chrome".into()
+                }
+            })
+    }
+
+    fn handoff_record(
+        &self,
+        iteration: usize,
+        status: BrowserHandoffStatus,
+        activation_status: BrowserHandoffActivationStatus,
+        failure_reason: Option<BrowserHandoffFailureReason>,
+        goal: &GoalSpec,
+        activation_attempted: bool,
+        frame: Option<&SemanticScreenFrame>,
+        verification: Option<&BrowserHandoffVerificationDiagnostic>,
+        attempts: usize,
+        reason: impl Into<String>,
+    ) -> BrowserVisualHandoffRecord {
+        BrowserVisualHandoffRecord {
+            iteration,
+            status,
+            activation_status,
+            failure_reason,
+            app_hint: Some(self.expected_browser_app(goal)),
+            provider_hint: goal.constraints.provider.clone(),
+            page_kind_hint: frame
+                .and_then(|frame| frame.page_evidence.page_kind_hint.clone())
+                .or_else(|| {
+                    verification.and_then(|verification| verification.raw_page_kind_hint.clone())
+                }),
+            verification: verification.cloned(),
+            activation_attempted,
+            page_verified: frame.is_some(),
+            frame_id: frame.map(|frame| frame.frame_id.clone()),
+            confidence: frame.map(|frame| frame.page_evidence.confidence),
+            attempts,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
+    fn prepare_visual_handoff<'a>(
+        &'a mut self,
+        goal: &'a GoalSpec,
+        iteration: usize,
+    ) -> GoalLoopDriverFuture<'a, Result<Option<BrowserVisualHandoffResult>, String>> {
+        Box::pin(async move {
+            if goal.constraints.provider.is_none()
+                && self.runtime.recent_workflow_context().is_none()
+            {
+                return Ok(None);
+            }
+            if !self
+                .runtime
+                .permissions
+                .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+                || !self
+                    .runtime
+                    .policy
+                    .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+            {
+                let record = self.handoff_record(
+                    iteration,
+                    BrowserHandoffStatus::SemanticFrameUnavailable,
+                    BrowserHandoffActivationStatus::NotAttempted,
+                    Some(BrowserHandoffFailureReason::PermissionDenied),
+                    goal,
+                    false,
+                    None,
+                    None,
+                    0,
+                    "desktop observation permission is required before browser visual handoff",
+                );
+                return Ok(Some(BrowserVisualHandoffResult {
+                    record,
+                    verified_frame: None,
+                }));
+            }
+
+            match self
+                .verify_current_browser_page(goal, "browser_handoff_pre_activation_check")
+                .await
+            {
+                Ok(verified) => {
+                    let record = self.handoff_record(
+                        iteration,
+                        BrowserHandoffStatus::VisuallyVerified,
+                        BrowserHandoffActivationStatus::NotAttempted,
+                        None,
+                        goal,
+                        false,
+                        Some(&verified.frame),
+                        Some(&verified.verification),
+                        1,
+                        "current visible page already matches the expected browser context",
+                    );
+                    return Ok(Some(BrowserVisualHandoffResult {
+                        record,
+                        verified_frame: Some(verified.frame),
+                    }));
+                }
+                Err(_) => {}
+            }
+
+            let activation_request = UIPrimitiveRequest {
+                primitive: UIPrimitiveKind::ActivateWindowOrApp,
+                value: None,
+                target: json!({
+                    "app": self.expected_browser_app(goal),
+                    "provider": goal.constraints.provider.clone(),
+                    "url": self.runtime.recent_workflow_context().and_then(|context| context.url),
+                }),
+                reason: Some(
+                    "Goal loop requires the expected browser page in the visual foreground before semantic continuation."
+                        .into(),
+                ),
+            };
+            self.runtime.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: self.action_id.clone(),
+                request_id: self.request_id.clone(),
+                tool_name: "goal_loop.browser_handoff".into(),
+                stage: "activation".into(),
+                status: "started".into(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+                details: json!({
+                    "goal": goal,
+                    "primitive": activation_request.primitive,
+                    "target": activation_request.target,
+                }),
+            });
+            let activation = self
+                .runtime
+                .ui_control
+                .execute(&activation_request, &self.capabilities);
+            self.runtime.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: self.action_id.clone(),
+                request_id: self.request_id.clone(),
+                tool_name: "goal_loop.browser_handoff".into(),
+                stage: "activation".into(),
+                status: format!("{:?}", activation.status).to_ascii_lowercase(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+                details: json!({"primitive_result": activation}),
+            });
+
+            let activation_status = match activation.status {
+                UIPrimitiveStatus::Executed => BrowserHandoffActivationStatus::Executed,
+                UIPrimitiveStatus::Unsupported => {
+                    let record = self.handoff_record(
+                        iteration,
+                        BrowserHandoffStatus::ActivationUnsupported,
+                        BrowserHandoffActivationStatus::Unsupported,
+                        Some(BrowserHandoffFailureReason::BrowserActivationUnsupported),
+                        goal,
+                        true,
+                        None,
+                        None,
+                        1,
+                        activation.message,
+                    );
+                    return Ok(Some(BrowserVisualHandoffResult {
+                        record,
+                        verified_frame: None,
+                    }));
+                }
+                UIPrimitiveStatus::Failed => {
+                    let record = self.handoff_record(
+                        iteration,
+                        BrowserHandoffStatus::ActivationFailed,
+                        BrowserHandoffActivationStatus::Failed,
+                        Some(BrowserHandoffFailureReason::BrowserActivationFailed),
+                        goal,
+                        true,
+                        None,
+                        None,
+                        1,
+                        activation.message,
+                    );
+                    return Ok(Some(BrowserVisualHandoffResult {
+                        record,
+                        verified_frame: None,
+                    }));
+                }
+            };
+
+            sleep(Duration::from_millis(BROWSER_HANDOFF_STABILIZATION_MS)).await;
+            let mut last_error = None;
+            for attempt in 0..BROWSER_HANDOFF_VERIFICATION_ATTEMPTS {
+                match self
+                    .verify_current_browser_page(goal, "browser_handoff_post_activation_verify")
+                    .await
+                {
+                    Ok(verified) => {
+                        let record = self.handoff_record(
+                            iteration,
+                            BrowserHandoffStatus::VisuallyVerified,
+                            activation_status,
+                            None,
+                            goal,
+                            true,
+                            Some(&verified.frame),
+                            Some(&verified.verification),
+                            attempt + 1,
+                            "browser foreground activation succeeded and page context was visually verified",
+                        );
+                        return Ok(Some(BrowserVisualHandoffResult {
+                            record,
+                            verified_frame: Some(verified.frame),
+                        }));
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
+
+            let verification = last_error
+                .as_ref()
+                .and_then(|failure| failure.verification.clone());
+            let failure_reason = last_error
+                .as_ref()
+                .map(|failure| failure.reason.clone())
+                .unwrap_or_else(|| "browser page did not verify after activation".into());
+            let record = self.handoff_record(
+                iteration,
+                BrowserHandoffStatus::PageNotVerified,
+                activation_status,
+                Some(BrowserHandoffFailureReason::BrowserPageNotVerified),
+                goal,
+                true,
+                None,
+                verification.as_ref(),
+                BROWSER_HANDOFF_VERIFICATION_ATTEMPTS,
+                failure_reason,
+            );
+            Ok(Some(BrowserVisualHandoffResult {
+                record,
+                verified_frame: None,
+            }))
+        })
+    }
+
+    fn perceive<'a>(
+        &'a mut self,
+        goal: &'a GoalSpec,
+        iteration: usize,
+        fresh_capture_required: bool,
+    ) -> GoalLoopDriverFuture<'a, Result<SemanticScreenFrame, String>> {
+        Box::pin(async move {
+            if !self
+                .runtime
+                .permissions
+                .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+                || !self
+                    .runtime
+                    .policy
+                    .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+            {
+                return Err("Permission denied for desktop observation".into());
+            }
+            let capture = self
+                .runtime
+                .capture_for_structured_grounding_with_policy(fresh_capture_required)?;
+            self.runtime
+                .screen_vision
+                .perceive_semantic_frame(
+                    &capture.image_path,
+                    capture.captured_at,
+                    &capture.provider,
+                    Some(&goal.utterance),
+                    None,
+                    goal.constraints.provider.as_deref(),
+                )
+                .await
+                .map(|mut frame| {
+                    frame.page_evidence.observation_source = Some(if fresh_capture_required {
+                        format!("goal_loop_perception_iteration_{}_fresh", iteration + 1)
+                    } else {
+                        format!("goal_loop_perception_iteration_{}", iteration + 1)
+                    });
+                    frame
+                })
+        })
+    }
+
+    fn execute_planner_step<'a>(
+        &'a mut self,
+        step: &'a PlannerStep,
+    ) -> GoalLoopDriverFuture<'a, PlannerStepExecutionRecord> {
+        Box::pin(async move {
+            let Some(mut request) = planner_step_primitive_request(step) else {
+                return PlannerStepExecutionRecord {
+                    step_id: step.step_id.clone(),
+                    status: PlannerStepExecutionStatus::Unsupported,
+                    primitive: "none".into(),
+                    message: "planner step cannot be converted into a governed UI primitive".into(),
+                    selected_target_candidate: step.executable_candidate.clone(),
+                    geometry: None,
+                    fresh_capture_required: false,
+                    fresh_capture_used: false,
+                    target_signature: None,
+                };
+            };
+            if let Some(target) = request.target.as_object_mut() {
+                let browser_app = target
+                    .get("browser_app_hint")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        self.runtime
+                            .recent_workflow_context()
+                            .and_then(|context| context.app)
+                    })
+                    .unwrap_or_else(|| "browser".into());
+                target
+                    .entry("browser_app_hint")
+                    .or_insert_with(|| json!(browser_app.clone()));
+                target.entry("app").or_insert_with(|| json!(browser_app));
+            }
+
+            self.runtime.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: self.action_id.clone(),
+                request_id: self.request_id.clone(),
+                tool_name: "goal_loop.primitive".into(),
+                stage: "execution".into(),
+                status: "started".into(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+                details: json!({
+                    "planner_step": step,
+                    "primitive": request.primitive,
+                }),
+            });
+
+            let result = self
+                .runtime
+                .ui_control
+                .execute(&request, &self.capabilities);
+            let status = match result.status {
+                UIPrimitiveStatus::Executed => PlannerStepExecutionStatus::Executed,
+                UIPrimitiveStatus::Unsupported => PlannerStepExecutionStatus::Unsupported,
+                UIPrimitiveStatus::Failed => PlannerStepExecutionStatus::Failed,
+            };
+            self.runtime.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: self.action_id.clone(),
+                request_id: self.request_id.clone(),
+                tool_name: "goal_loop.primitive".into(),
+                stage: "execution".into(),
+                status: format!("{:?}", result.status).to_ascii_lowercase(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+                details: json!({
+                    "planner_step": step,
+                    "primitive_result": result,
+                }),
+            });
+
+            PlannerStepExecutionRecord {
+                step_id: step.step_id.clone(),
+                status,
+                primitive: format!("{:?}", request.primitive),
+                message: result.message,
+                selected_target_candidate: step.executable_candidate.clone(),
+                geometry: result.geometry,
+                fresh_capture_required: false,
+                fresh_capture_used: false,
+                target_signature: step
+                    .executable_candidate
+                    .as_ref()
+                    .map(|candidate| candidate.candidate_id.clone()),
+            }
+        })
+    }
+
+    fn focused_perception<'a>(
+        &'a mut self,
+        request: &'a crate::desktop_agent_types::FocusedPerceptionRequest,
+    ) -> GoalLoopDriverFuture<'a, Result<Option<SemanticScreenFrame>, String>> {
+        Box::pin(async move {
+            if !self
+                .runtime
+                .permissions
+                .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+                || !self
+                    .runtime
+                    .policy
+                    .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+            {
+                return Err("Permission denied for desktop observation".into());
+            }
+            let capture = self.runtime.capture_for_structured_grounding()?;
+            self.runtime
+                .screen_vision
+                .perceive_focused_region(
+                    &capture.image_path,
+                    capture.captured_at,
+                    &capture.provider,
+                    request,
+                    Some(&request.reason),
+                    None,
+                    None,
+                )
+                .await
+                .map(Some)
+        })
+    }
+
+    fn recover_browser_surface<'a>(
+        &'a mut self,
+        goal: &'a GoalSpec,
+        iteration: usize,
+        reason: &'a str,
+    ) -> GoalLoopDriverFuture<'a, Result<Option<BrowserVisualHandoffResult>, String>> {
+        Box::pin(async move {
+            if goal.constraints.provider.is_none()
+                && self.runtime.recent_workflow_context().is_none()
+            {
+                return Ok(None);
+            }
+            if !self
+                .runtime
+                .permissions
+                .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+                || !self
+                    .runtime
+                    .policy
+                    .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+            {
+                let record = self.handoff_record(
+                    iteration,
+                    BrowserHandoffStatus::SemanticFrameUnavailable,
+                    BrowserHandoffActivationStatus::NotAttempted,
+                    Some(BrowserHandoffFailureReason::PermissionDenied),
+                    goal,
+                    false,
+                    None,
+                    None,
+                    0,
+                    format!(
+                        "desktop observation permission is required before browser recovery: {reason}"
+                    ),
+                );
+                return Ok(Some(BrowserVisualHandoffResult {
+                    record,
+                    verified_frame: None,
+                }));
+            }
+
+            self.runtime.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: self.action_id.clone(),
+                request_id: self.request_id.clone(),
+                tool_name: "goal_loop.browser_recovery".into(),
+                stage: "activation".into(),
+                status: "started".into(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+                details: json!({
+                    "goal": goal,
+                    "reason": reason,
+                    "expected_browser_app": self.expected_browser_app(goal),
+                }),
+            });
+
+            let activation_request = UIPrimitiveRequest {
+                primitive: UIPrimitiveKind::ActivateWindowOrApp,
+                value: None,
+                target: json!({
+                    "app": self.expected_browser_app(goal),
+                    "provider": goal.constraints.provider.clone(),
+                    "url": self.runtime.recent_workflow_context().and_then(|context| context.url),
+                }),
+                reason: Some(format!(
+                    "Goal loop browser recovery requested after `{reason}` to restore the expected browser interaction surface."
+                )),
+            };
+            let activation = self
+                .runtime
+                .ui_control
+                .execute(&activation_request, &self.capabilities);
+            self.runtime.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id: self.action_id.clone(),
+                request_id: self.request_id.clone(),
+                tool_name: "goal_loop.browser_recovery".into(),
+                stage: "activation".into(),
+                status: format!("{:?}", activation.status).to_ascii_lowercase(),
+                timestamp: now_ms(),
+                risk_level: crate::desktop_agent_types::RiskLevel::Medium,
+                details: json!({
+                    "reason": reason,
+                    "primitive_result": activation,
+                }),
+            });
+
+            let activation_status = match activation.status {
+                UIPrimitiveStatus::Executed => BrowserHandoffActivationStatus::Executed,
+                UIPrimitiveStatus::Unsupported => {
+                    let record = self.handoff_record(
+                        iteration,
+                        BrowserHandoffStatus::ActivationUnsupported,
+                        BrowserHandoffActivationStatus::Unsupported,
+                        Some(BrowserHandoffFailureReason::BrowserActivationUnsupported),
+                        goal,
+                        true,
+                        None,
+                        None,
+                        1,
+                        format!(
+                            "browser recovery could not reactivate the expected browser surface: {}",
+                            activation.message
+                        ),
+                    );
+                    return Ok(Some(BrowserVisualHandoffResult {
+                        record,
+                        verified_frame: None,
+                    }));
+                }
+                UIPrimitiveStatus::Failed => {
+                    let record = self.handoff_record(
+                        iteration,
+                        BrowserHandoffStatus::ActivationFailed,
+                        BrowserHandoffActivationStatus::Failed,
+                        Some(BrowserHandoffFailureReason::BrowserActivationFailed),
+                        goal,
+                        true,
+                        None,
+                        None,
+                        1,
+                        format!(
+                            "browser recovery activation failed after `{reason}`: {}",
+                            activation.message
+                        ),
+                    );
+                    return Ok(Some(BrowserVisualHandoffResult {
+                        record,
+                        verified_frame: None,
+                    }));
+                }
+            };
+
+            sleep(Duration::from_millis(BROWSER_HANDOFF_STABILIZATION_MS)).await;
+            let mut last_error = None;
+            for attempt in 0..BROWSER_HANDOFF_VERIFICATION_ATTEMPTS {
+                match self
+                    .verify_current_browser_page(goal, "browser_recovery_post_activation_verify")
+                    .await
+                {
+                    Ok(verified) => {
+                        let record = self.handoff_record(
+                            iteration,
+                            BrowserHandoffStatus::VisuallyVerified,
+                            activation_status,
+                            None,
+                            goal,
+                            true,
+                            Some(&verified.frame),
+                            Some(&verified.verification),
+                            attempt + 1,
+                            format!(
+                                "browser recovery succeeded after `{reason}` and the visible page context verified again"
+                            ),
+                        );
+                        return Ok(Some(BrowserVisualHandoffResult {
+                            record,
+                            verified_frame: Some(verified.frame),
+                        }));
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
+
+            let verification = last_error
+                .as_ref()
+                .and_then(|failure| failure.verification.clone());
+            let failure_reason = last_error
+                .as_ref()
+                .map(|failure| failure.reason.clone())
+                .unwrap_or_else(|| "browser recovery did not verify the expected page".into());
+            let record = self.handoff_record(
+                iteration,
+                BrowserHandoffStatus::PageNotVerified,
+                activation_status,
+                Some(BrowserHandoffFailureReason::BrowserPageNotVerified),
+                goal,
+                true,
+                None,
+                verification.as_ref(),
+                BROWSER_HANDOFF_VERIFICATION_ATTEMPTS,
+                failure_reason,
+            );
+            Ok(Some(BrowserVisualHandoffResult {
+                record,
+                verified_frame: None,
+            }))
+        })
+    }
+
+    fn plan<'a>(
+        &'a mut self,
+        input: &'a PlannerContractInput,
+    ) -> GoalLoopDriverFuture<'a, Result<Option<PlannerContractDecision>, String>> {
+        Box::pin(async move { self.runtime.planner.plan(input).await })
+    }
 }
 
 impl DesktopAgentRuntime {
@@ -98,8 +825,10 @@ impl DesktopAgentRuntime {
             screen_capture,
             screen_vision,
             ui_control,
+            planner: ModelAssistedPlanner::new(),
             recent_workflow_targets: Arc::new(Mutex::new(Vec::new())),
             recent_workflow_context: Arc::new(Mutex::new(None)),
+            recent_goal_loop: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -123,6 +852,12 @@ impl DesktopAgentRuntime {
     }
     pub fn screen_status(&self) -> ScreenObservationStatus {
         self.screen_capture.status()
+    }
+    pub fn recent_goal_loop(&self) -> Option<GoalLoopRun> {
+        self.recent_goal_loop
+            .lock()
+            .ok()
+            .and_then(|memory| memory.clone())
     }
     pub fn set_screen_observation_enabled(&self, enabled: bool) -> ScreenObservationStatus {
         self.screen_capture.set_enabled(enabled)
@@ -250,8 +985,12 @@ impl DesktopAgentRuntime {
         let previous_context = self.recent_workflow_context();
         workflow.grounding.recent_target_candidates = self.recent_workflow_targets();
         refresh_screen_workflow_plan(&mut workflow);
-        self.prepare_continuation_grounding(&mut workflow, &capabilities)
-            .await;
+        let production_goal = goal_for_screen_workflow(&workflow);
+        let used_production_goal_loop = production_goal.is_some();
+        if production_goal.is_none() {
+            self.prepare_continuation_grounding(&mut workflow, &capabilities)
+                .await;
+        }
         self.audit.append(&DesktopAuditEvent {
             audit_id: Uuid::new_v4().to_string(),
             action_id: action_id.clone(),
@@ -267,9 +1006,27 @@ impl DesktopAgentRuntime {
             }),
         });
 
-        let run = execute_screen_workflow(workflow, &self.ui_control, capabilities);
+        let run = if let Some(goal) = production_goal {
+            let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+            let mut driver = ProductionGoalLoopDriver::new(
+                self,
+                capabilities.clone(),
+                request_id.clone(),
+                action_id.clone(),
+            );
+            let goal_loop = runtime
+                .run_goal_loop_until_complete(goal, &mut driver)
+                .await;
+            self.store_recent_goal_loop(goal_loop.clone());
+            screen_workflow_run_from_goal_loop(workflow, capabilities, goal_loop)
+        } else {
+            execute_screen_workflow(workflow, &self.ui_control, capabilities)
+        };
         self.remember_workflow_targets(&run);
         self.remember_screen_workflow_context(&run, &request_id, &action_id, previous_context);
+        if !used_production_goal_loop {
+            self.refresh_recent_goal_loop_after_workflow(&run).await;
+        }
         if let Some(receipt) =
             verified_continuation_learning_event(&run).map(store_verified_continuation)
         {
@@ -429,6 +1186,94 @@ impl DesktopAgentRuntime {
         *memory = Some(context);
     }
 
+    fn store_recent_goal_loop(&self, run: GoalLoopRun) {
+        let Ok(mut memory) = self.recent_goal_loop.lock() else {
+            return;
+        };
+        *memory = Some(run);
+    }
+
+    async fn refresh_recent_goal_loop_after_workflow(&self, run: &ScreenWorkflowRun) {
+        let Some(mut goal_loop) = run.workflow.grounding.goal_loop.clone() else {
+            return;
+        };
+        if !matches!(
+            run.status,
+            crate::screen_workflow::WorkflowRunStatus::Completed
+        ) {
+            self.store_recent_goal_loop(goal_loop);
+            return;
+        }
+        let has_executed_goal_step = run.step_runs.iter().any(|step| {
+            matches!(
+                step.status,
+                crate::screen_workflow::WorkflowRunStatus::Completed
+            ) && step.primitive.is_some()
+        });
+        if !has_executed_goal_step {
+            self.store_recent_goal_loop(goal_loop);
+            return;
+        }
+
+        let capture = match self.capture_for_structured_grounding_with_policy(true) {
+            Ok(capture) => capture,
+            Err(error) => {
+                goal_loop.status = crate::desktop_agent_types::GoalLoopStatus::VerificationFailed;
+                goal_loop.failure_reason = Some(format!(
+                    "post-step semantic verification capture failed: {error}"
+                ));
+                goal_loop.verifier_status = Some("post_step_capture_failed".into());
+                self.store_recent_goal_loop(goal_loop);
+                return;
+            }
+        };
+        let frame = match self
+            .screen_vision
+            .perceive_semantic_frame(
+                &capture.image_path,
+                capture.captured_at,
+                &capture.provider,
+                Some(&goal_loop.goal.utterance),
+                None,
+                goal_loop.goal.constraints.provider.as_deref(),
+            )
+            .await
+        {
+            Ok(frame) => frame,
+            Err(error) => {
+                goal_loop.status = crate::desktop_agent_types::GoalLoopStatus::NeedsPerception;
+                goal_loop.failure_reason = Some(format!(
+                    "post-step semantic verification perception failed: {error}"
+                ));
+                goal_loop.verifier_status = Some("post_step_perception_failed".into());
+                self.store_recent_goal_loop(goal_loop);
+                return;
+            }
+        };
+        goal_loop.stale_capture_reuse_prevented = true;
+        if let Some(execution) = goal_loop.executed_steps.last_mut() {
+            execution.fresh_capture_used = true;
+        }
+        let verification =
+            verify_goal_state(&goal_loop.goal, &frame, goal_loop.iteration_count + 1);
+        let verification_status = verification.status.clone();
+        goal_loop.iteration_count += 1;
+        goal_loop.frames.push(frame);
+        goal_loop.verifier_status = Some(format!("{verification_status:?}"));
+        goal_loop.verification_history.push(verification.clone());
+        if verification_status == crate::desktop_agent_types::GoalVerificationStatus::GoalAchieved {
+            goal_loop.status = crate::desktop_agent_types::GoalLoopStatus::GoalAchieved;
+            goal_loop.failure_reason = None;
+        } else {
+            goal_loop.status = crate::desktop_agent_types::GoalLoopStatus::VerificationFailed;
+            goal_loop.failure_reason = Some(format!(
+                "post-step semantic verification did not satisfy the goal: {}",
+                verification.reason
+            ));
+        }
+        self.store_recent_goal_loop(goal_loop);
+    }
+
     async fn prepare_continuation_grounding(
         &self,
         workflow: &mut ScreenWorkflow,
@@ -482,6 +1327,22 @@ impl DesktopAgentRuntime {
                 Ok(extraction) => {
                     if let Some(page_evidence) = extraction.page_evidence {
                         workflow.grounding.page_evidence.push(page_evidence);
+                    }
+                    if let Some(frame) = extraction.semantic_frame {
+                        if let Some(goal_loop) =
+                            goal_loop_for_workflow_frame(workflow, frame.clone())
+                        {
+                            if let Some(candidate) = goal_loop
+                                .planner_steps
+                                .first()
+                                .and_then(planner_candidate_from_step)
+                            {
+                                workflow.grounding.visible_target_candidates.push(candidate);
+                            }
+                            self.store_recent_goal_loop(goal_loop.clone());
+                            workflow.grounding.goal_loop = Some(goal_loop);
+                        }
+                        workflow.grounding.semantic_frame = Some(frame);
                     }
                     if !extraction.candidates.is_empty() {
                         workflow
@@ -635,6 +1496,23 @@ impl DesktopAgentRuntime {
     }
 
     fn capture_for_structured_grounding(&self) -> Result<ScreenCaptureResult, String> {
+        self.capture_for_structured_grounding_with_policy(false)
+    }
+
+    fn capture_for_structured_grounding_with_policy(
+        &self,
+        force_fresh_capture: bool,
+    ) -> Result<ScreenCaptureResult, String> {
+        if force_fresh_capture {
+            let status = self.screen_capture.status();
+            if !status.enabled {
+                return Err(
+                    "fresh screen capture is required but screen observation is disabled".into(),
+                );
+            }
+            return self.screen_capture.capture_snapshot();
+        }
+
         let status = self.screen_capture.status();
         if let Some(path) = status.last_capture_path.clone() {
             let capture_age_ms = status
@@ -1075,6 +1953,25 @@ fn workflow_needs_target_grounding(workflow: &ScreenWorkflow) -> bool {
         .any(|plan| plan.support == StepSupportStatus::NeedsTargetGrounding)
 }
 
+fn planner_step_primitive_request(step: &PlannerStep) -> Option<UIPrimitiveRequest> {
+    if !matches!(
+        step.kind,
+        PlannerStepKind::ClickResultRegion | PlannerStepKind::ClickEntityRegion
+    ) {
+        return None;
+    }
+    let candidate = step.executable_candidate.as_ref()?;
+    Some(UIPrimitiveRequest {
+        primitive: UIPrimitiveKind::ClickTargetCandidate,
+        value: None,
+        target: candidate.execution_payload(),
+        reason: Some(format!(
+            "Goal loop requested governed click: {}",
+            step.rationale
+        )),
+    })
+}
+
 fn requested_roles_for_workflow(workflow: &ScreenWorkflow) -> Vec<String> {
     let mut roles = Vec::new();
     for step in &workflow.steps {
@@ -1092,6 +1989,238 @@ fn requested_roles_for_workflow(workflow: &ScreenWorkflow) -> Vec<String> {
         }
     }
     roles
+}
+
+fn goal_loop_for_workflow_frame(
+    workflow: &ScreenWorkflow,
+    frame: SemanticScreenFrame,
+) -> Option<crate::desktop_agent_types::GoalLoopRun> {
+    let goal = goal_for_screen_workflow(workflow)?;
+    Some(run_goal_loop_once(goal, frame))
+}
+
+fn goal_for_screen_workflow(workflow: &ScreenWorkflow) -> Option<GoalSpec> {
+    let continuation = workflow.continuation.as_ref()?;
+    let utterance = continuation
+        .followup
+        .interpretation
+        .as_ref()
+        .map(|interpretation| interpretation.utterance.clone())
+        .unwrap_or_else(|| "screen-guided continuation".into());
+    let provider = continuation
+        .policy
+        .provider
+        .clone()
+        .or_else(|| continuation.source_context.provider.clone());
+
+    if provider.as_deref() == Some("youtube") && looks_like_channel_goal(&utterance) {
+        let entity_name = continuation
+            .followup
+            .interpretation
+            .as_ref()
+            .and_then(|interpretation| interpretation.query_hint.clone())
+            .or_else(|| continuation.source_context.query.clone());
+        return Some(GoalSpec {
+            goal_id: Uuid::new_v4().to_string(),
+            goal_type: GoalType::OpenChannel,
+            constraints: GoalConstraints {
+                provider,
+                result_kind: None,
+                rank_within_kind: None,
+                rank_overall: None,
+                entity_name,
+                attributes: Value::Null,
+            },
+            success_condition: "channel_page_visible".into(),
+            utterance,
+            confidence: 0.86,
+        });
+    }
+
+    let reference = continuation.followup.result_reference.as_ref()?;
+    if !matches!(
+        continuation.followup.action_kind,
+        FollowupActionKind::OpenResult | FollowupActionKind::ClickResult
+    ) {
+        return None;
+    }
+    let visible_kind = match reference.item_kind {
+        ResultListItemKind::Video => VisibleResultKind::Video,
+        ResultListItemKind::Link => VisibleResultKind::Generic,
+        ResultListItemKind::Result => VisibleResultKind::Generic,
+        ResultListItemKind::Unknown => VisibleResultKind::Unknown,
+    };
+    let rank = reference.rank.unwrap_or(1);
+    Some(goal_for_open_media_result(
+        utterance,
+        provider,
+        visible_kind,
+        rank,
+    ))
+}
+
+fn looks_like_channel_goal(utterance: &str) -> bool {
+    utterance
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|token| matches!(token, "canale" | "channel"))
+}
+
+fn screen_workflow_run_from_goal_loop(
+    mut workflow: ScreenWorkflow,
+    primitive_capabilities: UIPrimitiveCapabilitySet,
+    goal_loop: GoalLoopRun,
+) -> ScreenWorkflowRun {
+    if let Some(candidate) = goal_loop.selected_target_candidate.clone() {
+        remember_goal_loop_candidate(&mut workflow, candidate);
+    }
+    for candidate in goal_loop
+        .executed_steps
+        .iter()
+        .filter_map(|step| step.selected_target_candidate.clone())
+    {
+        remember_goal_loop_candidate(&mut workflow, candidate);
+    }
+
+    let step_runs = goal_loop
+        .executed_steps
+        .iter()
+        .enumerate()
+        .map(goal_loop_execution_to_step_run)
+        .collect::<Vec<_>>();
+    let completed_steps = goal_loop
+        .executed_steps
+        .iter()
+        .filter(|step| step.status == PlannerStepExecutionStatus::Executed)
+        .count();
+    let status = workflow_status_for_goal_loop(&goal_loop);
+    let stopped_reason = if status == WorkflowRunStatus::Completed {
+        None
+    } else {
+        goal_loop.failure_reason.clone().or_else(|| {
+            goal_loop
+                .verification_history
+                .last()
+                .map(|verification| verification.reason.clone())
+        })
+    };
+
+    workflow.grounding.goal_loop = Some(goal_loop);
+
+    ScreenWorkflowRun {
+        run_id: Uuid::new_v4().to_string(),
+        status,
+        workflow,
+        primitive_capabilities,
+        step_runs,
+        completed_steps,
+        stopped_reason,
+        continuation_verification: None,
+    }
+}
+
+fn remember_goal_loop_candidate(workflow: &mut ScreenWorkflow, candidate: UITargetCandidate) {
+    if workflow
+        .grounding
+        .visible_target_candidates
+        .iter()
+        .any(|existing| existing.candidate_id == candidate.candidate_id)
+    {
+        return;
+    }
+    workflow.grounding.visible_target_candidates.push(candidate);
+}
+
+fn workflow_status_for_goal_loop(goal_loop: &GoalLoopRun) -> WorkflowRunStatus {
+    match goal_loop.status {
+        GoalLoopStatus::GoalAchieved => WorkflowRunStatus::Completed,
+        GoalLoopStatus::NeedsPerception => WorkflowRunStatus::NeedsScreenContext,
+        GoalLoopStatus::NeedsExecution | GoalLoopStatus::Running => {
+            WorkflowRunStatus::PartiallyCompleted
+        }
+        GoalLoopStatus::NeedsClarification | GoalLoopStatus::Refused => {
+            WorkflowRunStatus::NeedsTargetGrounding
+        }
+        GoalLoopStatus::BrowserHandoffFailed
+        | GoalLoopStatus::ScrollRequiredButUnsupported
+        | GoalLoopStatus::BudgetExhausted
+        | GoalLoopStatus::VerificationFailed => WorkflowRunStatus::StepFailed,
+    }
+}
+
+fn goal_loop_execution_to_step_run(
+    (index, execution): (usize, &PlannerStepExecutionRecord),
+) -> WorkflowStepRun {
+    let primitive = if execution.primitive.contains("ClickTargetCandidate") {
+        Some(UIPrimitiveKind::ClickTargetCandidate)
+    } else {
+        None
+    };
+    let step_kind = execution
+        .selected_target_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.result_kind.as_deref())
+        .map(|kind| {
+            if kind == "channel" {
+                WorkflowStepKind::ClickVisibleElement
+            } else {
+                WorkflowStepKind::OpenRankedResult
+            }
+        })
+        .unwrap_or(WorkflowStepKind::ClickVisibleElement);
+    let status = match execution.status {
+        PlannerStepExecutionStatus::Executed => WorkflowRunStatus::Completed,
+        PlannerStepExecutionStatus::Unsupported => WorkflowRunStatus::StepUnsupported,
+        PlannerStepExecutionStatus::Failed => WorkflowRunStatus::StepFailed,
+        PlannerStepExecutionStatus::Skipped => WorkflowRunStatus::Aborted,
+    };
+    let verification = match execution.status {
+        PlannerStepExecutionStatus::Executed => StepVerificationStatus::PartiallySatisfied,
+        PlannerStepExecutionStatus::Unsupported => StepVerificationStatus::Unsupported,
+        PlannerStepExecutionStatus::Failed => StepVerificationStatus::Failed,
+        PlannerStepExecutionStatus::Skipped => StepVerificationStatus::NotRun,
+    };
+    let target_selection = execution
+        .selected_target_candidate
+        .clone()
+        .map(goal_loop_target_selection);
+
+    WorkflowStepRun {
+        step: WorkflowStep {
+            step_id: format!("goal_loop_step_{}", index + 1),
+            step_kind,
+            target: json!({}),
+            value: None,
+            selection: json!({}),
+            expected_outcome: None,
+        },
+        primitive: primitive.clone(),
+        status,
+        verification,
+        primitive_result: primitive.map(|primitive| UIPrimitiveResult {
+            primitive,
+            status: match execution.status {
+                PlannerStepExecutionStatus::Executed => UIPrimitiveStatus::Executed,
+                PlannerStepExecutionStatus::Unsupported => UIPrimitiveStatus::Unsupported,
+                PlannerStepExecutionStatus::Failed | PlannerStepExecutionStatus::Skipped => {
+                    UIPrimitiveStatus::Failed
+                }
+            },
+            message: execution.message.clone(),
+            geometry: execution.geometry.clone(),
+        }),
+        target_selection,
+        note: Some(execution.message.clone()),
+    }
+}
+
+fn goal_loop_target_selection(candidate: UITargetCandidate) -> TargetSelection {
+    TargetSelection::selected(
+        candidate.clone(),
+        vec![candidate],
+        TargetSelectionPolicy::default().min_click_confidence,
+        TargetSelectionDiagnostics::default(),
+    )
 }
 
 fn verified_continuation_learning_event(
@@ -1138,7 +2267,22 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::DesktopAgentRuntime;
-    use crate::desktop_agent_types::{DesktopActionRequest, DesktopActionStatus, PendingApproval};
+    use crate::{
+        action_resolution::{ActionOperation, ResolutionSource},
+        desktop_agent_types::{
+            DesktopActionRequest, DesktopActionStatus, GoalConstraints, GoalLoopRun,
+            GoalLoopStatus, GoalSpec, GoalType, PendingApproval, PlannerStepExecutionRecord,
+            PlannerStepExecutionStatus, VisibleResultKind,
+        },
+        screen_workflow::{
+            ScreenFreshness, ScreenGroundingState, ScreenWorkflow, ScreenWorkflowDomain,
+            WorkflowSupportSummary,
+        },
+        ui_control::UIPrimitiveCapabilitySet,
+        ui_target_grounding::{
+            TargetGroundingSource, TargetRegion, UITargetCandidate, UITargetRole,
+        },
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -1189,5 +2333,148 @@ mod tests {
     fn launch_target_resolves_chrome_alias_without_losing_args_contract() {
         let target = super::resolve_launch_target("google-chrome");
         assert!(target.to_ascii_lowercase().contains("chrome"));
+    }
+
+    #[test]
+    fn goal_loop_run_is_projected_back_into_screen_workflow_diagnostics() {
+        let candidate = UITargetCandidate {
+            candidate_id: "video_candidate".into(),
+            role: UITargetRole::RankedResult,
+            region: Some(TargetRegion {
+                x: 10.0,
+                y: 20.0,
+                width: 200.0,
+                height: 100.0,
+                coordinate_space: "screen".into(),
+            }),
+            center_x: None,
+            center_y: None,
+            app_hint: None,
+            browser_app_hint: Some("chrome".into()),
+            provider_hint: Some("youtube".into()),
+            content_provider_hint: Some("youtube".into()),
+            page_kind_hint: Some("search_results".into()),
+            capture_backend: Some("powershell_gdi".into()),
+            observation_source: Some("test".into()),
+            result_kind: Some("video".into()),
+            confidence: 0.95,
+            source: TargetGroundingSource::ScreenAnalysis,
+            label: Some("Shiva video".into()),
+            rank: Some(1),
+            observed_at_ms: Some(1_000),
+            reuse_eligible: true,
+            supports_focus: false,
+            supports_click: true,
+            rationale: "test candidate".into(),
+        };
+        let workflow = ScreenWorkflow {
+            operation: ActionOperation::ScreenGuidedFollowupAction,
+            domain: ScreenWorkflowDomain::BrowserScreenInteraction,
+            requires_screen_context: true,
+            depends_on_recent_screen_context: true,
+            continuation: None,
+            grounding: ScreenGroundingState {
+                observation_supported: true,
+                observation_enabled: true,
+                capture_available: true,
+                analysis_available: true,
+                recent_capture_available: true,
+                recent_capture_age_ms: Some(100),
+                last_capture_path: Some("screen.png".into()),
+                freshness: ScreenFreshness::RecentAvailable,
+                fresh_capture_required: false,
+                sufficient_for_workflow: true,
+                visible_target_candidates: Vec::new(),
+                page_evidence: Vec::new(),
+                semantic_frame: None,
+                goal_loop: None,
+                recent_target_candidates: Vec::new(),
+                generated_at_ms: Some(1_000),
+                page_validation: None,
+                regrounding: None,
+                uncertainty: Vec::new(),
+            },
+            steps: Vec::new(),
+            step_plans: Vec::new(),
+            support: WorkflowSupportSummary {
+                executable: true,
+                requires_screen_context: true,
+                unsupported_steps: Vec::new(),
+                reason: "test".into(),
+            },
+            confidence: 0.9,
+            source: ResolutionSource::RustNormalizer,
+            rationale: Some("test".into()),
+        };
+        let goal_loop = GoalLoopRun {
+            run_id: "loop".into(),
+            goal: GoalSpec {
+                goal_id: "goal".into(),
+                goal_type: GoalType::OpenMediaResult,
+                constraints: GoalConstraints {
+                    provider: Some("youtube".into()),
+                    result_kind: Some(VisibleResultKind::Video),
+                    rank_within_kind: Some(1),
+                    rank_overall: None,
+                    entity_name: None,
+                    attributes: serde_json::Value::Null,
+                },
+                success_condition: "video_watch_page_open".into(),
+                utterance: "aprimi il primo video".into(),
+                confidence: 0.9,
+            },
+            status: GoalLoopStatus::GoalAchieved,
+            iteration_count: 2,
+            retry_budget: 3,
+            retries_used: 0,
+            current_strategy: Some("youtube_open_first_visible_media_result".into()),
+            fallback_strategy_state: None,
+            frames: Vec::new(),
+            planner_steps: Vec::new(),
+            planner_diagnostics: Vec::new(),
+            executed_steps: vec![PlannerStepExecutionRecord {
+                step_id: "step".into(),
+                status: PlannerStepExecutionStatus::Executed,
+                primitive: "ClickTargetCandidate".into(),
+                message: "clicked".into(),
+                selected_target_candidate: Some(candidate.clone()),
+                geometry: None,
+                fresh_capture_required: true,
+                fresh_capture_used: true,
+                target_signature: Some("planner_result_v1_title".into()),
+            }],
+            verification_history: Vec::new(),
+            focused_perception_requests: Vec::new(),
+            browser_handoff_history: Vec::new(),
+            browser_handoff: None,
+            focused_perception_used: false,
+            visible_refinement_used: false,
+            stale_capture_reuse_prevented: true,
+            browser_recovery_used: false,
+            browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
+            repeated_click_protection_triggered: false,
+            selected_target_candidate: Some(candidate),
+            verifier_status: Some("GoalAchieved".into()),
+            failure_reason: None,
+        };
+
+        let run = super::screen_workflow_run_from_goal_loop(
+            workflow,
+            UIPrimitiveCapabilitySet::for_runtime(true),
+            goal_loop,
+        );
+
+        assert_eq!(
+            run.status,
+            crate::screen_workflow::WorkflowRunStatus::Completed
+        );
+        assert_eq!(run.completed_steps, 1);
+        assert!(run.workflow.grounding.goal_loop.is_some());
+        assert_eq!(run.workflow.grounding.visible_target_candidates.len(), 1);
+        assert!(run.step_runs[0]
+            .target_selection
+            .as_ref()
+            .and_then(|selection| selection.selected_candidate.as_ref())
+            .is_some());
     }
 }
