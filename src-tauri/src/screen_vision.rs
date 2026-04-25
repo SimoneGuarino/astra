@@ -25,12 +25,18 @@ const SHARED_REGION_OUTPUT_INSTRUCTIONS: &str = concat!(
     "\"actionable_controls\":[{\"control_id\":\"play_button\",\"kind\":\"button\",\"label\":\"click to play video\",\"region\":{\"x\":YOUR_ACTUAL_X_IN_PIXELS,\"y\":YOUR_ACTUAL_Y_IN_PIXELS,\"width\":YOUR_ACTUAL_WIDTH,\"height\":YOUR_ACTUAL_HEIGHT,\"coordinate_space\":\"screen\"},\"confidence\":YOUR_CONFIDENCE}]}. ",
     "The uppercase coordinate/confidence tokens are fake placeholders only. Copying placeholder values is wrong. ",
     "All coordinates must be actual pixel positions measured from the current analyzed image resolution stated in the user prompt. ",
+    "Also include optional provider-agnostic primary_list when the main user-interactable surface is a ranked list. primary_list means the main list, not a sidebar, ad rail, recommendation rail, or secondary navigation. ",
+    "Use structural container_kind values such as result_list, never provider names. For each primary_list item include rank, title when visible, item_kind as video|article|product|site|channel|generic, confidence, and the best primary click region measured from the actual image. ",
+    "Also include optional page_state with structural kind list|detail|player|form|mixed|unknown and dominant_content result_list|detail_view|video_player|article|product_detail|generic|unknown. page_state describes what the page is doing, not what site it belongs to. ",
+    "Never output provider names like youtube, google, amazon, or github as page_state.kind, page_state.dominant_content, or primary_list.container_kind. ",
+    "If uncertain, omit primary_list or page_state rather than hallucinating structure. ",
+    "Placeholder-only primary_list shape: {\"primary_list\":{\"cluster_id\":\"SCHEMA_ONLY_DO_NOT_COPY\",\"container_kind\":\"result_list\",\"item_count\":YOUR_ACTUAL_ITEM_COUNT,\"items\":[{\"item_id\":\"SCHEMA_ONLY_DO_NOT_COPY\",\"rank\":YOUR_ACTUAL_RANK_INTEGER,\"title\":\"YOUR_ACTUAL_TITLE_FROM_SCREEN\",\"item_kind\":\"video|article|product|site|channel|generic\",\"is_sponsored\":false,\"confidence\":YOUR_ACTUAL_CONFIDENCE_0_TO_1,\"click_regions\":{\"primary\":{\"region\":{\"x\":YOUR_ACTUAL_X_IN_PIXELS,\"y\":YOUR_ACTUAL_Y_IN_PIXELS,\"width\":YOUR_ACTUAL_WIDTH,\"height\":YOUR_ACTUAL_HEIGHT,\"coordinate_space\":\"screen\"},\"confidence\":YOUR_ACTUAL_CONFIDENCE_0_TO_1}}}]},\"page_state\":{\"kind\":\"list|detail|player|form|mixed|unknown\",\"dominant_content\":\"result_list|detail_view|video_player|article|product_detail|generic|unknown\",\"list_visible\":true,\"detail_visible\":false}}. ",
     "Do not leave click_regions empty when a clear visible title link, thumbnail, avatar, or primary control boundary is present. ",
     "If the region is not reasonably clear, omit it and add uncertainty instead of guessing."
 );
 
 const SHARED_SEMANTIC_FRAME_OUTPUT_SUFFIX: &str = concat!(
-    "Return JSON shaped as {\"semantic_frame\":{\"page_evidence\":{...},\"scene_summary\":\"...\",\"visible_entities\":[],\"visible_result_items\":[],\"actionable_controls\":[],\"uncertainty\":[]}}."
+    "Return JSON shaped as {\"semantic_frame\":{\"page_evidence\":{...},\"scene_summary\":\"...\",\"primary_list\":null,\"page_state\":null,\"visible_entities\":[],\"visible_result_items\":[],\"actionable_controls\":[],\"uncertainty\":[]}}."
 );
 
 const SHARED_LEGACY_CANDIDATE_EXAMPLE: &str = concat!(
@@ -240,7 +246,7 @@ fn structured_candidate_system_prompt() -> String {
         "supports_focus, supports_click, optional label, optional browser_app_hint/app_hint, optional content_provider_hint/provider_hint, optional page_kind_hint, optional rank, and rationale. ",
         SHARED_LEGACY_CANDIDATE_EXAMPLE,
         SHARED_REGION_OUTPUT_INSTRUCTIONS,
-        "Also include optional semantic_frame with page_evidence, scene_summary, visible_entities, visible_result_items, actionable_controls, and uncertainty. ",
+        "Also include optional semantic_frame with page_evidence, scene_summary, primary_list, page_state, visible_entities, visible_result_items, actionable_controls, and uncertainty. ",
         "Also include page_evidence with browser_app_hint, content_provider_hint, page_kind_hint, query_hint, result_list_visible, confidence, and uncertainty. ",
         "For visible_result_items, distinguish video, mix, playlist, channel, hotel, product, repository, and generic; include rank_overall and rank_within_kind. ",
         "content_provider_hint/provider_hint means the visible site or content provider such as youtube, google, github, or amazon. ",
@@ -389,38 +395,16 @@ fn process_frame_prompt_geometry(
         .get_mut("visible_result_items")
         .and_then(Value::as_array_mut)
     {
-        for item in items {
-            let Some(item_object) = item.as_object_mut() else {
-                continue;
-            };
-            if let Some(click_regions) = item_object
-                .get_mut("click_regions")
-                .and_then(Value::as_object_mut)
-            {
-                let mut keys_to_remove = Vec::new();
-                for (key, region_value) in click_regions.iter_mut() {
-                    if let Some(pattern) = suspicious_prompt_template_label_for_entry(region_value)
-                    {
-                        report.record_pattern(pattern);
-                        report.removed_click_regions += 1;
-                        if enforce {
-                            keys_to_remove.push(key.clone());
-                        }
-                    }
-                }
-                if enforce {
-                    for key in keys_to_remove {
-                        click_regions.remove(&key);
-                    }
-                }
-            }
-            if let Some(attributes) = item_object
-                .get_mut("attributes")
-                .and_then(Value::as_object_mut)
-            {
-                strip_suspicious_attribute_region(attributes, enforce, report);
-            }
-        }
+        process_item_prompt_geometry(items, enforce, report);
+    }
+
+    if let Some(items) = object
+        .get_mut("primary_list")
+        .and_then(Value::as_object_mut)
+        .and_then(|primary_list| primary_list.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    {
+        process_item_prompt_geometry(items, enforce, report);
     }
 
     if let Some(controls) = object
@@ -460,6 +444,44 @@ fn process_frame_prompt_geometry(
                     entity_object.remove("region");
                 }
             }
+        }
+    }
+}
+
+fn process_item_prompt_geometry(
+    items: &mut Vec<Value>,
+    enforce: bool,
+    report: &mut VisionGeometrySanitizationReport,
+) {
+    for item in items {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        if let Some(click_regions) = item_object
+            .get_mut("click_regions")
+            .and_then(Value::as_object_mut)
+        {
+            let mut keys_to_remove = Vec::new();
+            for (key, region_value) in click_regions.iter_mut() {
+                if let Some(pattern) = suspicious_prompt_template_label_for_entry(region_value) {
+                    report.record_pattern(pattern);
+                    report.removed_click_regions += 1;
+                    if enforce {
+                        keys_to_remove.push(key.clone());
+                    }
+                }
+            }
+            if enforce {
+                for key in keys_to_remove {
+                    click_regions.remove(&key);
+                }
+            }
+        }
+        if let Some(attributes) = item_object
+            .get_mut("attributes")
+            .and_then(Value::as_object_mut)
+        {
+            strip_suspicious_attribute_region(attributes, enforce, report);
         }
     }
 }
@@ -576,6 +598,87 @@ fn maybe_reproject_model_coordinates(parsed: &mut Value, resize_plan: &VisionRes
         return;
     }
     reproject_value_coordinates(parsed, resize_plan);
+}
+
+fn sanitize_invalid_primary_list_geometry(
+    parsed: &mut Value,
+    resize_plan: &VisionResizePlan,
+) -> usize {
+    let Some(frame) = frame_value_mut(parsed) else {
+        return 0;
+    };
+    let Some(items) = frame
+        .get_mut("primary_list")
+        .and_then(Value::as_object_mut)
+        .and_then(|primary_list| primary_list.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    else {
+        return 0;
+    };
+
+    let mut removed_items = 0usize;
+    let mut kept_items = Vec::new();
+    for mut item in items.drain(..) {
+        let Some(item_object) = item.as_object_mut() else {
+            removed_items += 1;
+            continue;
+        };
+        let had_click_regions = item_object.get("click_regions").is_some();
+        if let Some(click_regions) = item_object
+            .get_mut("click_regions")
+            .and_then(Value::as_object_mut)
+        {
+            let invalid_keys = click_regions
+                .iter()
+                .filter_map(|(key, value)| {
+                    let region = value.get("region").unwrap_or(value);
+                    (!region_within_capture_bounds(region, resize_plan)).then(|| key.clone())
+                })
+                .collect::<Vec<_>>();
+            for key in invalid_keys {
+                click_regions.remove(&key);
+            }
+            if had_click_regions && click_regions.is_empty() {
+                removed_items += 1;
+                continue;
+            }
+        }
+        kept_items.push(item);
+    }
+    *items = kept_items;
+
+    if removed_items > 0 {
+        append_uncertainty_to_value(
+            frame,
+            &format!("primary_list_invalid_geometry_items_discarded:{removed_items}"),
+        );
+    }
+    removed_items
+}
+
+fn region_within_capture_bounds(region: &Value, resize_plan: &VisionResizePlan) -> bool {
+    let Some(x) = region.get("x").and_then(Value::as_f64) else {
+        return false;
+    };
+    let Some(y) = region.get("y").and_then(Value::as_f64) else {
+        return false;
+    };
+    let Some(width) = region.get("width").and_then(Value::as_f64) else {
+        return false;
+    };
+    let Some(height) = region.get("height").and_then(Value::as_f64) else {
+        return false;
+    };
+    x.is_finite()
+        && y.is_finite()
+        && width.is_finite()
+        && height.is_finite()
+        && x >= 0.0
+        && y >= 0.0
+        && width > 0.0
+        && height > 0.0
+        && x + width <= resize_plan.original_width as f64 + 1.0
+        && y + height <= resize_plan.original_height as f64 + 1.0
 }
 
 fn reproject_value_coordinates(value: &mut Value, resize_plan: &VisionResizePlan) {
@@ -818,6 +921,7 @@ impl ScreenVisionRuntime {
         let mut parsed = parse_model_json(content, "semantic screen perception")?;
         sanitize_suspicious_prompt_template_geometry(&mut parsed);
         maybe_reproject_model_coordinates(&mut parsed, &prepared_image.resize_plan);
+        sanitize_invalid_primary_list_geometry(&mut parsed, &prepared_image.resize_plan);
         let mut frame = semantic_frame_from_vision_value(
             &parsed,
             captured_at,
@@ -929,6 +1033,7 @@ impl ScreenVisionRuntime {
         let mut parsed = parse_model_json(content, "focused semantic perception")?;
         sanitize_suspicious_prompt_template_geometry(&mut parsed);
         maybe_reproject_model_coordinates(&mut parsed, &prepared_image.resize_plan);
+        sanitize_invalid_primary_list_geometry(&mut parsed, &prepared_image.resize_plan);
         let mut frame = semantic_frame_from_vision_value(
             &parsed,
             captured_at,
@@ -1026,6 +1131,7 @@ impl ScreenVisionRuntime {
         let mut parsed = parse_model_json(content, "structured vision extraction")?;
         sanitize_suspicious_prompt_template_geometry(&mut parsed);
         maybe_reproject_model_coordinates(&mut parsed, &prepared_image.resize_plan);
+        sanitize_invalid_primary_list_geometry(&mut parsed, &prepared_image.resize_plan);
         let mut extraction = parse_structured_vision_candidates_from_value(&parsed, captured_at)?;
         let page_evidence = extraction
             .page_evidence
@@ -1147,8 +1253,11 @@ mod tests {
         let prompt = semantic_perception_system_prompt();
         assert!(prompt.contains("\"click_regions\""));
         assert!(prompt.contains("\"actionable_controls\""));
+        assert!(prompt.contains("\"primary_list\""));
+        assert!(prompt.contains("\"page_state\""));
         assert!(prompt.contains("\"coordinate_space\":\"screen\""));
         assert!(prompt.contains("Do not leave click_regions empty"));
+        assert!(prompt.contains("Never output provider names"));
         assert!(prompt.contains("YOUR_ACTUAL_X_IN_PIXELS"));
         assert!(prompt.contains("fake placeholders"));
         assert!(!prompt.contains("\"x\":120"));
@@ -1182,6 +1291,7 @@ mod tests {
 
         assert!(system.contains("\"click_regions\""));
         assert!(system.contains("\"actionable_controls\""));
+        assert!(system.contains("\"primary_list\""));
         assert!(user.contains("Routing decision"));
         assert!(user.contains("RegionlessTargetVisible"));
         assert!(user.contains("Analyzed image resolution: 1280x536 pixels"));
@@ -1195,6 +1305,7 @@ mod tests {
             .contains("Only include an element if you can provide an explicit rectangular region"));
         assert!(prompt.contains("\"ui_candidates\""));
         assert!(prompt.contains("\"role\":\"ranked_result\""));
+        assert!(prompt.contains("primary_list"));
         assert!(prompt.contains("\"coordinate_space\":\"screen\""));
         assert!(prompt.contains("YOUR_ACTUAL_X_IN_PIXELS"));
         assert!(!prompt.contains("\"x\":90"));
@@ -1216,6 +1327,29 @@ mod tests {
         let plan = VisionResizePlan::new(3440, 1440);
         let mut parsed = json!({
             "semantic_frame": {
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 1,
+                    "items": [{
+                        "item_id": "p1",
+                        "rank": 1,
+                        "item_kind": "generic",
+                        "click_regions": {
+                            "primary": {
+                                "region": {
+                                    "x": 40.0,
+                                    "y": 80.0,
+                                    "width": 100.0,
+                                    "height": 40.0,
+                                    "coordinate_space": "screen"
+                                },
+                                "confidence": 0.9
+                            }
+                        },
+                        "confidence": 0.9
+                    }]
+                },
                 "visible_result_items": [{
                     "item_id": "v1",
                     "kind": "video",
@@ -1270,6 +1404,16 @@ mod tests {
             parsed["semantic_frame"]["visible_result_items"][0]["click_regions"]["title"]["region"]
                 ["y"],
             json!(644.78)
+        );
+        assert_eq!(
+            parsed["semantic_frame"]["primary_list"]["items"][0]["click_regions"]["primary"]
+                ["region"]["x"],
+            json!(107.5)
+        );
+        assert_eq!(
+            parsed["semantic_frame"]["primary_list"]["items"][0]["click_regions"]["primary"]
+                ["region"]["width"],
+            json!(268.75)
         );
         assert_eq!(parsed["ui_candidates"][0]["center_x"], json!(268.75));
         assert_eq!(parsed["ui_candidates"][0]["center_y"], json!(537.31));
@@ -1382,5 +1526,73 @@ mod tests {
             parsed["semantic_frame"]["visible_result_items"][0]["click_regions"]["title"]
                 .is_object()
         );
+    }
+
+    #[test]
+    fn invalid_primary_list_geometry_is_discarded_without_crashing() {
+        let plan = VisionResizePlan::new(1000, 800);
+        let mut parsed = json!({
+            "semantic_frame": {
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 2,
+                    "items": [
+                        {
+                            "item_id": "bad",
+                            "rank": 1,
+                            "item_kind": "generic",
+                            "click_regions": {
+                                "primary": {
+                                    "region": {
+                                        "x": 980.0,
+                                        "y": 100.0,
+                                        "width": 80.0,
+                                        "height": 40.0,
+                                        "coordinate_space": "screen"
+                                    },
+                                    "confidence": 0.9
+                                }
+                            },
+                            "confidence": 0.9
+                        },
+                        {
+                            "item_id": "good",
+                            "rank": 2,
+                            "item_kind": "generic",
+                            "click_regions": {
+                                "primary": {
+                                    "region": {
+                                        "x": 100.0,
+                                        "y": 100.0,
+                                        "width": 80.0,
+                                        "height": 40.0,
+                                        "coordinate_space": "screen"
+                                    },
+                                    "confidence": 0.9
+                                }
+                            },
+                            "confidence": 0.9
+                        }
+                    ]
+                }
+            }
+        });
+
+        let removed = sanitize_invalid_primary_list_geometry(&mut parsed, &plan);
+
+        assert_eq!(removed, 1);
+        let items = parsed["semantic_frame"]["primary_list"]["items"]
+            .as_array()
+            .expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["item_id"], json!("good"));
+        assert!(parsed["semantic_frame"]["uncertainty"]
+            .as_array()
+            .expect("uncertainty")
+            .iter()
+            .any(|value| value
+                .as_str()
+                .is_some_and(|value| value.contains("primary_list_invalid_geometry"))));
     }
 }

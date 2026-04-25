@@ -521,6 +521,7 @@ mod tests {
             goal_type: GoalType::OpenChannel,
             constraints: GoalConstraints {
                 provider: Some("youtube".into()),
+                item_kind: None,
                 result_kind: None,
                 rank_within_kind: None,
                 rank_overall: None,

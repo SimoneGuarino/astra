@@ -103,12 +103,41 @@ export type PageSemanticEvidence = {
     uncertainty?: string[];
 };
 
+export type PrimaryListItem = {
+    item_id: string;
+    rank: number;
+    title?: string | null;
+    item_kind?: string | null;
+    is_sponsored?: boolean | null;
+    confidence: number;
+    click_regions?: Record<string, unknown>;
+    attributes?: unknown;
+};
+
+export type PrimaryList = {
+    cluster_id: string;
+    container_kind: string;
+    item_count: number;
+    items?: PrimaryListItem[];
+    confidence?: number;
+};
+
+export type PageState = {
+    kind: string;
+    dominant_content: string;
+    list_visible?: boolean | null;
+    detail_visible?: boolean | null;
+    confidence?: number | null;
+};
+
 export type SemanticScreenFrame = {
     frame_id: string;
     captured_at: number;
     image_path?: string | null;
     page_evidence: PageSemanticEvidence;
     scene_summary: string;
+    primary_list?: PrimaryList | null;
+    page_state?: PageState | null;
     visible_entities?: unknown[];
     visible_result_items?: unknown[];
     actionable_controls?: unknown[];
@@ -268,13 +297,20 @@ export type BrowserHandoffVerificationDiagnostic = {
     decision?: BrowserHandoffVerificationDecision;
     accepted?: boolean;
     provider_matches?: boolean;
+    goal_expects_results_context?: boolean;
+    generic_provider_page_kind_hint?: boolean;
     query_hint_present?: boolean;
     result_list_visible?: boolean;
     visible_result_item_count?: number;
+    primary_list_item_count?: number;
+    structural_list_surface_visible?: boolean;
+    page_state_kind?: string | null;
+    page_state_dominant_content?: string | null;
     visible_entity_signal_count?: number;
     legacy_candidate_signal_count?: number;
     scene_summary_result_hint?: boolean;
     supporting_signal_count?: number;
+    supporting_evidence?: string[];
     reason?: string | null;
 };
 
@@ -415,6 +451,7 @@ export type GoalLoopRun = {
     stale_capture_reuse_prevented?: boolean;
     browser_recovery_used?: boolean;
     browser_recovery_status?: BrowserRecoveryStatus;
+    post_action_progress_observed?: boolean;
     repeated_click_protection_triggered?: boolean;
     selected_target_candidate?: unknown | null;
     verifier_status?: string | null;

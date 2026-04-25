@@ -228,6 +228,50 @@ pub struct VisibleResultItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimaryListItem {
+    pub item_id: String,
+    pub rank: u32,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub item_kind: Option<String>,
+    #[serde(default)]
+    pub is_sponsored: Option<bool>,
+    #[serde(default)]
+    pub raw_confidence: Option<f32>,
+    pub confidence: f32,
+    #[serde(default)]
+    pub click_regions: HashMap<String, ClickRegion>,
+    #[serde(default)]
+    pub attributes: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrimaryList {
+    pub cluster_id: String,
+    pub container_kind: String,
+    pub item_count: u32,
+    #[serde(default)]
+    pub items: Vec<PrimaryListItem>,
+    #[serde(default)]
+    pub raw_confidence: Option<f32>,
+    #[serde(default)]
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageState {
+    pub kind: String,
+    pub dominant_content: String,
+    #[serde(default)]
+    pub list_visible: Option<bool>,
+    #[serde(default)]
+    pub detail_visible: Option<bool>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionableControl {
     pub control_id: String,
     pub kind: String,
@@ -262,6 +306,10 @@ pub struct SemanticScreenFrame {
     #[serde(default)]
     pub visible_result_items: Vec<VisibleResultItem>,
     #[serde(default)]
+    pub primary_list: Option<PrimaryList>,
+    #[serde(default)]
+    pub page_state: Option<PageState>,
+    #[serde(default)]
     pub actionable_controls: Vec<ActionableControl>,
     #[serde(default)]
     pub legacy_target_candidates: Vec<UITargetCandidate>,
@@ -272,6 +320,7 @@ pub struct SemanticScreenFrame {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalType {
+    OpenListItem,
     OpenMediaResult,
     OpenChannel,
     FindBestOffer,
@@ -283,6 +332,8 @@ pub enum GoalType {
 pub struct GoalConstraints {
     #[serde(default)]
     pub provider: Option<String>,
+    #[serde(default)]
+    pub item_kind: Option<String>,
     #[serde(default)]
     pub result_kind: Option<VisibleResultKind>,
     #[serde(default)]
@@ -741,11 +792,23 @@ pub struct BrowserHandoffVerificationDiagnostic {
     #[serde(default)]
     pub provider_matches: bool,
     #[serde(default)]
+    pub goal_expects_results_context: bool,
+    #[serde(default)]
+    pub generic_provider_page_kind_hint: bool,
+    #[serde(default)]
     pub query_hint_present: bool,
     #[serde(default)]
     pub result_list_visible: bool,
     #[serde(default)]
     pub visible_result_item_count: usize,
+    #[serde(default)]
+    pub primary_list_item_count: usize,
+    #[serde(default)]
+    pub structural_list_surface_visible: bool,
+    #[serde(default)]
+    pub page_state_kind: Option<String>,
+    #[serde(default)]
+    pub page_state_dominant_content: Option<String>,
     #[serde(default)]
     pub visible_entity_signal_count: usize,
     #[serde(default)]
@@ -754,6 +817,8 @@ pub struct BrowserHandoffVerificationDiagnostic {
     pub scene_summary_result_hint: bool,
     #[serde(default)]
     pub supporting_signal_count: usize,
+    #[serde(default)]
+    pub supporting_evidence: Vec<String>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -1029,6 +1094,8 @@ pub struct GoalLoopRun {
     pub browser_recovery_used: bool,
     #[serde(default)]
     pub browser_recovery_status: BrowserRecoveryStatus,
+    #[serde(default)]
+    pub post_action_progress_observed: bool,
     #[serde(default)]
     pub repeated_click_protection_triggered: bool,
     #[serde(default)]

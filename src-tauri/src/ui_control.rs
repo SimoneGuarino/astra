@@ -205,7 +205,7 @@ impl UIControlRuntime {
 
         let pointer_target = match request.primitive {
             UIPrimitiveKind::FocusCurrentInput | UIPrimitiveKind::ClickTargetCandidate => {
-                match validate_pointer_target(request) {
+                match validate_pointer_target(request, !self.dry_run) {
                     Ok(target) => Some(target),
                     Err(error) => {
                         return primitive_result_with_geometry(
@@ -402,6 +402,7 @@ fn normalize_app_hint(value: &str) -> String {
 
 fn validate_pointer_target(
     request: &UIPrimitiveRequest,
+    allow_live_environment_bounds: bool,
 ) -> Result<PointerTarget, PointerTargetValidationFailure> {
     let candidate = request.target.get("candidate").unwrap_or(&request.target);
     let confidence = candidate
@@ -473,10 +474,16 @@ fn validate_pointer_target(
                 "pointer target did not contain usable center coordinates or region geometry",
             )),
         })?;
-    let browser_window_bounds = extract_browser_window_bounds(request, candidate)
-        .or_else(|| browser_window_bounds_for_candidate(candidate));
-    let screen_bounds =
-        extract_screen_bounds(request, candidate).or_else(query_virtual_screen_bounds_windows);
+    let browser_window_bounds = extract_browser_window_bounds(request, candidate).or_else(|| {
+        allow_live_environment_bounds
+            .then(|| browser_window_bounds_for_candidate(candidate))
+            .flatten()
+    });
+    let screen_bounds = extract_screen_bounds(request, candidate).or_else(|| {
+        allow_live_environment_bounds
+            .then(query_virtual_screen_bounds_windows)
+            .flatten()
+    });
     let coordinate_space = raw_region
         .as_ref()
         .map(|region| normalize_coordinate_space(&region.coordinate_space))

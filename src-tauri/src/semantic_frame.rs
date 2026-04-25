@@ -6,13 +6,14 @@ use crate::{
         ExecutableTargetConfidenceDiagnostic, FocusedPerceptionRequest, FrameUncertainty,
         GoalConstraints, GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationRecord,
         GoalVerificationStatus, OffscreenInferenceStage, PageEvidenceSource, PageSemanticEvidence,
-        PerceptionRequestMode, PerceptionRoutingDecision, PlannerContractDecision,
+        PageState, PerceptionRequestMode, PerceptionRoutingDecision, PlannerContractDecision,
         PlannerContractInput, PlannerContractSource, PlannerDecisionDiagnostic,
         PlannerDecisionStatus, PlannerRejectionReason, PlannerScrollIntent, PlannerStep,
         PlannerStepExecutionRecord, PlannerStepExecutionStatus, PlannerStepKind,
-        PlannerVisibilityAssessment, SemanticScreenFrame, VisibleActionabilityDiagnostic,
-        VisibleActionabilityStatus, VisibleEntity, VisibleEntityKind, VisibleGroundingGap,
-        VisibleRefinementStrategy, VisibleResultItem, VisibleResultKind,
+        PlannerVisibilityAssessment, PrimaryList, PrimaryListItem, SemanticScreenFrame,
+        VisibleActionabilityDiagnostic, VisibleActionabilityStatus, VisibleEntity,
+        VisibleEntityKind, VisibleGroundingGap, VisibleRefinementStrategy, VisibleResultItem,
+        VisibleResultKind,
     },
     ui_target_grounding::{
         ground_targets_for_request, normalize_browser_app_hint, normalize_content_provider_hint,
@@ -97,11 +98,19 @@ pub fn semantic_frame_from_vision_value(
     if visible_result_items.is_empty() {
         visible_result_items = result_items_from_candidates(&legacy_candidates);
     }
+    let (primary_list, primary_list_uncertainty) =
+        parse_primary_list(frame_value.get("primary_list"));
+    let page_state = parse_page_state(frame_value.get("page_state"));
     let actionable_controls = parse_actionable_controls(frame_value.get("actionable_controls"));
-    let uncertainty = parse_uncertainty(frame_value.get("uncertainty"));
+    let mut uncertainty = parse_uncertainty(frame_value.get("uncertainty"));
+    uncertainty.extend(primary_list_uncertainty);
 
     let has_structured_content = !visible_entities.is_empty()
         || !visible_result_items.is_empty()
+        || primary_list
+            .as_ref()
+            .is_some_and(|list| !list.items.is_empty())
+        || page_state.is_some()
         || !actionable_controls.is_empty()
         || !legacy_candidates.is_empty()
         || page_evidence.confidence > 0.0;
@@ -118,6 +127,8 @@ pub fn semantic_frame_from_vision_value(
         scene_summary,
         visible_entities,
         visible_result_items,
+        primary_list,
+        page_state,
         actionable_controls,
         legacy_target_candidates: legacy_candidates,
         uncertainty,
@@ -171,6 +182,8 @@ pub fn semantic_frame_from_candidates(
         page_evidence,
         visible_entities: Vec::new(),
         visible_result_items,
+        primary_list: None,
+        page_state: None,
         actionable_controls: Vec::new(),
         legacy_target_candidates: legacy_candidates,
         uncertainty: Vec::new(),
@@ -193,7 +206,7 @@ pub fn plan_next_step(goal: &GoalSpec, frame: &SemanticScreenFrame) -> PlannerSt
     }
 
     match goal.goal_type {
-        GoalType::OpenMediaResult => plan_open_media_result(goal, frame),
+        GoalType::OpenListItem | GoalType::OpenMediaResult => plan_open_list_item(goal, frame),
         GoalType::OpenChannel => plan_open_channel(goal, frame),
         GoalType::InspectScreen => PlannerStep {
             step_id: Uuid::new_v4().to_string(),
@@ -253,6 +266,7 @@ pub fn run_goal_loop_once(goal: GoalSpec, frame: SemanticScreenFrame) -> GoalLoo
         stale_capture_reuse_prevented: false,
         browser_recovery_used: false,
         browser_recovery_status: BrowserRecoveryStatus::NotNeeded,
+        post_action_progress_observed: false,
         repeated_click_protection_triggered: false,
         selected_target_candidate: None,
         verifier_status: None,
@@ -338,6 +352,22 @@ struct PendingPostClickVerification {
     target_signature: Option<String>,
     geometry_signature: Option<String>,
     pre_click_frame_signature: String,
+    pre_click_list_surface_visible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostClickVerificationOutcome {
+    goal_achieved: bool,
+    progress_observed: bool,
+    frame_unchanged: bool,
+    browser_surface_suspect: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenListItemVerificationState {
+    Achieved(&'static str),
+    Ambiguous(&'static str),
+    NotAchieved,
 }
 
 #[allow(dead_code)]
@@ -374,6 +404,7 @@ impl GoalLoopRuntime {
             stale_capture_reuse_prevented: false,
             browser_recovery_used: false,
             browser_recovery_status: BrowserRecoveryStatus::NotNeeded,
+            post_action_progress_observed: false,
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: None,
@@ -464,20 +495,19 @@ impl GoalLoopRuntime {
                     .frames
                     .last()
                     .expect("frame after post-click perception");
-                let current_signature = frame_progress_signature(current_frame);
-                let goal_achieved = verify_goal_against_frame(&run.goal, current_frame).is_some();
-                let browser_surface_suspect = run.goal.constraints.provider.is_some()
-                    && verify_browser_handoff_page(&run.goal, current_frame).is_err();
-                let frame_unchanged = current_signature == pending.pre_click_frame_signature;
+                let post_click = evaluate_post_click_frame(&run.goal, &pending, current_frame);
+                if post_click.progress_observed {
+                    run.post_action_progress_observed = true;
+                }
                 if let Some(signature) = pending.geometry_signature.clone() {
-                    if goal_achieved || !frame_unchanged {
+                    if post_click.progress_observed {
                         no_progress_geometry_failures.remove(&signature);
                     } else {
                         *no_progress_geometry_failures.entry(signature).or_insert(0) += 1;
                     }
                 }
                 if let Some(signature) = pending.target_signature.clone() {
-                    if goal_achieved || !frame_unchanged {
+                    if post_click.progress_observed {
                         repeated_click_attempts.remove(&signature);
                     } else {
                         let attempts = repeated_click_attempts
@@ -497,11 +527,11 @@ impl GoalLoopRuntime {
                     }
                 }
 
-                if !goal_achieved
+                if !post_click.goal_achieved
                     && browser_recovery_attempts < MAX_BROWSER_RECOVERY_ATTEMPTS
-                    && (browser_surface_suspect || frame_unchanged)
+                    && (post_click.browser_surface_suspect || post_click.frame_unchanged)
                 {
-                    let reason = if browser_surface_suspect {
+                    let reason = if post_click.browser_surface_suspect {
                         "browser_surface_lost_after_click"
                     } else {
                         "post_click_page_unchanged"
@@ -712,6 +742,7 @@ impl GoalLoopRuntime {
                                 .clone(),
                             geometry_signature: step_geometry_signature(&step),
                             pre_click_frame_signature: current_frame_signature,
+                            pre_click_list_surface_visible: structural_list_surface_visible(frame),
                         });
                         force_fresh_capture = true;
                     }
@@ -803,43 +834,14 @@ impl GoalLoopRuntime {
 
 pub fn verify_goal_against_frame(goal: &GoalSpec, frame: &SemanticScreenFrame) -> Option<String> {
     match goal.goal_type {
-        GoalType::OpenMediaResult => {
-            let provider_matches = goal
-                .constraints
-                .provider
-                .as_deref()
-                .map_or(true, |expected| {
-                    frame
-                        .page_evidence
-                        .content_provider_hint
-                        .as_deref()
-                        .map_or(false, |observed| labels_match(expected, observed))
-                });
-            let watch_page = frame
-                .page_evidence
-                .page_kind_hint
-                .as_deref()
-                .is_some_and(|kind| {
-                    matches!(
-                        normalize_label(kind).as_str(),
-                        "watch_page" | "video_page" | "youtube_watch"
-                    )
-                });
-            (provider_matches && watch_page).then_some("media_watch_page_visible".into())
+        GoalType::OpenListItem | GoalType::OpenMediaResult => {
+            match structural_open_list_item_state(goal, frame) {
+                OpenListItemVerificationState::Achieved(reason) => Some(reason.into()),
+                OpenListItemVerificationState::Ambiguous(_)
+                | OpenListItemVerificationState::NotAchieved => None,
+            }
         }
-        GoalType::OpenChannel => {
-            let channel_page = frame
-                .page_evidence
-                .page_kind_hint
-                .as_deref()
-                .is_some_and(|kind| {
-                    matches!(
-                        normalize_label(kind).as_str(),
-                        "channel_page" | "profile_page" | "youtube_channel"
-                    )
-                });
-            channel_page.then_some("channel_page_visible".into())
-        }
+        GoalType::OpenChannel => is_channel_page(frame).then_some("channel_page_visible".into()),
         _ => None,
     }
 }
@@ -861,8 +863,13 @@ pub fn verify_goal_state(
     }
 
     let status = match goal.goal_type {
-        GoalType::OpenMediaResult if is_watch_page(frame) => {
-            GoalVerificationStatus::PageChangedWrongOutcome
+        GoalType::OpenListItem | GoalType::OpenMediaResult
+            if matches!(
+                structural_open_list_item_state(goal, frame),
+                OpenListItemVerificationState::Ambiguous(_)
+            ) =>
+        {
+            GoalVerificationStatus::Ambiguous
         }
         GoalType::OpenChannel if is_watch_page(frame) => GoalVerificationStatus::ReplanRequired,
         GoalType::OpenChannel if is_search_results_page(frame) => {
@@ -894,13 +901,12 @@ pub fn verify_browser_handoff_page(
         .provider
         .as_deref()
         .map_or(true, |expected| {
-            frame
-                .page_evidence
-                .content_provider_hint
-                .as_deref()
-                .is_some_and(|observed| labels_match(expected, observed))
+            provider_context_compatible(
+                Some(expected),
+                frame.page_evidence.content_provider_hint.as_deref(),
+            )
         });
-    let mut diagnostic = browser_handoff_verification_diagnostic(frame, provider_matches);
+    let mut diagnostic = browser_handoff_verification_diagnostic(goal, frame, provider_matches);
     if !provider_matches {
         diagnostic.reason = Some(format!(
             "visible page provider {:?} does not match expected provider {:?}",
@@ -918,7 +924,9 @@ pub fn verify_browser_handoff_page(
     }
 
     match goal.goal_type {
-        GoalType::OpenMediaResult => verify_result_list_handoff_context(diagnostic),
+        GoalType::OpenListItem | GoalType::OpenMediaResult => {
+            verify_list_handoff_context(diagnostic)
+        }
         GoalType::OpenChannel => {
             if diagnostic.normalized_page_kind == BrowserPageSemanticKind::WatchPage {
                 diagnostic.accepted = true;
@@ -929,7 +937,7 @@ pub fn verify_browser_handoff_page(
                 ));
                 Ok(diagnostic)
             } else {
-                let mut diagnostic = verify_result_list_handoff_context(diagnostic)?;
+                let mut diagnostic = verify_list_handoff_context(diagnostic)?;
                 diagnostic.reason = Some(format!(
                     "page kind {:?} resolved as a verified result-list context for channel continuation",
                     diagnostic.raw_page_kind_hint
@@ -954,25 +962,89 @@ pub fn verify_browser_handoff_page(
 }
 
 fn browser_handoff_verification_diagnostic(
+    goal: &GoalSpec,
     frame: &SemanticScreenFrame,
     provider_matches: bool,
 ) -> BrowserHandoffVerificationDiagnostic {
     let summary = summarize_visible_signals(frame);
     let raw_page_kind_hint = frame.page_evidence.page_kind_hint.clone();
     let normalized_page_kind = browser_page_semantic_kind(raw_page_kind_hint.as_deref());
+    let generic_provider_page_kind_hint = raw_page_kind_hint.as_deref().is_some_and(|kind| {
+        frame
+            .page_evidence
+            .content_provider_hint
+            .as_deref()
+            .is_some_and(|provider| labels_match(kind, provider))
+    });
+    let goal_expects_results_context = matches!(
+        goal.goal_type,
+        GoalType::OpenListItem | GoalType::OpenMediaResult | GoalType::OpenChannel
+    );
     let query_hint_present = frame
         .page_evidence
         .query_hint
         .as_deref()
         .is_some_and(|value| !value.trim().is_empty());
     let result_list_visible = frame.page_evidence.result_list_visible == Some(true);
-    let structured_result_signal =
-        summary.result_item_count > 0 || summary.legacy_candidate_signal_count > 0;
+    let primary_list_item_count = frame
+        .primary_list
+        .as_ref()
+        .map(|list| list.items.len())
+        .unwrap_or(0);
+    let structural_list_surface = structural_list_surface_visible(frame);
+    let structured_result_signal = primary_list_item_count > 0
+        || summary.result_item_count > 0
+        || summary.legacy_candidate_signal_count > 0;
     let supporting_signal_count = usize::from(result_list_visible)
+        + usize::from(structural_list_surface)
+        + usize::from(primary_list_item_count > 0)
         + usize::from(structured_result_signal)
         + usize::from(summary.entity_signal_count > 0)
         + usize::from(summary.scene_summary_result_hint)
         + usize::from(query_hint_present);
+    let mut supporting_evidence = Vec::new();
+    if provider_matches {
+        supporting_evidence.push("provider_matches".into());
+    }
+    if goal_expects_results_context {
+        supporting_evidence.push("goal_expects_results_context".into());
+    }
+    if generic_provider_page_kind_hint {
+        supporting_evidence.push("generic_provider_page_kind_hint".into());
+    }
+    if result_list_visible {
+        supporting_evidence.push("result_list_visible".into());
+    }
+    if structural_list_surface {
+        supporting_evidence.push("structural_list_surface_visible".into());
+    }
+    if primary_list_item_count > 0 {
+        supporting_evidence.push(format!("primary_list_items={primary_list_item_count}"));
+    }
+    if !frame.visible_result_items.is_empty() {
+        supporting_evidence.push(format!(
+            "visible_result_items={}",
+            frame.visible_result_items.len()
+        ));
+    }
+    if summary.entity_signal_count > 0 {
+        supporting_evidence.push(format!(
+            "visible_entity_signals={}",
+            summary.entity_signal_count
+        ));
+    }
+    if summary.legacy_candidate_signal_count > 0 {
+        supporting_evidence.push(format!(
+            "legacy_candidate_signals={}",
+            summary.legacy_candidate_signal_count
+        ));
+    }
+    if summary.scene_summary_result_hint {
+        supporting_evidence.push("scene_summary_result_hint".into());
+    }
+    if query_hint_present {
+        supporting_evidence.push("query_hint_present".into());
+    }
 
     BrowserHandoffVerificationDiagnostic {
         raw_page_kind_hint,
@@ -980,18 +1052,28 @@ fn browser_handoff_verification_diagnostic(
         decision: BrowserHandoffVerificationDecision::Rejected,
         accepted: false,
         provider_matches,
+        goal_expects_results_context,
+        generic_provider_page_kind_hint,
         query_hint_present,
         result_list_visible,
-        visible_result_item_count: summary.result_item_count,
+        visible_result_item_count: frame.visible_result_items.len(),
+        primary_list_item_count,
+        structural_list_surface_visible: structural_list_surface,
+        page_state_kind: frame.page_state.as_ref().map(|state| state.kind.clone()),
+        page_state_dominant_content: frame
+            .page_state
+            .as_ref()
+            .map(|state| state.dominant_content.clone()),
         visible_entity_signal_count: summary.entity_signal_count,
         legacy_candidate_signal_count: summary.legacy_candidate_signal_count,
         scene_summary_result_hint: summary.scene_summary_result_hint,
         supporting_signal_count,
+        supporting_evidence,
         reason: None,
     }
 }
 
-fn verify_result_list_handoff_context(
+fn verify_list_handoff_context(
     mut diagnostic: BrowserHandoffVerificationDiagnostic,
 ) -> Result<BrowserHandoffVerificationDiagnostic, BrowserHandoffVerificationDiagnostic> {
     if diagnostic.normalized_page_kind == BrowserPageSemanticKind::SearchResults {
@@ -1004,11 +1086,45 @@ fn verify_result_list_handoff_context(
         return Ok(diagnostic);
     }
 
-    let has_structural_result_signal = diagnostic.visible_result_item_count > 0
+    let has_structural_result_signal = diagnostic.primary_list_item_count > 0
+        || diagnostic.visible_result_item_count > 0
         || diagnostic.visible_entity_signal_count > 0
         || diagnostic.legacy_candidate_signal_count > 0;
-    let has_supporting_result_context =
-        has_structural_result_signal || diagnostic.scene_summary_result_hint;
+    let has_scene_or_query_signal = diagnostic.scene_summary_result_hint
+        || diagnostic.query_hint_present
+        || diagnostic.structural_list_surface_visible;
+    let has_supporting_result_context = has_structural_result_signal
+        || diagnostic.scene_summary_result_hint
+        || diagnostic.structural_list_surface_visible;
+    if diagnostic.structural_list_surface_visible
+        && diagnostic.primary_list_item_count > 0
+        && diagnostic.supporting_signal_count >= 2
+    {
+        diagnostic.accepted = true;
+        diagnostic.decision = BrowserHandoffVerificationDecision::SupportingEvidence;
+        diagnostic.reason = Some(format!(
+            "visible page was accepted as a provider-agnostic list context using primary_list/page_state evidence; raw page kind {:?}",
+            diagnostic.raw_page_kind_hint
+        ));
+        return Ok(diagnostic);
+    }
+
+    let generic_provider_results_context = diagnostic.generic_provider_page_kind_hint
+        && diagnostic.goal_expects_results_context
+        && diagnostic.provider_matches
+        && has_structural_result_signal
+        && has_scene_or_query_signal
+        && diagnostic.supporting_signal_count >= 3;
+
+    if generic_provider_results_context {
+        diagnostic.accepted = true;
+        diagnostic.decision = BrowserHandoffVerificationDecision::SupportingEvidence;
+        diagnostic.reason = Some(format!(
+            "generic provider page kind {:?} was accepted as a result-list context using goal-aware supporting evidence",
+            diagnostic.raw_page_kind_hint
+        ));
+        return Ok(diagnostic);
+    }
 
     if diagnostic.result_list_visible
         && diagnostic.supporting_signal_count >= 2
@@ -1023,10 +1139,17 @@ fn verify_result_list_handoff_context(
         return Ok(diagnostic);
     }
 
-    diagnostic.reason = Some(format!(
-        "visible page kind {:?} did not normalize to a verified result-list context and supporting evidence was insufficient",
-        diagnostic.raw_page_kind_hint
-    ));
+    diagnostic.reason = Some(if diagnostic.generic_provider_page_kind_hint {
+        format!(
+            "generic provider page kind {:?} did not normalize to search_results and the supporting evidence was not strong enough to infer a reusable result-list context",
+            diagnostic.raw_page_kind_hint
+        )
+    } else {
+        format!(
+            "visible page kind {:?} did not normalize to a verified result-list context and supporting evidence was insufficient",
+            diagnostic.raw_page_kind_hint
+        )
+    });
     Err(diagnostic)
 }
 
@@ -1152,7 +1275,9 @@ impl VisibleSignalSummary {
 fn visible_actionability_for_goal(input: &PlannerContractInput) -> VisibleActionabilityDiagnostic {
     let summary = summarize_visible_signals(&input.current_frame);
     match input.goal.goal_type {
-        GoalType::OpenMediaResult => visible_actionability_for_open_media(input, &summary),
+        GoalType::OpenListItem | GoalType::OpenMediaResult => {
+            visible_actionability_for_open_list_item(input, &summary)
+        }
         GoalType::OpenChannel => visible_actionability_for_open_channel(input, &summary),
         GoalType::InspectScreen => base_visible_actionability(input, &summary),
         GoalType::FindBestOffer | GoalType::Unknown => {
@@ -1189,18 +1314,18 @@ fn base_visible_actionability(
     }
 }
 
-fn visible_actionability_for_open_media(
+fn visible_actionability_for_open_list_item(
     input: &PlannerContractInput,
     summary: &VisibleSignalSummary,
 ) -> VisibleActionabilityDiagnostic {
     let goal = &input.goal;
     let frame = &input.current_frame;
-    let desired_kind = goal
+    let desired_kind = requested_item_kind_label(goal);
+    let desired_rank = goal
         .constraints
-        .result_kind
-        .clone()
-        .unwrap_or(VisibleResultKind::Video);
-    let desired_rank = goal.constraints.rank_within_kind.unwrap_or(1);
+        .rank_within_kind
+        .or(goal.constraints.rank_overall)
+        .unwrap_or(1);
     let provider = goal
         .constraints
         .provider
@@ -1209,11 +1334,30 @@ fn visible_actionability_for_open_media(
     let refinement_remaining =
         input.visible_refinement_attempts < input.max_visible_refinement_passes;
     let mut diagnostic = base_visible_actionability(input, summary);
-    let result_context_visible = is_search_results_page(frame)
-        || frame.page_evidence.result_list_visible == Some(true)
-        || summary.scene_summary_result_hint;
+    let result_context_visible = list_context_visible(frame);
 
     diagnostic.relevant_visible_content = result_context_visible || summary.has_visible_signals();
+
+    if let Some(item) = find_primary_list_item_match(goal, frame) {
+        diagnostic.target_visible_evidence = true;
+        if preferred_primary_click_region(item, &["primary", "title", "thumbnail"]).is_some() {
+            diagnostic.status = VisibleActionabilityStatus::VisibleExecutable;
+            return diagnostic;
+        }
+        diagnostic.status = VisibleActionabilityStatus::VisibleTargetNeedsClickRegion;
+        diagnostic.refinement_eligible =
+            primary_item_region(item).is_some() || refinement_remaining;
+        diagnostic.refinement_strategy = if primary_item_region(item).is_some() {
+            VisibleRefinementStrategy::TargetRegion
+        } else {
+            summary.refinement_strategy()
+        };
+        append_visible_gap(
+            &mut diagnostic.gaps,
+            VisibleGroundingGap::MissingClickRegion,
+        );
+        return diagnostic;
+    }
 
     if let Some(item) = find_ranked_result_match(goal, frame) {
         diagnostic.target_visible_evidence = true;
@@ -1237,9 +1381,9 @@ fn visible_actionability_for_open_media(
         return diagnostic;
     }
 
-    let typed_max_rank = max_visible_rank_for_kind(frame, desired_kind.clone(), provider);
+    let typed_max_rank = max_visible_rank_for_goal(frame, desired_kind.as_deref(), provider);
     let weak_media_candidate =
-        has_weak_open_media_candidate(goal, frame, provider, desired_kind.clone());
+        has_weak_open_list_item_candidate(goal, frame, provider, desired_kind.as_deref());
     let partial_target_evidence = has_partial_open_media_target_evidence(goal, frame, provider);
     diagnostic.target_visible_evidence = partial_target_evidence;
 
@@ -1384,6 +1528,34 @@ fn offscreen_inference_stage_for_attempts(
 fn summarize_visible_signals(frame: &SemanticScreenFrame) -> VisibleSignalSummary {
     let mut summary = VisibleSignalSummary::default();
     summary.scene_summary_result_hint = scene_summary_suggests_results(&frame.scene_summary);
+
+    if let Some(primary_list) = frame.primary_list.as_ref() {
+        for item in &primary_list.items {
+            summary.result_item_count += 1;
+            let missing_title = item
+                .title
+                .as_deref()
+                .map_or(true, |title| title.trim().is_empty());
+            let weak_item = item.item_kind.as_deref().map_or(true, |kind| {
+                matches!(
+                    normalize_item_kind_label(kind).as_str(),
+                    "unknown" | "generic"
+                )
+            }) || missing_title;
+            if weak_item {
+                summary.weak_result_count += 1;
+            }
+            if missing_title {
+                summary.missing_title_count += 1;
+            }
+            if item.click_regions.is_empty() {
+                summary.missing_click_region_count += 1;
+            }
+            if let Some(region) = primary_item_region(item) {
+                summary.result_like_regions.push(region);
+            }
+        }
+    }
 
     for item in &frame.visible_result_items {
         summary.result_item_count += 1;
@@ -1587,71 +1759,114 @@ fn find_ranked_result_match<'a>(
     goal: &GoalSpec,
     frame: &'a SemanticScreenFrame,
 ) -> Option<&'a VisibleResultItem> {
-    let desired_kind = goal
+    let desired_kind = requested_item_kind_label(goal);
+    let desired_rank = goal
         .constraints
-        .result_kind
-        .clone()
-        .unwrap_or(VisibleResultKind::Video);
-    let desired_rank = goal.constraints.rank_within_kind.unwrap_or(1);
+        .rank_within_kind
+        .or(goal.constraints.rank_overall)
+        .unwrap_or(1);
     let provider = goal
         .constraints
         .provider
         .as_deref()
         .or(frame.page_evidence.content_provider_hint.as_deref());
     frame.visible_result_items.iter().find(|item| {
-        item.kind == desired_kind
+        item_kind_compatibility(desired_kind.as_deref(), Some(result_kind_label(&item.kind)))
+            .is_some()
             && provider_matches_item(
                 provider,
                 frame.page_evidence.content_provider_hint.as_deref(),
                 item,
             )
-            && effective_rank_within_kind(frame, item, desired_kind.clone()) == Some(desired_rank)
+            && effective_rank_for_goal(frame, item, desired_kind.as_deref()) == Some(desired_rank)
     })
 }
 
-fn effective_rank_within_kind(
+fn find_primary_list_item_match<'a>(
+    goal: &GoalSpec,
+    frame: &'a SemanticScreenFrame,
+) -> Option<&'a PrimaryListItem> {
+    let desired_kind = requested_item_kind_label(goal);
+    let desired_rank = goal
+        .constraints
+        .rank_within_kind
+        .or(goal.constraints.rank_overall)
+        .unwrap_or(1);
+    let list = frame.primary_list.as_ref()?;
+    list.items
+        .iter()
+        .filter(|item| {
+            item_kind_compatibility(desired_kind.as_deref(), item.item_kind.as_deref()).is_some()
+        })
+        .find(|item| item.rank == desired_rank)
+        .or_else(|| {
+            list.items
+                .iter()
+                .filter(|item| {
+                    item_kind_compatibility(desired_kind.as_deref(), item.item_kind.as_deref())
+                        .is_some()
+                })
+                .nth((desired_rank.saturating_sub(1)) as usize)
+        })
+}
+
+fn effective_rank_for_goal(
     frame: &SemanticScreenFrame,
     item: &VisibleResultItem,
-    kind: VisibleResultKind,
+    requested_kind: Option<&str>,
 ) -> Option<u32> {
+    if requested_kind.is_none() {
+        return item.rank_overall.or(item.rank_within_kind);
+    }
     item.rank_within_kind.or_else(|| {
-        if item.kind != kind {
+        if item_kind_compatibility(requested_kind, Some(result_kind_label(&item.kind))).is_none() {
             return None;
         }
         frame
             .visible_result_items
             .iter()
-            .filter(|other| other.kind == kind)
+            .filter(|other| {
+                item_kind_compatibility(requested_kind, Some(result_kind_label(&other.kind)))
+                    .is_some()
+            })
             .position(|other| other.item_id == item.item_id)
             .map(|index| (index + 1) as u32)
     })
 }
 
-fn max_visible_rank_for_kind(
+fn max_visible_rank_for_goal(
     frame: &SemanticScreenFrame,
-    kind: VisibleResultKind,
+    requested_kind: Option<&str>,
     provider: Option<&str>,
 ) -> Option<u32> {
-    frame
+    let primary_rank = frame
+        .primary_list
+        .as_ref()
+        .into_iter()
+        .flat_map(|list| list.items.iter())
+        .filter(|item| item_kind_compatibility(requested_kind, item.item_kind.as_deref()).is_some())
+        .map(|item| item.rank)
+        .max();
+    let visible_rank = frame
         .visible_result_items
         .iter()
-        .fold(None, |current, item| {
-            if item.kind != kind
-                || !provider_matches_item(
+        .filter(|item| {
+            item_kind_compatibility(requested_kind, Some(result_kind_label(&item.kind))).is_some()
+                && provider_matches_item(
                     provider,
                     frame.page_evidence.content_provider_hint.as_deref(),
                     item,
                 )
-            {
-                return current;
-            }
-            let rank = effective_rank_within_kind(frame, item, kind.clone()).or(item.rank_overall);
-            match (current, rank) {
-                (Some(existing), Some(rank)) => Some(existing.max(rank)),
-                (None, Some(rank)) => Some(rank),
-                (existing, None) => existing,
-            }
         })
+        .filter_map(|item| {
+            effective_rank_for_goal(frame, item, requested_kind).or(item.rank_overall)
+        })
+        .max();
+    match (primary_rank, visible_rank) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(rank), None) | (None, Some(rank)) => Some(rank),
+        (None, None) => None,
+    }
 }
 
 fn has_partial_open_media_target_evidence(
@@ -1659,12 +1874,13 @@ fn has_partial_open_media_target_evidence(
     frame: &SemanticScreenFrame,
     provider: Option<&str>,
 ) -> bool {
-    let desired_kind = goal
-        .constraints
-        .result_kind
-        .clone()
-        .unwrap_or(VisibleResultKind::Video);
-    frame.visible_result_items.iter().any(|item| {
+    let desired_kind = requested_item_kind_label(goal);
+    frame.primary_list.as_ref().is_some_and(|list| {
+        list.items.iter().any(|item| {
+            item_kind_compatibility(desired_kind.as_deref(), item.item_kind.as_deref()).is_some()
+                && (item.title.is_some() || primary_item_region(item).is_some())
+        })
+    }) || frame.visible_result_items.iter().any(|item| {
         provider_matches_item(
             provider,
             frame.page_evidence.content_provider_hint.as_deref(),
@@ -1673,7 +1889,7 @@ fn has_partial_open_media_target_evidence(
             item.kind,
             VisibleResultKind::Unknown | VisibleResultKind::Generic
         ) && (item.title.is_some() || result_item_region(item).is_some())
-    }) || desired_kind == VisibleResultKind::Video
+    }) || desired_kind.as_deref() == Some("video")
         && (frame.visible_entities.iter().any(|entity| {
             matches!(
                 entity.kind,
@@ -1689,18 +1905,37 @@ fn has_partial_open_media_target_evidence(
         }))
 }
 
-fn has_weak_open_media_candidate(
+fn has_weak_open_list_item_candidate(
     _goal: &GoalSpec,
     frame: &SemanticScreenFrame,
     provider: Option<&str>,
-    desired_kind: VisibleResultKind,
+    desired_kind: Option<&str>,
 ) -> bool {
+    if frame.primary_list.as_ref().is_some_and(|list| {
+        list.items.iter().any(|item| {
+            item_kind_compatibility(desired_kind, item.item_kind.as_deref()).is_some()
+                && (item.click_regions.is_empty()
+                    || item
+                        .title
+                        .as_deref()
+                        .map_or(true, |title| title.trim().is_empty())
+                    || item.item_kind.as_deref().map_or(true, |kind| {
+                        matches!(
+                            normalize_item_kind_label(kind).as_str(),
+                            "generic" | "unknown"
+                        )
+                    }))
+        })
+    }) {
+        return true;
+    }
+
     frame.visible_result_items.iter().any(|item| {
         let missing_title = item
             .title
             .as_deref()
             .map_or(true, |title| title.trim().is_empty());
-        let missing_rank = effective_rank_within_kind(frame, item, desired_kind.clone())
+        let missing_rank = effective_rank_for_goal(frame, item, desired_kind)
             .or(item.rank_overall)
             .is_none();
         let weak_type = matches!(
@@ -1711,7 +1946,8 @@ fn has_weak_open_media_candidate(
             provider,
             frame.page_evidence.content_provider_hint.as_deref(),
             item,
-        ) && (item.kind == desired_kind || weak_type)
+        ) && (item_kind_compatibility(desired_kind, Some(result_kind_label(&item.kind))).is_some()
+            || weak_type)
             && (item.click_regions.is_empty() || missing_title || missing_rank || weak_type)
     })
 }
@@ -1862,7 +2098,7 @@ fn maybe_apply_safe_fallback_step(
     }
 
     match input.goal.goal_type {
-        GoalType::OpenMediaResult => {
+        GoalType::OpenListItem | GoalType::OpenMediaResult => {
             safe_fallback_step_for_open_media(input, &proposed_step).unwrap_or(proposed_step)
         }
         GoalType::OpenChannel
@@ -1878,24 +2114,38 @@ fn safe_fallback_step_for_open_media(
 ) -> Option<PlannerStep> {
     let goal = &input.goal;
     let frame = &input.current_frame;
-    let desired_kind = goal
+    let desired_kind = requested_item_kind_label(goal);
+    let desired_rank = goal
         .constraints
-        .result_kind
-        .clone()
-        .unwrap_or(VisibleResultKind::Video);
-    let desired_rank = goal.constraints.rank_within_kind.unwrap_or(1);
+        .rank_within_kind
+        .or(goal.constraints.rank_overall)
+        .unwrap_or(1);
 
-    let matched_item = proposed_step
+    let matched_title = proposed_step
         .target_item_id
         .as_deref()
         .and_then(|item_id| {
             frame
-                .visible_result_items
-                .iter()
-                .find(|item| item.item_id == item_id)
+                .primary_list
+                .as_ref()
+                .and_then(|list| list.items.iter().find(|item| item.item_id == item_id))
+                .and_then(|item| item.title.clone())
+                .or_else(|| {
+                    frame
+                        .visible_result_items
+                        .iter()
+                        .find(|item| item.item_id == item_id)
+                        .and_then(|item| item.title.clone())
+                })
         })
-        .or_else(|| find_ranked_result_match(goal, frame));
-    let matched_title = matched_item.and_then(|item| item.title.as_deref());
+        .or_else(|| {
+            find_primary_list_item_match(goal, frame)
+                .and_then(|item| item.title.clone())
+                .or_else(|| {
+                    find_ranked_result_match(goal, frame).and_then(|item| item.title.clone())
+                })
+        });
+    let matched_title = matched_title.as_deref();
 
     let mut screen_candidates = legacy_result_fallback_candidates(frame);
     screen_candidates.extend(
@@ -1908,7 +2158,7 @@ fn safe_fallback_step_for_open_media(
                     control,
                     goal,
                     frame,
-                    Some(result_kind_label(&desired_kind)),
+                    desired_kind.as_deref(),
                     "planner_actionable_control_fallback",
                     "planner selected actionable control fallback after regionless refinement",
                 )
@@ -1942,7 +2192,7 @@ fn safe_fallback_step_for_open_media(
             .clone()
             .or_else(|| frame.page_evidence.content_provider_hint.clone()),
         rank_hint: Some(desired_rank),
-        result_kind_hint: Some(result_kind_label(&desired_kind).into()),
+        result_kind_hint: desired_kind.clone(),
         allow_recent_reuse: false,
         now_ms: Some(frame.captured_at),
         max_recent_age_ms: 0,
@@ -2092,20 +2342,17 @@ fn target_execution_context_matches_goal(goal: &GoalSpec, frame: &SemanticScreen
         .provider
         .as_deref()
         .map_or(true, |expected| {
-            frame
-                .page_evidence
-                .content_provider_hint
-                .as_deref()
-                .is_some_and(|observed| labels_match(expected, observed))
+            provider_context_compatible(
+                Some(expected),
+                frame.page_evidence.content_provider_hint.as_deref(),
+            )
         });
     if !provider_matches {
         return false;
     }
 
     match goal.goal_type {
-        GoalType::OpenMediaResult => {
-            is_search_results_page(frame) || frame.page_evidence.result_list_visible == Some(true)
-        }
+        GoalType::OpenListItem | GoalType::OpenMediaResult => list_context_visible(frame),
         GoalType::OpenChannel => {
             is_search_results_page(frame)
                 || frame.page_evidence.result_list_visible == Some(true)
@@ -2425,6 +2672,26 @@ fn step_target_confidence_diagnostic(
     if let Some(item_id) = step.target_item_id.as_deref() {
         if let Some(item) = input
             .current_frame
+            .primary_list
+            .as_ref()
+            .and_then(|list| list.items.iter().find(|item| item.item_id == item_id))
+        {
+            let click_region = step
+                .click_region_key
+                .as_deref()
+                .and_then(|key| item.click_regions.get(key));
+            let visible_like = visible_result_item_from_primary_list_item(item);
+            return Some(result_item_confidence_diagnostic(
+                &input.goal,
+                &input.current_frame,
+                &visible_like,
+                click_region,
+                None,
+                None,
+            ));
+        }
+        if let Some(item) = input
+            .current_frame
             .visible_result_items
             .iter()
             .find(|item| item.item_id == item_id)
@@ -2645,17 +2912,17 @@ fn page_matches_goal_context(input: &PlannerContractInput) -> bool {
         .provider
         .as_deref()
         .map_or(true, |expected| {
-            input
-                .current_frame
-                .page_evidence
-                .content_provider_hint
-                .as_deref()
-                .or(input.provider_hint.as_deref())
-                .is_some_and(|observed| labels_match(expected, observed))
+            provider_context_compatible(
+                Some(expected),
+                input
+                    .current_frame
+                    .page_evidence
+                    .content_provider_hint
+                    .as_deref()
+                    .or(input.provider_hint.as_deref()),
+            )
         });
-    provider_matches
-        && (is_search_results_page(&input.current_frame)
-            || input.current_frame.page_evidence.result_list_visible == Some(true))
+    provider_matches && list_context_visible(&input.current_frame)
 }
 
 fn provider_matches_item(
@@ -2669,6 +2936,60 @@ fn provider_matches_item(
             .or(frame_provider)
             .map_or(true, |observed| labels_match(expected, observed))
     })
+}
+
+fn provider_context_compatible(
+    expected_provider: Option<&str>,
+    observed_provider: Option<&str>,
+) -> bool {
+    match (expected_provider, observed_provider) {
+        (Some(expected), Some(observed)) => labels_match(expected, observed),
+        _ => true,
+    }
+}
+
+fn list_context_visible(frame: &SemanticScreenFrame) -> bool {
+    is_search_results_page(frame)
+        || frame.page_evidence.result_list_visible == Some(true)
+        || structural_list_surface_visible(frame)
+        || scene_summary_suggests_results(&frame.scene_summary)
+}
+
+fn requested_item_kind_label(goal: &GoalSpec) -> Option<String> {
+    goal.constraints
+        .item_kind
+        .as_deref()
+        .map(normalize_item_kind_label)
+        .or_else(|| {
+            goal.constraints
+                .result_kind
+                .as_ref()
+                .map(result_kind_label)
+                .map(normalize_item_kind_label)
+        })
+        .or_else(|| matches!(goal.goal_type, GoalType::OpenMediaResult).then_some("video".into()))
+}
+
+fn item_kind_compatibility(
+    requested_kind: Option<&str>,
+    observed_kind: Option<&str>,
+) -> Option<f32> {
+    let Some(requested) = requested_kind.map(normalize_item_kind_label) else {
+        return Some(1.0);
+    };
+    let observed = observed_kind
+        .map(normalize_item_kind_label)
+        .unwrap_or_else(|| "unknown".into());
+    if requested == observed {
+        return Some(1.0);
+    }
+    if matches!(observed.as_str(), "generic" | "result") {
+        return Some(0.94);
+    }
+    if requested == "site" && matches!(observed.as_str(), "article" | "generic" | "result") {
+        return Some(0.94);
+    }
+    None
 }
 
 pub fn validate_model_planner_decision(
@@ -2937,6 +3258,7 @@ fn validate_model_entity_click(
     Ok(accepted_model_decision(decision))
 }
 
+#[allow(dead_code)]
 pub fn goal_for_open_media_result(
     utterance: impl Into<String>,
     provider: Option<String>,
@@ -2948,6 +3270,7 @@ pub fn goal_for_open_media_result(
         goal_type: GoalType::OpenMediaResult,
         constraints: GoalConstraints {
             provider,
+            item_kind: Some(result_kind_label(&result_kind).into()),
             result_kind: Some(result_kind),
             rank_within_kind: Some(rank_within_kind),
             rank_overall: None,
@@ -2960,22 +3283,113 @@ pub fn goal_for_open_media_result(
     }
 }
 
+pub fn goal_for_open_list_item(
+    utterance: impl Into<String>,
+    provider: Option<String>,
+    item_kind: Option<String>,
+    rank_within_kind: Option<u32>,
+    rank_overall: Option<u32>,
+) -> GoalSpec {
+    let normalized_item_kind = item_kind.as_deref().map(normalize_item_kind_label);
+    GoalSpec {
+        goal_id: Uuid::new_v4().to_string(),
+        goal_type: GoalType::OpenListItem,
+        constraints: GoalConstraints {
+            provider,
+            item_kind: normalized_item_kind.clone(),
+            result_kind: normalized_item_kind
+                .as_deref()
+                .map(|kind| result_kind_from_value(Some(kind))),
+            rank_within_kind,
+            rank_overall,
+            entity_name: None,
+            attributes: Value::Null,
+        },
+        success_condition: "list_item_detail_open".into(),
+        utterance: utterance.into(),
+        confidence: 0.86,
+    }
+}
+
 pub fn planner_candidate_from_step(step: &PlannerStep) -> Option<UITargetCandidate> {
     step.executable_candidate.clone()
 }
 
-fn plan_open_media_result(goal: &GoalSpec, frame: &SemanticScreenFrame) -> PlannerStep {
-    let desired_kind = goal
+fn plan_open_list_item(goal: &GoalSpec, frame: &SemanticScreenFrame) -> PlannerStep {
+    let desired_kind = requested_item_kind_label(goal);
+    let desired_rank = goal
         .constraints
-        .result_kind
-        .clone()
-        .unwrap_or(VisibleResultKind::Video);
-    let desired_rank = goal.constraints.rank_within_kind.or(Some(1));
+        .rank_within_kind
+        .or(goal.constraints.rank_overall)
+        .or(Some(1));
     let provider = goal
         .constraints
         .provider
         .clone()
         .or_else(|| frame.page_evidence.content_provider_hint.clone());
+
+    if let Some(item) = find_primary_list_item_match(goal, frame) {
+        let Some((region_key, click_region)) =
+            preferred_primary_click_region(item, &["primary", "title", "thumbnail"])
+        else {
+            let visible_like = visible_result_item_from_primary_list_item(item);
+            let replan_confidence =
+                result_item_confidence_diagnostic(goal, frame, &visible_like, None, None, None)
+                    .semantic_confidence;
+            return PlannerStep {
+                step_id: Uuid::new_v4().to_string(),
+                kind: PlannerStepKind::ReplanAfterPerception,
+                confidence: replan_confidence,
+                rationale: "matching primary list item is visible but needs focused perception before a click region can be trusted".into(),
+                target_item_id: Some(item.item_id.clone()),
+                target_entity_id: None,
+                click_region_key: None,
+                executable_candidate: None,
+                expected_state: Some(goal.success_condition.clone()),
+            };
+        };
+
+        let visible_like = visible_result_item_from_primary_list_item(item);
+        let compatibility =
+            item_kind_compatibility(desired_kind.as_deref(), item.item_kind.as_deref())
+                .unwrap_or(1.0);
+        let confidence_diagnostic = result_item_confidence_diagnostic(
+            goal,
+            frame,
+            &visible_like,
+            Some(click_region),
+            None,
+            None,
+        );
+        let confidence = (confidence_diagnostic.derived_confidence * compatibility).clamp(0.0, 1.0);
+        let candidate = candidate_from_primary_list_item(
+            item,
+            &region_key,
+            click_region,
+            provider,
+            desired_rank,
+            confidence,
+        );
+        return PlannerStep {
+            step_id: Uuid::new_v4().to_string(),
+            kind: if confidence >= MIN_PLANNER_CLICK_CONFIDENCE {
+                PlannerStepKind::ClickResultRegion
+            } else {
+                PlannerStepKind::Refuse
+            },
+            confidence,
+            rationale: format!(
+                "selected primary list item rank {:?} with structural kind {:?} using {region_key} region",
+                desired_rank,
+                item.item_kind
+            ),
+            target_item_id: Some(item.item_id.clone()),
+            target_entity_id: None,
+            click_region_key: Some(region_key),
+            executable_candidate: (confidence >= MIN_PLANNER_CLICK_CONFIDENCE).then_some(candidate),
+            expected_state: Some(goal.success_condition.clone()),
+        };
+    }
 
     let Some(item) = find_ranked_result_match(goal, frame) else {
         return PlannerStep {
@@ -2983,7 +3397,7 @@ fn plan_open_media_result(goal: &GoalSpec, frame: &SemanticScreenFrame) -> Plann
             kind: PlannerStepKind::ReplanAfterPerception,
             confidence: 0.35,
             rationale: format!(
-                "no visible {:?} result with rank {:?} is grounded in the semantic frame",
+                "no visible {:?} list item with rank {:?} is grounded in the semantic frame",
                 desired_kind, desired_rank
             ),
             target_item_id: None,
@@ -3015,7 +3429,10 @@ fn plan_open_media_result(goal: &GoalSpec, frame: &SemanticScreenFrame) -> Plann
 
     let confidence_diagnostic =
         result_item_confidence_diagnostic(goal, frame, item, Some(click_region), None, None);
-    let confidence = confidence_diagnostic.derived_confidence;
+    let compatibility =
+        item_kind_compatibility(desired_kind.as_deref(), Some(result_kind_label(&item.kind)))
+            .unwrap_or(1.0);
+    let confidence = (confidence_diagnostic.derived_confidence * compatibility).clamp(0.0, 1.0);
     let candidate = candidate_from_result_item(
         item,
         &region_key,
@@ -3035,7 +3452,7 @@ fn plan_open_media_result(goal: &GoalSpec, frame: &SemanticScreenFrame) -> Plann
         rationale: format!(
             "selected {:?} result {:?} using {region_key} region",
             item.kind,
-            effective_rank_within_kind(frame, item, desired_kind.clone()).or(item.rank_overall)
+            effective_rank_for_goal(frame, item, desired_kind.as_deref()).or(item.rank_overall)
         ),
         target_item_id: Some(item.item_id.clone()),
         target_entity_id: None,
@@ -3301,7 +3718,7 @@ fn candidate_from_result_item(
         browser_app_hint: None,
         provider_hint: provider.clone().or_else(|| item.provider.clone()),
         content_provider_hint: provider.or_else(|| item.provider.clone()),
-        page_kind_hint: Some("search_results".into()),
+        page_kind_hint: Some("result_list".into()),
         capture_backend: None,
         observation_source: Some("planner_semantic_frame".into()),
         result_kind: Some(result_kind_label(&item.kind).into()),
@@ -3316,6 +3733,60 @@ fn candidate_from_result_item(
         supports_focus: false,
         supports_click: true,
         rationale: format!("planner selected semantic {:?} result", item.kind),
+    }
+}
+
+fn candidate_from_primary_list_item(
+    item: &PrimaryListItem,
+    region_key: &str,
+    click_region: &ClickRegion,
+    provider: Option<String>,
+    requested_rank: Option<u32>,
+    confidence: f32,
+) -> UITargetCandidate {
+    UITargetCandidate {
+        candidate_id: format!("planner_primary_list_{}_{}", item.item_id, region_key),
+        role: UITargetRole::RankedResult,
+        region: Some(click_region.region.clone()),
+        center_x: None,
+        center_y: None,
+        app_hint: None,
+        browser_app_hint: None,
+        provider_hint: provider.clone(),
+        content_provider_hint: provider,
+        page_kind_hint: Some("result_list".into()),
+        capture_backend: None,
+        observation_source: Some("planner_primary_list".into()),
+        result_kind: item.item_kind.clone().or_else(|| Some("generic".into())),
+        confidence,
+        source: TargetGroundingSource::ScreenAnalysis,
+        label: item.title.clone(),
+        rank: requested_rank.or(Some(item.rank)),
+        observed_at_ms: None,
+        reuse_eligible: true,
+        supports_focus: false,
+        supports_click: true,
+        rationale: format!(
+            "planner selected provider-agnostic primary list item rank {}",
+            item.rank
+        ),
+    }
+}
+
+fn visible_result_item_from_primary_list_item(item: &PrimaryListItem) -> VisibleResultItem {
+    VisibleResultItem {
+        item_id: item.item_id.clone(),
+        kind: result_kind_from_value(item.item_kind.as_deref()),
+        title: item.title.clone(),
+        channel_name: None,
+        provider: None,
+        rank_overall: Some(item.rank),
+        rank_within_kind: Some(item.rank),
+        click_regions: item.click_regions.clone(),
+        raw_confidence: item.raw_confidence,
+        confidence: item.confidence,
+        rationale: Some("primary_list_structural_item".into()),
+        attributes: item.attributes.clone(),
     }
 }
 
@@ -3367,6 +3838,21 @@ fn preferred_click_region<'a>(
         .map(|(key, region)| (key.clone(), region))
 }
 
+fn preferred_primary_click_region<'a>(
+    item: &'a PrimaryListItem,
+    keys: &[&str],
+) -> Option<(String, &'a ClickRegion)> {
+    for key in keys {
+        if let Some(region) = item.click_regions.get(*key) {
+            return Some(((*key).to_string(), region));
+        }
+    }
+    item.click_regions
+        .iter()
+        .next()
+        .map(|(key, region)| (key.clone(), region))
+}
+
 #[allow(dead_code)]
 fn step_is_executable(step: &PlannerStep, min_confidence: f32) -> bool {
     matches!(
@@ -3382,9 +3868,10 @@ fn step_is_executable(step: &PlannerStep, min_confidence: f32) -> bool {
 #[allow(dead_code)]
 fn strategy_for_step(goal: &GoalSpec, step: &PlannerStep) -> String {
     match (&goal.goal_type, &step.kind) {
-        (GoalType::OpenMediaResult, PlannerStepKind::ClickResultRegion) => {
-            "youtube_open_first_visible_media_result".into()
-        }
+        (
+            GoalType::OpenListItem | GoalType::OpenMediaResult,
+            PlannerStepKind::ClickResultRegion,
+        ) => "open_visible_list_item".into(),
         (GoalType::OpenChannel, PlannerStepKind::ClickEntityRegion)
             if step.expected_state.as_deref() == Some("channel_page_visible") =>
         {
@@ -3509,11 +3996,22 @@ fn target_region_anchor_for_step(
         .as_deref()
         .and_then(|item_id| {
             frame
-                .visible_result_items
-                .iter()
-                .find(|item| item.item_id == item_id)
+                .primary_list
+                .as_ref()
+                .and_then(|list| {
+                    list.items
+                        .iter()
+                        .find(|item| item.item_id == item_id)
+                        .and_then(primary_item_region)
+                })
+                .or_else(|| {
+                    frame
+                        .visible_result_items
+                        .iter()
+                        .find(|item| item.item_id == item_id)
+                        .and_then(result_item_region)
+                })
         })
-        .and_then(result_item_region)
         .or_else(|| {
             step.target_entity_id.as_deref().and_then(|entity_id| {
                 frame
@@ -3540,9 +4038,33 @@ fn result_item_region(item: &VisibleResultItem) -> Option<TargetRegion> {
         })
 }
 
+fn primary_item_region(item: &PrimaryListItem) -> Option<TargetRegion> {
+    item.click_regions
+        .values()
+        .next()
+        .map(|click_region| click_region.region.clone())
+        .or_else(|| {
+            item.attributes
+                .get("region")
+                .or_else(|| item.attributes.get("bounding_region"))
+                .or_else(|| item.attributes.get("bounds"))
+                .and_then(parse_region)
+        })
+}
+
 fn visible_cluster_region(frame: &SemanticScreenFrame) -> Option<TargetRegion> {
     let mut regions = Vec::new();
 
+    if let Some(primary_list) = frame.primary_list.as_ref() {
+        for item in &primary_list.items {
+            if let Some(region) = primary_item_region(item) {
+                regions.push(region);
+            }
+            if regions.len() >= 4 {
+                break;
+            }
+        }
+    }
     for item in &frame.visible_result_items {
         if let Some(region) = result_item_region(item) {
             regions.push(region);
@@ -3697,13 +4219,44 @@ fn frame_progress_signature(frame: &SemanticScreenFrame) -> String {
         })
         .collect::<Vec<_>>()
         .join("|");
+    let primary = frame
+        .primary_list
+        .as_ref()
+        .map(|list| {
+            list.items
+                .iter()
+                .take(5)
+                .map(|item| {
+                    format!(
+                        "{}:{}:{}",
+                        item.item_id,
+                        item.item_kind.as_deref().unwrap_or("unknown"),
+                        item.rank
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .unwrap_or_default();
+    let page_state = frame
+        .page_state
+        .as_ref()
+        .map(|state| {
+            format!(
+                "{}:{}:{:?}:{:?}",
+                state.kind, state.dominant_content, state.list_visible, state.detail_visible
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{:?}|{:?}|{}|{}|{}",
+        "{:?}|{:?}|{}|{}|{}|{}|{}",
         frame.page_evidence.content_provider_hint,
         frame.page_evidence.page_kind_hint,
         results,
         entities,
-        controls
+        controls,
+        primary,
+        page_state
     )
 }
 
@@ -3717,18 +4270,148 @@ fn browser_recovery_reason_for_execution(execution: &PlannerStepExecutionRecord)
     })
 }
 
+fn evaluate_post_click_frame(
+    goal: &GoalSpec,
+    pending: &PendingPostClickVerification,
+    frame: &SemanticScreenFrame,
+) -> PostClickVerificationOutcome {
+    let structural_transition_achieved = matches!(
+        goal.goal_type,
+        GoalType::OpenListItem | GoalType::OpenMediaResult
+    ) && pending.pre_click_list_surface_visible
+        && matches!(
+            structural_open_list_item_state(goal, frame),
+            OpenListItemVerificationState::Achieved(_)
+        );
+    let goal_achieved =
+        verify_goal_against_frame(goal, frame).is_some() || structural_transition_achieved;
+    let frame_unchanged = frame_progress_signature(frame) == pending.pre_click_frame_signature;
+    let browser_surface_suspect = !goal_achieved
+        && goal.constraints.provider.is_some()
+        && verify_browser_handoff_page(goal, frame).is_err();
+
+    PostClickVerificationOutcome {
+        goal_achieved,
+        progress_observed: goal_achieved || !frame_unchanged,
+        frame_unchanged,
+        browser_surface_suspect,
+    }
+}
+
 fn is_watch_page(frame: &SemanticScreenFrame) -> bool {
-    browser_page_semantic_kind(frame.page_evidence.page_kind_hint.as_deref())
-        == BrowserPageSemanticKind::WatchPage
+    browser_page_semantic_kind_for_frame(frame) == BrowserPageSemanticKind::WatchPage
 }
 
 #[allow(dead_code)]
 fn is_search_results_page(frame: &SemanticScreenFrame) -> bool {
-    browser_page_semantic_kind(frame.page_evidence.page_kind_hint.as_deref())
-        == BrowserPageSemanticKind::SearchResults
+    browser_page_semantic_kind_for_frame(frame) == BrowserPageSemanticKind::SearchResults
 }
 
-fn browser_page_semantic_kind(value: Option<&str>) -> BrowserPageSemanticKind {
+fn structural_list_surface_visible(frame: &SemanticScreenFrame) -> bool {
+    if let Some(state) = frame.page_state.as_ref() {
+        return state.list_visible == Some(true)
+            || state.kind == "list"
+            || state.dominant_content == "result_list";
+    }
+
+    frame
+        .primary_list
+        .as_ref()
+        .is_some_and(|list| !list.items.is_empty())
+        || frame.page_evidence.result_list_visible == Some(true)
+        || !frame.visible_result_items.is_empty()
+}
+
+fn structural_detail_surface_visible(frame: &SemanticScreenFrame) -> bool {
+    frame.page_state.as_ref().is_some_and(|state| {
+        state.detail_visible == Some(true)
+            || matches!(state.kind.as_str(), "detail" | "player")
+            || matches!(
+                state.dominant_content.as_str(),
+                "detail_view" | "video_player" | "article" | "product_detail"
+            )
+    })
+}
+
+fn structural_detail_surface_dominant(frame: &SemanticScreenFrame) -> bool {
+    frame.page_state.as_ref().is_some_and(|state| {
+        matches!(state.kind.as_str(), "detail" | "player")
+            || matches!(
+                state.dominant_content.as_str(),
+                "detail_view" | "video_player" | "article" | "product_detail"
+            )
+    })
+}
+
+fn structural_open_list_item_state(
+    goal: &GoalSpec,
+    frame: &SemanticScreenFrame,
+) -> OpenListItemVerificationState {
+    if !provider_context_compatible(
+        goal.constraints.provider.as_deref(),
+        frame.page_evidence.content_provider_hint.as_deref(),
+    ) {
+        return OpenListItemVerificationState::NotAchieved;
+    }
+
+    if frame.page_state.is_some() {
+        let list_visible = structural_list_surface_visible(frame);
+        let detail_visible = structural_detail_surface_visible(frame);
+        let detail_dominant = structural_detail_surface_dominant(frame);
+        if detail_dominant && !list_visible {
+            return OpenListItemVerificationState::Achieved(
+                "list_to_detail_structural_transition_visible",
+            );
+        }
+        if detail_dominant && detail_visible && list_visible {
+            return OpenListItemVerificationState::Ambiguous(
+                "detail_surface_visible_but_list_still_visible",
+            );
+        }
+        return OpenListItemVerificationState::NotAchieved;
+    }
+
+    if is_watch_page(frame) {
+        return OpenListItemVerificationState::Achieved("media_watch_page_visible");
+    }
+
+    let requested_kind = requested_item_kind_label(goal);
+    let generic_web_target = requested_kind.as_deref().map_or(true, |kind| {
+        matches!(kind, "site" | "article" | "product" | "generic" | "result")
+    });
+    if generic_web_target
+        && browser_page_semantic_kind_for_frame(frame) == BrowserPageSemanticKind::WebPage
+        && frame.page_evidence.result_list_visible != Some(true)
+        && frame.visible_result_items.is_empty()
+        && frame
+            .primary_list
+            .as_ref()
+            .map_or(true, |list| list.items.is_empty())
+    {
+        return OpenListItemVerificationState::Achieved("generic_web_detail_page_visible");
+    }
+
+    OpenListItemVerificationState::NotAchieved
+}
+
+fn is_channel_page(frame: &SemanticScreenFrame) -> bool {
+    frame
+        .page_evidence
+        .page_kind_hint
+        .as_deref()
+        .is_some_and(|kind| {
+            matches!(
+                normalize_label(kind).as_str(),
+                "channel_page" | "profile_page" | "youtube_channel"
+            )
+        })
+}
+
+fn browser_page_semantic_kind_for_frame(frame: &SemanticScreenFrame) -> BrowserPageSemanticKind {
+    browser_page_semantic_kind(frame.page_evidence.page_kind_hint.as_deref())
+}
+
+pub(crate) fn browser_page_semantic_kind(value: Option<&str>) -> BrowserPageSemanticKind {
     match value.map(normalize_label).as_deref() {
         Some(
             "search_results"
@@ -3737,12 +4420,15 @@ fn browser_page_semantic_kind(value: Option<&str>) -> BrowserPageSemanticKind {
             | "result_page"
             | "youtube_results"
             | "results"
+            | "search"
+            | "search_page"
             | "result_list"
             | "result",
         ) => BrowserPageSemanticKind::SearchResults,
-        Some("watch_page" | "video_page" | "youtube_watch" | "detail_page") => {
-            BrowserPageSemanticKind::WatchPage
-        }
+        Some(
+            "watch_page" | "video_page" | "youtube_watch" | "detail_page" | "watch" | "video"
+            | "video_watch" | "player" | "media_page",
+        ) => BrowserPageSemanticKind::WatchPage,
         Some("web_page" | "page") => BrowserPageSemanticKind::WebPage,
         _ => BrowserPageSemanticKind::Unknown,
     }
@@ -3843,6 +4529,144 @@ fn parse_visible_result_items(value: Option<&Value>) -> Vec<VisibleResultItem> {
         .enumerate()
         .filter_map(|(index, value)| parse_visible_result_item(value, index))
         .collect()
+}
+
+fn parse_primary_list(value: Option<&Value>) -> (Option<PrimaryList>, Vec<FrameUncertainty>) {
+    let mut uncertainty = Vec::new();
+    let Some(object) = value.and_then(Value::as_object) else {
+        return (None, uncertainty);
+    };
+
+    let raw_container_kind = object
+        .get("container_kind")
+        .or_else(|| object.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("result_list");
+    let container_kind = normalize_structural_list_kind(raw_container_kind);
+    let raw_confidence = parse_optional_confidence(object.get("confidence"));
+    let items_value = object.get("items").and_then(Value::as_array);
+    let mut malformed_items = 0usize;
+    let items = items_value
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            parse_primary_list_item(value, index).or_else(|| {
+                malformed_items += 1;
+                None
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if malformed_items > 0 {
+        uncertainty.push(FrameUncertainty {
+            code: "primary_list_malformed_items_discarded".into(),
+            message: format!(
+                "{malformed_items} malformed primary_list item(s) were discarded; existing result-item fallback remains available"
+            ),
+            severity: "info".into(),
+        });
+    }
+    if items.is_empty() {
+        uncertainty.push(FrameUncertainty {
+            code: "primary_list_unusable_fallback_to_visible_result_items".into(),
+            message: "primary_list was absent or had no structurally valid items; falling back to visible_result_items and legacy page-kind evidence".into(),
+            severity: "info".into(),
+        });
+        return (None, uncertainty);
+    }
+
+    let item_count = object
+        .get("item_count")
+        .and_then(Value::as_u64)
+        .map(|value| value as u32)
+        .unwrap_or(items.len() as u32)
+        .max(items.len() as u32);
+
+    (
+        Some(PrimaryList {
+            cluster_id: object
+                .get("cluster_id")
+                .or_else(|| object.get("id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| "primary_list".into()),
+            container_kind,
+            item_count,
+            items,
+            raw_confidence,
+            confidence: raw_confidence.unwrap_or(0.0),
+        }),
+        uncertainty,
+    )
+}
+
+fn parse_primary_list_item(value: &Value, index: usize) -> Option<PrimaryListItem> {
+    let object = value.as_object()?;
+    let rank = object
+        .get("rank")
+        .or_else(|| object.get("rank_overall"))
+        .or_else(|| object.get("position"))
+        .and_then(Value::as_u64)
+        .filter(|rank| *rank > 0)
+        .map(|rank| rank as u32)
+        .unwrap_or((index + 1) as u32);
+    let raw_confidence = parse_optional_confidence(object.get("confidence"));
+    let click_regions_value = object.get("click_regions");
+    let click_regions = parse_click_regions(click_regions_value, raw_confidence);
+    if click_regions_value.is_some() && click_regions.is_empty() {
+        return None;
+    }
+
+    Some(PrimaryListItem {
+        item_id: object
+            .get("item_id")
+            .or_else(|| object.get("id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("primary_item_{}", index + 1)),
+        rank,
+        title: object
+            .get("title")
+            .or_else(|| object.get("name"))
+            .or_else(|| object.get("label"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        item_kind: object
+            .get("item_kind")
+            .or_else(|| object.get("kind"))
+            .or_else(|| object.get("result_kind"))
+            .and_then(Value::as_str)
+            .map(normalize_item_kind_label),
+        is_sponsored: object.get("is_sponsored").and_then(Value::as_bool),
+        raw_confidence,
+        confidence: raw_confidence.unwrap_or(0.0),
+        click_regions,
+        attributes: object.get("attributes").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn parse_page_state(value: Option<&Value>) -> Option<PageState> {
+    let object = value?.as_object()?;
+    Some(PageState {
+        kind: normalize_page_state_kind(
+            object
+                .get("kind")
+                .or_else(|| object.get("page_kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        ),
+        dominant_content: normalize_dominant_content_kind(
+            object
+                .get("dominant_content")
+                .or_else(|| object.get("dominant_surface"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        ),
+        list_visible: object.get("list_visible").and_then(Value::as_bool),
+        detail_visible: object.get("detail_visible").and_then(Value::as_bool),
+        confidence: parse_optional_confidence(object.get("confidence")),
+    })
 }
 
 fn parse_visible_result_item(value: &Value, index: usize) -> Option<VisibleResultItem> {
@@ -4085,7 +4909,16 @@ fn parse_region(value: &Value) -> Option<TargetRegion> {
             .unwrap_or("screen")
             .to_string(),
     })
-    .filter(|region| region.width > 0.0 && region.height > 0.0)
+    .filter(|region| {
+        region.x.is_finite()
+            && region.y.is_finite()
+            && region.width.is_finite()
+            && region.height.is_finite()
+            && region.x >= 0.0
+            && region.y >= 0.0
+            && region.width > 0.0
+            && region.height > 0.0
+    })
 }
 
 fn result_kind_from_value(value: Option<&str>) -> VisibleResultKind {
@@ -4099,6 +4932,61 @@ fn result_kind_from_value(value: Option<&str>) -> VisibleResultKind {
         Some("repository") | Some("repo") => VisibleResultKind::Repository,
         Some("generic") | Some("result") | Some("search_result") => VisibleResultKind::Generic,
         _ => VisibleResultKind::Unknown,
+    }
+}
+
+fn normalize_item_kind_label(value: &str) -> String {
+    match normalize_label(value).as_str() {
+        "video_result" | "media" => "video".into(),
+        "article_result" | "article_link" => "article".into(),
+        "product_result" | "product_card" => "product".into(),
+        "site_result" | "website" | "web_page" | "link" | "url" => "site".into(),
+        "channel_result" => "channel".into(),
+        "search_result" | "ranked_result" | "result" => "generic".into(),
+        "youtube" | "google" | "amazon" | "github" => "generic".into(),
+        other if other.is_empty() => "generic".into(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_structural_list_kind(value: &str) -> String {
+    match normalize_label(value).as_str() {
+        "result_list" | "results_list" | "ranked_list" | "list" | "search_results" => {
+            "result_list".into()
+        }
+        "youtube" | "google" | "amazon" | "github" => "result_list".into(),
+        _ => "result_list".into(),
+    }
+}
+
+fn normalize_page_state_kind(value: &str) -> String {
+    match normalize_label(value).as_str() {
+        "list" | "results" | "result_list" | "search_results" | "search" => "list".into(),
+        "detail" | "details" | "detail_page" | "web_page" | "article_page" | "product_page" => {
+            "detail".into()
+        }
+        "player" | "watch" | "watch_page" | "video" | "video_page" | "media_page" => {
+            "player".into()
+        }
+        "form" | "input_form" => "form".into(),
+        "mixed" | "split" => "mixed".into(),
+        "youtube" | "google" | "amazon" | "github" => "unknown".into(),
+        _ => "unknown".into(),
+    }
+}
+
+fn normalize_dominant_content_kind(value: &str) -> String {
+    match normalize_label(value).as_str() {
+        "result_list" | "results" | "results_list" | "search_results" | "search" | "list" => {
+            "result_list".into()
+        }
+        "detail" | "details" | "detail_view" | "web_page" => "detail_view".into(),
+        "video_player" | "player" | "watch" | "watch_page" | "video" => "video_player".into(),
+        "article" | "article_page" => "article".into(),
+        "product" | "product_detail" | "product_page" => "product_detail".into(),
+        "generic" => "generic".into(),
+        "youtube" | "google" | "amazon" | "github" => "unknown".into(),
+        _ => "unknown".into(),
     }
 }
 
@@ -4214,6 +5102,7 @@ mod tests {
             goal_type: GoalType::OpenChannel,
             constraints: GoalConstraints {
                 provider: Some("youtube".into()),
+                item_kind: None,
                 result_kind: None,
                 rank_within_kind: None,
                 rank_overall: None,
@@ -4281,6 +5170,332 @@ mod tests {
         .expect("watch frame")
     }
 
+    fn open_list_item_goal(
+        utterance: &str,
+        provider: Option<&str>,
+        item_kind: Option<&str>,
+        rank_within_kind: Option<u32>,
+        rank_overall: Option<u32>,
+    ) -> GoalSpec {
+        goal_for_open_list_item(
+            utterance,
+            provider.map(ToOwned::to_owned),
+            item_kind.map(ToOwned::to_owned),
+            rank_within_kind,
+            rank_overall,
+        )
+    }
+
+    #[test]
+    fn open_list_item_grounds_second_video_from_primary_list_without_page_kind_label() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "youtube",
+                    "confidence": 0.90
+                },
+                "scene_summary": "main area shows ranked playable items",
+                "page_state": {
+                    "kind": "list",
+                    "dominant_content": "result_list",
+                    "list_visible": true,
+                    "detail_visible": false
+                },
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 2,
+                    "items": [
+                        {
+                            "item_id": "first",
+                            "rank": 1,
+                            "title": "First item",
+                            "item_kind": "generic",
+                            "click_regions": {
+                                "primary": {"x": 20, "y": 40, "width": 200, "height": 80, "coordinate_space": "screen"}
+                            },
+                            "confidence": 0.95
+                        },
+                        {
+                            "item_id": "second",
+                            "rank": 2,
+                            "title": "Second item",
+                            "item_kind": "generic",
+                            "click_regions": {
+                                "primary": {"x": 20, "y": 140, "width": 200, "height": 80, "coordinate_space": "screen"}
+                            },
+                            "confidence": 0.95
+                        }
+                    ]
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = open_list_item_goal(
+            "aprimi il secondo video",
+            Some("youtube"),
+            Some("video"),
+            Some(2),
+            None,
+        );
+
+        let step = plan_next_step(&goal, &frame);
+
+        assert_eq!(step.kind, PlannerStepKind::ClickResultRegion);
+        assert_eq!(step.target_item_id.as_deref(), Some("second"));
+        assert_eq!(
+            step.executable_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.result_kind.as_deref()),
+            Some("generic")
+        );
+        assert!(step.confidence >= MIN_PLANNER_CLICK_CONFIDENCE);
+    }
+
+    #[test]
+    fn open_list_item_grounds_first_site_from_generic_results_surface() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {"page_kind_hint": "search", "confidence": 0.88},
+                "scene_summary": "search results are visible as a ranked list",
+                "page_state": {
+                    "kind": "list",
+                    "dominant_content": "result_list",
+                    "list_visible": true,
+                    "detail_visible": false
+                },
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 1,
+                    "items": [{
+                        "item_id": "site_1",
+                        "rank": 1,
+                        "title": "Example site",
+                        "item_kind": "site",
+                        "click_regions": {
+                            "primary": {"x": 100, "y": 120, "width": 360, "height": 42, "coordinate_space": "screen"}
+                        },
+                        "confidence": 0.96
+                    }]
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = open_list_item_goal("aprimi il primo sito", None, Some("site"), Some(1), None);
+
+        let step = plan_next_step(&goal, &frame);
+
+        assert_eq!(step.kind, PlannerStepKind::ClickResultRegion);
+        assert_eq!(step.target_item_id.as_deref(), Some("site_1"));
+        assert_eq!(
+            step.executable_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.result_kind.as_deref()),
+            Some("site")
+        );
+    }
+
+    #[test]
+    fn open_list_item_success_uses_structural_list_to_detail_state() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {"confidence": 0.83},
+                "scene_summary": "a detail page is visible",
+                "page_state": {
+                    "kind": "detail",
+                    "dominant_content": "detail_view",
+                    "list_visible": false,
+                    "detail_visible": true
+                }
+            }),
+            2_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = open_list_item_goal("open the first result", None, None, None, Some(1));
+
+        let verification = verify_goal_state(&goal, &frame, 1);
+
+        assert_eq!(verification.status, GoalVerificationStatus::GoalAchieved);
+        assert_eq!(
+            verification.reason,
+            "list_to_detail_structural_transition_visible"
+        );
+    }
+
+    #[test]
+    fn open_list_item_falls_back_to_legacy_visible_result_items_when_primary_list_missing() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {"page_kind_hint": "search_results", "result_list_visible": true, "confidence": 0.91},
+                "scene_summary": "results visible",
+                "visible_result_items": [{
+                    "item_id": "legacy_1",
+                    "kind": "generic",
+                    "title": "Legacy result",
+                    "rank_overall": 1,
+                    "click_regions": {
+                        "title": {"x": 30, "y": 80, "width": 240, "height": 50, "coordinate_space": "screen"}
+                    },
+                    "confidence": 0.94
+                }]
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = open_list_item_goal("open the first result", None, None, None, Some(1));
+
+        let step = plan_next_step(&goal, &frame);
+
+        assert_eq!(step.kind, PlannerStepKind::ClickResultRegion);
+        assert_eq!(step.target_item_id.as_deref(), Some("legacy_1"));
+    }
+
+    #[test]
+    fn browser_handoff_accepts_primary_list_context_without_search_results_label() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {"content_provider_hint": "youtube", "page_kind_hint": "youtube", "confidence": 0.89},
+                "scene_summary": "a ranked list of items is visible",
+                "page_state": {"kind": "list", "dominant_content": "result_list", "list_visible": true},
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 1,
+                    "items": [{
+                        "item_id": "item_1",
+                        "rank": 1,
+                        "title": "Visible item",
+                        "item_kind": "generic",
+                        "click_regions": {
+                            "primary": {"x": 10, "y": 20, "width": 120, "height": 50, "coordinate_space": "screen"}
+                        },
+                        "confidence": 0.9
+                    }]
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+
+        let diagnostic = verify_browser_handoff_page(&goal, &frame).expect("handoff accepted");
+
+        assert!(diagnostic.accepted);
+        assert_eq!(
+            diagnostic.decision,
+            BrowserHandoffVerificationDecision::SupportingEvidence
+        );
+        assert_eq!(diagnostic.primary_list_item_count, 1);
+        assert!(diagnostic.structural_list_surface_visible);
+    }
+
+    #[test]
+    fn malformed_primary_list_items_are_discarded_and_valid_items_remain() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {"confidence": 0.8},
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 2,
+                    "items": [
+                        {
+                            "item_id": "bad",
+                            "rank": 1,
+                            "item_kind": "generic",
+                            "click_regions": {
+                                "primary": {"x": 0, "y": 0, "width": 0, "height": 40, "coordinate_space": "screen"}
+                            },
+                            "confidence": 0.9
+                        },
+                        {
+                            "item_id": "good",
+                            "rank": 2,
+                            "item_kind": "generic",
+                            "click_regions": {
+                                "primary": {"x": 20, "y": 60, "width": 200, "height": 40, "coordinate_space": "screen"}
+                            },
+                            "confidence": 0.9
+                        }
+                    ]
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+
+        let list = frame.primary_list.expect("primary list");
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.items[0].item_id, "good");
+        assert!(frame
+            .uncertainty
+            .iter()
+            .any(|entry| entry.code == "primary_list_malformed_items_discarded"));
+    }
+
+    #[test]
+    fn low_confidence_primary_list_item_refuses_instead_of_blind_clicking() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {"confidence": 0.20},
+                "page_state": {"kind": "list", "dominant_content": "result_list", "list_visible": true},
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 1,
+                    "items": [{
+                        "item_id": "weak",
+                        "rank": 1,
+                        "item_kind": "video",
+                        "click_regions": {
+                            "primary": {"x": 20, "y": 60, "width": 200, "height": 40, "coordinate_space": "screen", "confidence": 0.2}
+                        },
+                        "confidence": 0.2
+                    }]
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = open_list_item_goal("aprimi il primo video", None, Some("video"), Some(1), None);
+
+        let step = plan_next_step(&goal, &frame);
+
+        assert_eq!(step.kind, PlannerStepKind::Refuse);
+        assert!(step.executable_candidate.is_none());
+    }
+
     struct MockGoalLoopDriver {
         frames: Vec<SemanticScreenFrame>,
         focused_frames: Vec<SemanticScreenFrame>,
@@ -4289,6 +5504,7 @@ mod tests {
         perceive_fresh_requests: Vec<bool>,
         handoff: Option<BrowserVisualHandoffResult>,
         recovery: Option<BrowserVisualHandoffResult>,
+        recovery_attempts: usize,
     }
 
     impl MockGoalLoopDriver {
@@ -4301,6 +5517,7 @@ mod tests {
                 perceive_fresh_requests: Vec::new(),
                 handoff: None,
                 recovery: None,
+                recovery_attempts: 0,
             }
         }
     }
@@ -4368,7 +5585,10 @@ mod tests {
             _iteration: usize,
             _reason: &'a str,
         ) -> GoalLoopDriverFuture<'a, Result<Option<BrowserVisualHandoffResult>, String>> {
-            Box::pin(async move { Ok(self.recovery.take()) })
+            Box::pin(async move {
+                self.recovery_attempts += 1;
+                Ok(self.recovery.take())
+            })
         }
     }
 
@@ -4556,6 +5776,46 @@ mod tests {
     }
 
     #[test]
+    fn watch_page_aliases_normalize_to_watch_page() {
+        for alias in ["watch", "video", "video_watch", "player", "media_page"] {
+            assert_eq!(
+                browser_page_semantic_kind(Some(alias)),
+                BrowserPageSemanticKind::WatchPage,
+                "alias `{alias}` should normalize to watch_page"
+            );
+        }
+    }
+
+    #[test]
+    fn verifier_accepts_watch_alias_through_centralized_normalization() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "player",
+                    "confidence": 0.91
+                }
+            }),
+            2_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = goal_for_open_media_result(
+            "open first video",
+            Some("youtube".into()),
+            VisibleResultKind::Video,
+            1,
+        );
+
+        assert_eq!(
+            verify_goal_against_frame(&goal, &frame).as_deref(),
+            Some("media_watch_page_visible")
+        );
+    }
+
+    #[test]
     fn planner_selects_visible_channel_entity_when_available() {
         let frame = semantic_frame_from_vision_value(
             &json!({
@@ -4583,6 +5843,7 @@ mod tests {
             goal_type: GoalType::OpenChannel,
             constraints: GoalConstraints {
                 provider: Some("youtube".into()),
+                item_kind: None,
                 result_kind: None,
                 rank_within_kind: None,
                 rank_overall: None,
@@ -4679,6 +5940,63 @@ mod tests {
         assert!(run.stale_capture_reuse_prevented);
         assert!(run.executed_steps[0].fresh_capture_required);
         assert!(run.executed_steps[0].fresh_capture_used);
+    }
+
+    #[tokio::test]
+    async fn watch_alias_after_click_is_verified_before_browser_recovery() {
+        let goal = goal_for_open_media_result(
+            "aprimi il primo video",
+            Some("youtube".into()),
+            VisibleResultKind::Video,
+            1,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![
+            youtube_search_frame("search_1", 1_000, "Shiva"),
+            semantic_frame_from_vision_value(
+                &json!({
+                    "page_evidence": {
+                        "content_provider_hint": "youtube",
+                        "page_kind_hint": "video_watch",
+                        "confidence": 0.93
+                    }
+                }),
+                2_000,
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("watch alias frame"),
+        ]);
+        driver.recovery = Some(BrowserVisualHandoffResult {
+            record: BrowserVisualHandoffRecord {
+                iteration: 1,
+                status: BrowserHandoffStatus::VisuallyVerified,
+                activation_status:
+                    crate::desktop_agent_types::BrowserHandoffActivationStatus::Executed,
+                failure_reason: None,
+                app_hint: Some("browser".into()),
+                provider_hint: Some("youtube".into()),
+                page_kind_hint: Some("watch_page".into()),
+                verification: None,
+                activation_attempted: true,
+                page_verified: true,
+                frame_id: Some("recovery_watch".into()),
+                confidence: Some(0.92),
+                attempts: 1,
+                reason: Some("should not be used".into()),
+            },
+            verified_frame: Some(youtube_watch_frame("recovery_watch", 3_000)),
+        });
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(run.status, GoalLoopStatus::GoalAchieved);
+        assert_eq!(driver.recovery_attempts, 0);
+        assert!(!run.browser_recovery_used);
+        assert!(run.post_action_progress_observed);
     }
 
     #[tokio::test]
@@ -4986,6 +6304,92 @@ mod tests {
     }
 
     #[test]
+    fn browser_handoff_page_verification_accepts_generic_provider_label_with_strong_results_evidence(
+    ) {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "youtube",
+                    "query_hint": "shiva",
+                    "confidence": 0.9
+                },
+                "scene_summary": "YouTube search results are visible for Shiva",
+                "visible_result_items": [{
+                    "item_id": "video_1",
+                    "kind": "video",
+                    "title": "Shiva - official video",
+                    "rank_within_kind": 1,
+                    "click_regions": {"title": {"x": 420, "y": 220, "width": 360, "height": 40, "coordinate_space": "screen"}},
+                    "confidence": 0.93
+                }]
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = goal_for_open_media_result(
+            "aprimi il secondo video",
+            Some("youtube".into()),
+            VisibleResultKind::Video,
+            2,
+        );
+
+        let verification = verify_browser_handoff_page(&goal, &frame).expect("verification");
+
+        assert!(verification.accepted);
+        assert_eq!(
+            verification.decision,
+            BrowserHandoffVerificationDecision::SupportingEvidence
+        );
+        assert!(verification.generic_provider_page_kind_hint);
+        assert!(verification.goal_expects_results_context);
+        assert!(verification
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("generic provider page kind"));
+    }
+
+    #[test]
+    fn browser_handoff_page_verification_rejects_generic_provider_label_without_strong_results_evidence(
+    ) {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "youtube",
+                    "confidence": 0.88
+                },
+                "scene_summary": "YouTube home page is visible"
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = goal_for_open_media_result(
+            "aprimi il secondo video",
+            Some("youtube".into()),
+            VisibleResultKind::Video,
+            2,
+        );
+
+        let verification = verify_browser_handoff_page(&goal, &frame)
+            .expect_err("generic provider label should need stronger evidence");
+
+        assert!(verification.generic_provider_page_kind_hint);
+        assert!(verification
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("supporting evidence was not strong enough"));
+    }
+
+    #[test]
     fn browser_handoff_verification_preserves_provider_backend_separation() {
         let frame = semantic_frame_from_vision_value(
             &json!({
@@ -5275,7 +6679,7 @@ mod tests {
             1,
         );
         let planner_input = planner_contract_input(&goal, &frame, &[], &[], 3, 0);
-        let step = plan_open_media_result(&goal, &frame);
+        let step = plan_open_list_item(&goal, &frame);
 
         let request = focused_perception_request_for_step(
             &goal,

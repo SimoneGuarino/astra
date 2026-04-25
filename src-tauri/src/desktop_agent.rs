@@ -11,10 +11,10 @@ use crate::{
         BrowserHandoffVerificationDiagnostic, BrowserVisualHandoffRecord,
         BrowserVisualHandoffResult, CapabilityManifest, DesktopActionRequest,
         DesktopActionResponse, DesktopActionStatus, DesktopAuditEvent, GoalConstraints,
-        GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, PendingApproval, PlannerContractDecision,
-        PlannerContractInput, PlannerStep, PlannerStepExecutionRecord, PlannerStepExecutionStatus,
-        PlannerStepKind, ScreenAnalysisRequest, ScreenAnalysisResult, ScreenCaptureResult,
-        ScreenObservationStatus, SemanticScreenFrame, VisibleResultKind,
+        GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus, PendingApproval,
+        PlannerContractDecision, PlannerContractInput, PlannerStep, PlannerStepExecutionRecord,
+        PlannerStepExecutionStatus, PlannerStepKind, ScreenAnalysisRequest, ScreenAnalysisResult,
+        ScreenCaptureResult, ScreenObservationStatus, SemanticScreenFrame,
     },
     filesystem_service::FilesystemService,
     model_assisted_planner::ModelAssistedPlanner,
@@ -25,7 +25,7 @@ use crate::{
         WorkflowStepKind, WorkflowStepRun,
     },
     semantic_frame::{
-        goal_for_open_media_result, planner_candidate_from_step, run_goal_loop_once,
+        goal_for_open_list_item, planner_candidate_from_step, run_goal_loop_once,
         verify_browser_handoff_page, verify_goal_state, GoalLoopDriver, GoalLoopDriverFuture,
         GoalLoopRuntime, GoalLoopRuntimeConfig,
     },
@@ -41,11 +41,11 @@ use crate::{
     },
     workflow_continuation::{
         build_context_from_action_response, build_context_from_screen_workflow_run,
-        resolve_workflow_continuation, resolve_workflow_continuation_with_model_params,
-        scroll_policy_for_regrounding, validate_continuation_page,
-        ContinuationRegroundingDiagnostics, FollowupActionKind, RecentWorkflowContext,
-        RegroundingAttemptDiagnostic, ResultListItemKind, ScrollContinuationStatus,
-        WorkflowContinuationResolution, MAX_RECENT_SCREEN_AGE_MS,
+        build_continuation_verification_result, resolve_workflow_continuation,
+        resolve_workflow_continuation_with_model_params, scroll_policy_for_regrounding,
+        validate_continuation_page, ContinuationRegroundingDiagnostics, FollowupActionKind,
+        RecentWorkflowContext, RegroundingAttemptDiagnostic, ResultListItemKind,
+        ScrollContinuationStatus, WorkflowContinuationResolution, MAX_RECENT_SCREEN_AGE_MS,
     },
 };
 use serde_json::{json, Value};
@@ -628,6 +628,33 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
                 }));
             }
 
+            match self
+                .verify_current_browser_page(goal, "browser_recovery_pre_activation_check")
+                .await
+            {
+                Ok(verified) => {
+                    let record = self.handoff_record(
+                        iteration,
+                        BrowserHandoffStatus::VisuallyVerified,
+                        BrowserHandoffActivationStatus::NotAttempted,
+                        None,
+                        goal,
+                        false,
+                        Some(&verified.frame),
+                        Some(&verified.verification),
+                        1,
+                        format!(
+                            "browser recovery found the expected page already visible before foreground activation: {reason}"
+                        ),
+                    );
+                    return Ok(Some(BrowserVisualHandoffResult {
+                        record,
+                        verified_frame: Some(verified.frame),
+                    }));
+                }
+                Err(_) => {}
+            }
+
             self.runtime.audit.append(&DesktopAuditEvent {
                 audit_id: Uuid::new_v4().to_string(),
                 action_id: self.action_id.clone(),
@@ -984,6 +1011,16 @@ impl DesktopAgentRuntime {
         let capabilities = self.ui_primitive_capabilities();
         let previous_context = self.recent_workflow_context();
         workflow.grounding.recent_target_candidates = self.recent_workflow_targets();
+        if workflow
+            .continuation
+            .as_ref()
+            .is_some_and(|descriptor| !descriptor.policy.recent_candidate_reuse_allowed)
+        {
+            workflow.grounding.recent_target_candidates.clear();
+            workflow.grounding.uncertainty.push(
+                "recent_target_candidates_suppressed_for_fresh_continuation_grounding".into(),
+            );
+        }
         refresh_screen_workflow_plan(&mut workflow);
         let production_goal = goal_for_screen_workflow(&workflow);
         let used_production_goal_loop = production_goal.is_some();
@@ -1309,16 +1346,28 @@ impl DesktopAgentRuntime {
                 break;
             }
 
-            let capture = match self.capture_for_structured_grounding() {
-                Ok(capture) => capture,
-                Err(error) => {
-                    workflow
-                        .grounding
-                        .uncertainty
-                        .push(format!("structured_grounding_capture_unavailable: {error}"));
-                    break;
-                }
-            };
+            let force_fresh_capture = workflow
+                .continuation
+                .as_ref()
+                .is_some_and(|descriptor| descriptor.policy.fresh_capture_required);
+            if force_fresh_capture {
+                workflow
+                    .grounding
+                    .uncertainty
+                    .push("fresh_capture_enforced_for_continuation_grounding".into());
+            }
+
+            let capture =
+                match self.capture_for_structured_grounding_with_policy(force_fresh_capture) {
+                    Ok(capture) => capture,
+                    Err(error) => {
+                        workflow
+                            .grounding
+                            .uncertainty
+                            .push(format!("structured_grounding_capture_unavailable: {error}"));
+                        break;
+                    }
+                };
 
             let extraction = self
                 .extract_structured_candidates_for_workflow_capture(workflow, &capture)
@@ -2025,6 +2074,7 @@ fn goal_for_screen_workflow(workflow: &ScreenWorkflow) -> Option<GoalSpec> {
             goal_type: GoalType::OpenChannel,
             constraints: GoalConstraints {
                 provider,
+                item_kind: None,
                 result_kind: None,
                 rank_within_kind: None,
                 rank_overall: None,
@@ -2044,18 +2094,19 @@ fn goal_for_screen_workflow(workflow: &ScreenWorkflow) -> Option<GoalSpec> {
     ) {
         return None;
     }
-    let visible_kind = match reference.item_kind {
-        ResultListItemKind::Video => VisibleResultKind::Video,
-        ResultListItemKind::Link => VisibleResultKind::Generic,
-        ResultListItemKind::Result => VisibleResultKind::Generic,
-        ResultListItemKind::Unknown => VisibleResultKind::Unknown,
+    let item_kind = match reference.item_kind {
+        ResultListItemKind::Video => Some("video".into()),
+        ResultListItemKind::Link => Some("site".into()),
+        ResultListItemKind::Result | ResultListItemKind::Unknown => None,
     };
     let rank = reference.rank.unwrap_or(1);
-    Some(goal_for_open_media_result(
+    let has_item_kind = item_kind.is_some();
+    Some(goal_for_open_list_item(
         utterance,
         provider,
-        visible_kind,
-        rank,
+        item_kind,
+        if has_item_kind { Some(rank) } else { None },
+        if has_item_kind { None } else { Some(rank) },
     ))
 }
 
@@ -2106,6 +2157,16 @@ fn screen_workflow_run_from_goal_loop(
     };
 
     workflow.grounding.goal_loop = Some(goal_loop);
+    let continuation_verification = workflow.continuation.as_ref().map(|descriptor| {
+        build_continuation_verification_result(
+            descriptor,
+            &status,
+            completed_steps,
+            workflow.steps.len(),
+            stopped_reason.as_deref(),
+            workflow.grounding.goal_loop.as_ref(),
+        )
+    });
 
     ScreenWorkflowRun {
         run_id: Uuid::new_v4().to_string(),
@@ -2115,7 +2176,7 @@ fn screen_workflow_run_from_goal_loop(
         step_runs,
         completed_steps,
         stopped_reason,
-        continuation_verification: None,
+        continuation_verification,
     }
 }
 
@@ -2131,6 +2192,35 @@ fn remember_goal_loop_candidate(workflow: &mut ScreenWorkflow, candidate: UITarg
     workflow.grounding.visible_target_candidates.push(candidate);
 }
 
+fn goal_loop_has_executed_action(goal_loop: &GoalLoopRun) -> bool {
+    goal_loop
+        .executed_steps
+        .iter()
+        .any(|step| step.status == PlannerStepExecutionStatus::Executed)
+}
+
+fn goal_loop_has_ambiguous_final_verification(goal_loop: &GoalLoopRun) -> bool {
+    goal_loop
+        .verification_history
+        .last()
+        .is_some_and(|verification| {
+            matches!(
+                verification.status,
+                GoalVerificationStatus::Ambiguous | GoalVerificationStatus::PageChangedWrongOutcome
+            )
+        })
+}
+
+fn goal_loop_should_project_partial_completion(goal_loop: &GoalLoopRun) -> bool {
+    goal_loop_has_executed_action(goal_loop)
+        && (goal_loop.post_action_progress_observed
+            || goal_loop_has_ambiguous_final_verification(goal_loop)
+            || matches!(
+                goal_loop.browser_recovery_status,
+                crate::desktop_agent_types::BrowserRecoveryStatus::Failed
+            ))
+}
+
 fn workflow_status_for_goal_loop(goal_loop: &GoalLoopRun) -> WorkflowRunStatus {
     match goal_loop.status {
         GoalLoopStatus::GoalAchieved => WorkflowRunStatus::Completed,
@@ -2139,7 +2229,16 @@ fn workflow_status_for_goal_loop(goal_loop: &GoalLoopRun) -> WorkflowRunStatus {
             WorkflowRunStatus::PartiallyCompleted
         }
         GoalLoopStatus::NeedsClarification | GoalLoopStatus::Refused => {
-            WorkflowRunStatus::NeedsTargetGrounding
+            if goal_loop_should_project_partial_completion(goal_loop) {
+                WorkflowRunStatus::PartiallyCompleted
+            } else {
+                WorkflowRunStatus::NeedsTargetGrounding
+            }
+        }
+        GoalLoopStatus::BudgetExhausted | GoalLoopStatus::VerificationFailed
+            if goal_loop_should_project_partial_completion(goal_loop) =>
+        {
+            WorkflowRunStatus::PartiallyCompleted
         }
         GoalLoopStatus::BrowserHandoffFailed
         | GoalLoopStatus::ScrollRequiredButUnsupported
@@ -2271,8 +2370,8 @@ mod tests {
         action_resolution::{ActionOperation, ResolutionSource},
         desktop_agent_types::{
             DesktopActionRequest, DesktopActionStatus, GoalConstraints, GoalLoopRun,
-            GoalLoopStatus, GoalSpec, GoalType, PendingApproval, PlannerStepExecutionRecord,
-            PlannerStepExecutionStatus, VisibleResultKind,
+            GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus, PendingApproval,
+            PlannerStepExecutionRecord, PlannerStepExecutionStatus, VisibleResultKind,
         },
         screen_workflow::{
             ScreenFreshness, ScreenGroundingState, ScreenWorkflow, ScreenWorkflowDomain,
@@ -2413,6 +2512,7 @@ mod tests {
                 goal_type: GoalType::OpenMediaResult,
                 constraints: GoalConstraints {
                     provider: Some("youtube".into()),
+                    item_kind: Some("video".into()),
                     result_kind: Some(VisibleResultKind::Video),
                     rank_within_kind: Some(1),
                     rank_overall: None,
@@ -2452,6 +2552,7 @@ mod tests {
             stale_capture_reuse_prevented: true,
             browser_recovery_used: false,
             browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
+            post_action_progress_observed: true,
             repeated_click_protection_triggered: false,
             selected_target_candidate: Some(candidate),
             verifier_status: Some("GoalAchieved".into()),
@@ -2476,5 +2577,306 @@ mod tests {
             .as_ref()
             .and_then(|selection| selection.selected_candidate.as_ref())
             .is_some());
+    }
+
+    #[test]
+    fn workflow_status_projects_executed_ambiguous_goal_loop_as_partial() {
+        let goal_loop = GoalLoopRun {
+            run_id: "loop".into(),
+            goal: GoalSpec {
+                goal_id: "goal".into(),
+                goal_type: GoalType::OpenMediaResult,
+                constraints: GoalConstraints {
+                    provider: Some("youtube".into()),
+                    item_kind: Some("video".into()),
+                    result_kind: Some(VisibleResultKind::Video),
+                    rank_within_kind: Some(1),
+                    rank_overall: None,
+                    entity_name: None,
+                    attributes: serde_json::Value::Null,
+                },
+                success_condition: "video_watch_page_open".into(),
+                utterance: "aprimi il primo video".into(),
+                confidence: 0.9,
+            },
+            status: GoalLoopStatus::Refused,
+            iteration_count: 2,
+            retry_budget: 3,
+            retries_used: 0,
+            current_strategy: Some("youtube_open_first_visible_media_result".into()),
+            fallback_strategy_state: None,
+            frames: Vec::new(),
+            planner_steps: Vec::new(),
+            planner_diagnostics: Vec::new(),
+            executed_steps: vec![PlannerStepExecutionRecord {
+                step_id: "step".into(),
+                status: PlannerStepExecutionStatus::Executed,
+                primitive: "ClickTargetCandidate".into(),
+                message: "clicked".into(),
+                selected_target_candidate: None,
+                geometry: None,
+                fresh_capture_required: true,
+                fresh_capture_used: true,
+                target_signature: Some("planner_result_v1_title".into()),
+            }],
+            verification_history: vec![crate::desktop_agent_types::GoalVerificationRecord {
+                iteration: 1,
+                status: GoalVerificationStatus::Ambiguous,
+                confidence: 0.71,
+                reason: "page changed but final confirmation remained uncertain".into(),
+                frame_id: Some("frame_2".into()),
+            }],
+            focused_perception_requests: Vec::new(),
+            browser_handoff_history: Vec::new(),
+            browser_handoff: None,
+            focused_perception_used: false,
+            visible_refinement_used: false,
+            stale_capture_reuse_prevented: true,
+            browser_recovery_used: false,
+            browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
+            post_action_progress_observed: true,
+            repeated_click_protection_triggered: false,
+            selected_target_candidate: None,
+            verifier_status: Some("Ambiguous".into()),
+            failure_reason: Some("final watch-page confirmation remained uncertain".into()),
+        };
+
+        assert_eq!(
+            super::workflow_status_for_goal_loop(&goal_loop),
+            crate::screen_workflow::WorkflowRunStatus::PartiallyCompleted
+        );
+    }
+
+    #[test]
+    fn screen_workflow_run_from_goal_loop_hydrates_goal_aware_continuation_verification() {
+        let workflow = ScreenWorkflow {
+            operation: ActionOperation::ScreenGuidedFollowupAction,
+            domain: ScreenWorkflowDomain::BrowserScreenInteraction,
+            requires_screen_context: true,
+            depends_on_recent_screen_context: true,
+            continuation: Some(crate::workflow_continuation::WorkflowContinuationDescriptor {
+                followup: crate::workflow_continuation::FollowupActionResolution {
+                    action_kind: crate::workflow_continuation::FollowupActionKind::OpenResult,
+                    result_reference: Some(crate::workflow_continuation::ResultListReference {
+                        rank: Some(1),
+                        ordinal_label: "primo".into(),
+                        item_kind: crate::workflow_continuation::ResultListItemKind::Video,
+                    }),
+                    text_value: None,
+                    provider_hint: Some("youtube".into()),
+                    query_hint: Some("shiva".into()),
+                    browser_hint: Some("chrome".into()),
+                    app_hint: Some("chrome".into()),
+                    page_context_hint: Some(
+                        crate::workflow_continuation::PageContextHint::RecentResultsPage,
+                    ),
+                    requires_result_list: true,
+                    requires_recent_focus_target: false,
+                    confidence: 0.91,
+                    source: crate::workflow_continuation::FollowupResolutionSource::RustFollowupResolver,
+                    rationale: "test".into(),
+                    interpretation: None,
+                    merge_diagnostic: None,
+                },
+                policy: crate::workflow_continuation::ContinuationPolicyDecision {
+                    status: crate::workflow_continuation::ContinuationPolicyStatus::SafeToAttempt,
+                    executable: true,
+                    reason: "test".into(),
+                    context_age_ms: Some(100),
+                    screen_age_ms: Some(100),
+                    required_rank: Some(1),
+                    provider: Some("youtube".into()),
+                    query: Some("shiva".into()),
+                    fresh_capture_required: false,
+                    recent_candidate_reuse_allowed: true,
+                    max_reusable_screen_age_ms: Some(60_000),
+                    freshness_reason: None,
+                },
+                source_context: crate::workflow_continuation::RecentWorkflowContextSummary {
+                    context_id: "ctx".into(),
+                    kind: crate::workflow_continuation::RecentWorkflowContextKind::BrowserSearchResults,
+                    page_kind: crate::workflow_continuation::BrowserPageKind::SearchResults,
+                    provider: Some("youtube".into()),
+                    app: Some("chrome".into()),
+                    url: Some("https://www.youtube.com/results?search_query=shiva".into()),
+                    query: Some("shiva".into()),
+                    has_result_list: true,
+                    has_recent_focused_target: false,
+                    has_recent_selected_target: false,
+                    last_run_status: Some("completed".into()),
+                    resumable: false,
+                    continuation_allowed: true,
+                    updated_at_ms: 1_000,
+                    expires_at_ms: 2_000,
+                },
+                verifier: crate::workflow_continuation::ContinuationVerifierExpectation {
+                    verifier_kind: crate::workflow_continuation::ContinuationVerifierKind::ResultNavigationExpected,
+                    expected_state_change: "watch page visible".into(),
+                    requires_post_step_screen_check: true,
+                },
+                page_validation: None,
+                regrounding: None,
+            }),
+            grounding: ScreenGroundingState {
+                observation_supported: true,
+                observation_enabled: true,
+                capture_available: true,
+                analysis_available: true,
+                recent_capture_available: true,
+                recent_capture_age_ms: Some(100),
+                last_capture_path: Some("screen.png".into()),
+                freshness: ScreenFreshness::RecentAvailable,
+                fresh_capture_required: false,
+                sufficient_for_workflow: true,
+                visible_target_candidates: Vec::new(),
+                page_evidence: Vec::new(),
+                semantic_frame: None,
+                goal_loop: None,
+                recent_target_candidates: Vec::new(),
+                generated_at_ms: Some(1_000),
+                page_validation: None,
+                regrounding: None,
+                uncertainty: Vec::new(),
+            },
+            steps: Vec::new(),
+            step_plans: Vec::new(),
+            support: WorkflowSupportSummary {
+                executable: true,
+                requires_screen_context: true,
+                unsupported_steps: Vec::new(),
+                reason: "test".into(),
+            },
+            confidence: 0.9,
+            source: ResolutionSource::RustNormalizer,
+            rationale: Some("test".into()),
+        };
+        let goal_loop = GoalLoopRun {
+            run_id: "loop".into(),
+            goal: GoalSpec {
+                goal_id: "goal".into(),
+                goal_type: GoalType::OpenMediaResult,
+                constraints: GoalConstraints {
+                    provider: Some("youtube".into()),
+                    item_kind: Some("video".into()),
+                    result_kind: Some(VisibleResultKind::Video),
+                    rank_within_kind: Some(1),
+                    rank_overall: None,
+                    entity_name: None,
+                    attributes: serde_json::Value::Null,
+                },
+                success_condition: "video_watch_page_open".into(),
+                utterance: "aprimi il primo video".into(),
+                confidence: 0.9,
+            },
+            status: GoalLoopStatus::GoalAchieved,
+            iteration_count: 2,
+            retry_budget: 3,
+            retries_used: 0,
+            current_strategy: Some("youtube_open_first_visible_media_result".into()),
+            fallback_strategy_state: None,
+            frames: Vec::new(),
+            planner_steps: Vec::new(),
+            planner_diagnostics: Vec::new(),
+            executed_steps: vec![PlannerStepExecutionRecord {
+                step_id: "step".into(),
+                status: PlannerStepExecutionStatus::Executed,
+                primitive: "ClickTargetCandidate".into(),
+                message: "clicked".into(),
+                selected_target_candidate: None,
+                geometry: None,
+                fresh_capture_required: true,
+                fresh_capture_used: true,
+                target_signature: Some("planner_result_v1_title".into()),
+            }],
+            verification_history: vec![crate::desktop_agent_types::GoalVerificationRecord {
+                iteration: 1,
+                status: GoalVerificationStatus::GoalAchieved,
+                confidence: 0.93,
+                reason: "watch page visible".into(),
+                frame_id: Some("frame_1".into()),
+            }],
+            focused_perception_requests: Vec::new(),
+            browser_handoff_history: Vec::new(),
+            browser_handoff: None,
+            focused_perception_used: false,
+            visible_refinement_used: false,
+            stale_capture_reuse_prevented: true,
+            browser_recovery_used: false,
+            browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
+            post_action_progress_observed: true,
+            repeated_click_protection_triggered: false,
+            selected_target_candidate: None,
+            verifier_status: Some("GoalAchieved".into()),
+            failure_reason: None,
+        };
+
+        let run = super::screen_workflow_run_from_goal_loop(
+            workflow,
+            UIPrimitiveCapabilitySet::for_runtime(true),
+            goal_loop,
+        );
+
+        assert_eq!(
+            run.status,
+            crate::screen_workflow::WorkflowRunStatus::Completed
+        );
+        assert_eq!(
+            run.continuation_verification
+                .as_ref()
+                .map(|verification| &verification.status),
+            Some(&crate::workflow_continuation::ContinuationVerificationStatus::GoalAchieved)
+        );
+    }
+
+    #[test]
+    fn workflow_status_keeps_unexecuted_refusal_as_needs_target_grounding() {
+        let goal_loop = GoalLoopRun {
+            run_id: "loop".into(),
+            goal: GoalSpec {
+                goal_id: "goal".into(),
+                goal_type: GoalType::OpenMediaResult,
+                constraints: GoalConstraints {
+                    provider: Some("youtube".into()),
+                    item_kind: Some("video".into()),
+                    result_kind: Some(VisibleResultKind::Video),
+                    rank_within_kind: Some(1),
+                    rank_overall: None,
+                    entity_name: None,
+                    attributes: serde_json::Value::Null,
+                },
+                success_condition: "video_watch_page_open".into(),
+                utterance: "aprimi il primo video".into(),
+                confidence: 0.9,
+            },
+            status: GoalLoopStatus::Refused,
+            iteration_count: 1,
+            retry_budget: 3,
+            retries_used: 0,
+            current_strategy: Some("youtube_open_first_visible_media_result".into()),
+            fallback_strategy_state: None,
+            frames: Vec::new(),
+            planner_steps: Vec::new(),
+            planner_diagnostics: Vec::new(),
+            executed_steps: Vec::new(),
+            verification_history: Vec::new(),
+            focused_perception_requests: Vec::new(),
+            browser_handoff_history: Vec::new(),
+            browser_handoff: None,
+            focused_perception_used: false,
+            visible_refinement_used: false,
+            stale_capture_reuse_prevented: false,
+            browser_recovery_used: false,
+            browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
+            post_action_progress_observed: false,
+            repeated_click_protection_triggered: false,
+            selected_target_candidate: None,
+            verifier_status: Some("Refused".into()),
+            failure_reason: Some("no sufficiently grounded candidate was found".into()),
+        };
+
+        assert_eq!(
+            super::workflow_status_for_goal_loop(&goal_loop),
+            crate::screen_workflow::WorkflowRunStatus::NeedsTargetGrounding
+        );
     }
 }

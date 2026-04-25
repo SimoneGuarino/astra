@@ -1,12 +1,14 @@
 use crate::{
     action_resolution::{ActionDomain, ActionOperation, ActionResolution, ResolutionSource},
     desktop_agent_types::{
-        CapabilityManifest, DesktopActionRequest, PageSemanticEvidence, ScreenCaptureResult,
+        BrowserPageSemanticKind, CapabilityManifest, DesktopActionRequest, GoalLoopRun,
+        GoalLoopStatus, GoalVerificationStatus, PageSemanticEvidence, ScreenCaptureResult,
     },
     screen_workflow::{
         resolve_screen_workflow, ScreenWorkflow, ScreenWorkflowRun, WorkflowRunStatus,
         WorkflowStepKind,
     },
+    semantic_frame::browser_page_semantic_kind,
     ui_control::{UIPrimitiveCapabilitySet, UIPrimitiveKind},
     ui_target_grounding::{
         candidate_browser_app_hint, candidate_content_provider_hint, is_technical_capture_backend,
@@ -20,6 +22,8 @@ use uuid::Uuid;
 pub const RECENT_WORKFLOW_CONTEXT_TTL_MS: u64 = 5 * 60 * 1_000;
 pub const RECENT_RESULT_LIST_TTL_MS: u64 = 3 * 60 * 1_000;
 pub const MAX_RECENT_SCREEN_AGE_MS: u64 = 3 * 60 * 1_000;
+const MAX_RANKED_RESULT_SCREEN_AGE_MS: u64 = 60 * 1_000;
+const MAX_HIGHER_ORDINAL_RESULT_SCREEN_AGE_MS: u64 = 30 * 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -433,6 +437,14 @@ pub struct ContinuationPolicyDecision {
     pub provider: Option<String>,
     #[serde(default)]
     pub query: Option<String>,
+    #[serde(default)]
+    pub fresh_capture_required: bool,
+    #[serde(default)]
+    pub recent_candidate_reuse_allowed: bool,
+    #[serde(default)]
+    pub max_reusable_screen_age_ms: Option<u64>,
+    #[serde(default)]
+    pub freshness_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -467,8 +479,10 @@ pub struct WorkflowContinuationDescriptor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ContinuationVerificationStatus {
+    GoalAchieved,
     SatisfiedAtPrimitiveLevel,
     NeedsPostStepScreenCheck,
+    VerificationAmbiguous,
     PageMismatch,
     RegroundingRequired,
     ScrollUnsupported,
@@ -485,6 +499,12 @@ pub struct ContinuationVerificationResult {
     pub observed_evidence: Vec<String>,
     pub requires_post_step_screen_check: bool,
     pub next_resumable: bool,
+    #[serde(default)]
+    pub goal_loop_status: Option<GoalLoopStatus>,
+    #[serde(default)]
+    pub goal_verifier_status: Option<GoalVerificationStatus>,
+    #[serde(default)]
+    pub post_action_progress_observed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,6 +592,10 @@ fn resolve_workflow_continuation_from_interpretation(
                     .and_then(|reference| reference.rank),
                 provider: followup.provider_hint.clone(),
                 query: followup.query_hint.clone(),
+                fresh_capture_required: false,
+                recent_candidate_reuse_allowed: true,
+                max_reusable_screen_age_ms: None,
+                freshness_reason: None,
             };
             return Some(WorkflowContinuationResolution::Refusal(
                 ContinuationRefusal {
@@ -881,6 +905,7 @@ pub fn build_continuation_verification_result(
     completed_steps: usize,
     planned_steps: usize,
     stopped_reason: Option<&str>,
+    goal_loop: Option<&GoalLoopRun>,
 ) -> ContinuationVerificationResult {
     let completed = matches!(run_status, WorkflowRunStatus::Completed)
         && completed_steps == planned_steps
@@ -895,7 +920,26 @@ pub fn build_continuation_verification_result(
         run_status,
         WorkflowRunStatus::StepFailed | WorkflowRunStatus::Aborted
     );
-    let status = if failed {
+    let goal_verifier_status = goal_loop.and_then(|goal_loop| {
+        goal_loop
+            .verification_history
+            .last()
+            .map(|verification| verification.status.clone())
+    });
+    let goal_achieved = goal_loop
+        .is_some_and(|goal_loop| goal_loop.status == GoalLoopStatus::GoalAchieved)
+        || goal_verifier_status == Some(GoalVerificationStatus::GoalAchieved);
+    let verification_ambiguous = goal_loop.is_some_and(|goal_loop| {
+        goal_loop_executed_action(goal_loop)
+            && goal_loop.status != GoalLoopStatus::GoalAchieved
+            && (goal_loop.post_action_progress_observed
+                || goal_loop_has_ambiguous_final_verification(goal_loop))
+    });
+    let status = if goal_achieved {
+        ContinuationVerificationStatus::GoalAchieved
+    } else if verification_ambiguous {
+        ContinuationVerificationStatus::VerificationAmbiguous
+    } else if failed {
         ContinuationVerificationStatus::Failed
     } else if descriptor
         .page_validation
@@ -928,8 +972,32 @@ pub fn build_continuation_verification_result(
     let mut observed_evidence = Vec::new();
     observed_evidence.push(format!("workflow_status={}", run_status.as_str()));
     observed_evidence.push(format!("completed_steps={completed_steps}/{planned_steps}"));
+    observed_evidence.push(format!(
+        "fresh_capture_required={}",
+        descriptor.policy.fresh_capture_required
+    ));
+    observed_evidence.push(format!(
+        "recent_candidate_reuse_allowed={}",
+        descriptor.policy.recent_candidate_reuse_allowed
+    ));
+    if let Some(age_ms) = descriptor.policy.max_reusable_screen_age_ms {
+        observed_evidence.push(format!("max_reusable_screen_age_ms={age_ms}"));
+    }
+    if let Some(reason) = descriptor.policy.freshness_reason.as_deref() {
+        observed_evidence.push(format!("freshness_reason={reason}"));
+    }
     if let Some(reason) = stopped_reason.filter(|value| !value.trim().is_empty()) {
         observed_evidence.push(format!("stopped_reason={reason}"));
+    }
+    if let Some(goal_loop) = goal_loop {
+        observed_evidence.push(format!("goal_loop_status={:?}", goal_loop.status));
+        observed_evidence.push(format!(
+            "post_action_progress_observed={}",
+            goal_loop.post_action_progress_observed
+        ));
+    }
+    if let Some(status) = goal_verifier_status.as_ref() {
+        observed_evidence.push(format!("goal_verifier_status={status:?}"));
     }
     if let Some(validation) = descriptor.page_validation.as_ref() {
         observed_evidence.push(format!("page_validation={:?}", validation.status));
@@ -951,8 +1019,32 @@ pub fn build_continuation_verification_result(
         expected_state_change: descriptor.verifier.expected_state_change.clone(),
         observed_evidence,
         requires_post_step_screen_check: descriptor.verifier.requires_post_step_screen_check,
-        next_resumable: !completed,
+        next_resumable: !completed && !goal_achieved,
+        goal_loop_status: goal_loop.map(|goal_loop| goal_loop.status.clone()),
+        goal_verifier_status,
+        post_action_progress_observed: goal_loop
+            .map(|goal_loop| goal_loop.post_action_progress_observed)
+            .unwrap_or(false),
     }
+}
+
+fn goal_loop_executed_action(goal_loop: &GoalLoopRun) -> bool {
+    goal_loop
+        .executed_steps
+        .iter()
+        .any(|step| step.status == crate::desktop_agent_types::PlannerStepExecutionStatus::Executed)
+}
+
+fn goal_loop_has_ambiguous_final_verification(goal_loop: &GoalLoopRun) -> bool {
+    goal_loop
+        .verification_history
+        .last()
+        .is_some_and(|verification| {
+            matches!(
+                verification.status,
+                GoalVerificationStatus::Ambiguous | GoalVerificationStatus::PageChangedWrongOutcome
+            )
+        })
 }
 
 pub fn render_continuation_refusal(refusal: &ContinuationRefusal, italian: bool) -> String {
@@ -1061,9 +1153,22 @@ pub fn validate_continuation_page(
     let observation_source = page_evidence
         .iter()
         .find_map(|evidence| evidence.observation_source.clone());
+    let max_capture_age_ms = descriptor
+        .policy
+        .max_reusable_screen_age_ms
+        .unwrap_or(MAX_RECENT_SCREEN_AGE_MS);
     let mut evidence = Vec::new();
     evidence.push(format!("candidate_count={}", candidates.len()));
     evidence.push(format!("page_evidence_count={}", page_evidence.len()));
+    evidence.push(format!(
+        "recent_candidate_reuse_allowed={}",
+        descriptor.policy.recent_candidate_reuse_allowed
+    ));
+    evidence.push(format!(
+        "fresh_capture_required={}",
+        descriptor.policy.fresh_capture_required
+    ));
+    evidence.push(format!("max_capture_age_ms={max_capture_age_ms}"));
     if let Some(provider) = observed_provider.as_deref() {
         evidence.push(format!("observed_content_provider={provider}"));
     }
@@ -1114,7 +1219,7 @@ pub fn validate_continuation_page(
         };
     }
 
-    if capture_age_ms.is_some_and(|age| age > MAX_RECENT_SCREEN_AGE_MS) {
+    if capture_age_ms.is_some_and(|age| age > max_capture_age_ms) {
         return SemanticPageValidationResult {
             status: SemanticPageValidationStatus::NeedsFreshCapture,
             expected_page_kind,
@@ -1128,9 +1233,9 @@ pub fn validate_continuation_page(
             observation_source,
             confidence: 0.30,
             needs_fresh_capture: true,
-            mismatch_reason: Some(
-                "screen capture is too old for semantic continuation validation".into(),
-            ),
+            mismatch_reason: Some(format!(
+                "screen capture is too old for semantic continuation validation; max reusable age is {max_capture_age_ms} ms"
+            )),
             evidence,
             captured_at_ms: capture.map(|capture| capture.captured_at),
             capture_age_ms,
@@ -1450,8 +1555,18 @@ fn continuation_policy(
         .query_hint
         .clone()
         .or_else(|| context.query.clone());
+    let mut fresh_capture_required = false;
+    let mut recent_candidate_reuse_allowed = true;
+    let mut max_reusable_screen_age_ms = None;
+    let mut freshness_reason = None;
 
-    let policy = |status, executable, reason: String| ContinuationPolicyDecision {
+    let policy = |status,
+                  executable,
+                  reason: String,
+                  fresh_capture_required,
+                  recent_candidate_reuse_allowed,
+                  max_reusable_screen_age_ms,
+                  freshness_reason| ContinuationPolicyDecision {
         status,
         executable,
         reason,
@@ -1460,6 +1575,10 @@ fn continuation_policy(
         required_rank,
         provider: provider.clone(),
         query: query.clone(),
+        fresh_capture_required,
+        recent_candidate_reuse_allowed,
+        max_reusable_screen_age_ms,
+        freshness_reason,
     };
 
     if now_ms > context.expires_at_ms {
@@ -1467,6 +1586,10 @@ fn continuation_policy(
             ContinuationPolicyStatus::StaleWorkflowContext,
             false,
             "recent workflow context exceeded its continuation freshness window".into(),
+            false,
+            recent_candidate_reuse_allowed,
+            max_reusable_screen_age_ms,
+            None,
         );
     }
     if !context.continuation_allowed {
@@ -1474,6 +1597,10 @@ fn continuation_policy(
             ContinuationPolicyStatus::NoRecentWorkflowContext,
             false,
             "recent context is not marked continuation-eligible".into(),
+            false,
+            recent_candidate_reuse_allowed,
+            max_reusable_screen_age_ms,
+            None,
         );
     }
     if matches!(
@@ -1484,6 +1611,10 @@ fn continuation_policy(
             ContinuationPolicyStatus::UnsupportedMultiStepRegrounding,
             false,
             "navigate-back-plus-click needs a post-navigation screen recapture before target selection".into(),
+            false,
+            recent_candidate_reuse_allowed,
+            max_reusable_screen_age_ms,
+            None,
         );
     }
     if matches!(followup.action_kind, FollowupActionKind::ContinueWorkflow)
@@ -1493,6 +1624,10 @@ fn continuation_policy(
             ContinuationPolicyStatus::NoResumableWorkflow,
             false,
             "the recent workflow is not stopped at a resumable follow-up step".into(),
+            false,
+            recent_candidate_reuse_allowed,
+            max_reusable_screen_age_ms,
+            None,
         );
     }
     if let Some(provider_hint) = followup.provider_hint.as_deref() {
@@ -1508,6 +1643,10 @@ fn continuation_policy(
                     "follow-up provider {provider_hint} does not match recent provider {}",
                     context.provider.as_deref().unwrap_or("unknown")
                 ),
+                false,
+                recent_candidate_reuse_allowed,
+                max_reusable_screen_age_ms,
+                None,
             );
         }
     }
@@ -1524,16 +1663,30 @@ fn continuation_policy(
                     "follow-up query {query_hint} does not match recent query {}",
                     context.query.as_deref().unwrap_or("unknown")
                 ),
+                false,
+                recent_candidate_reuse_allowed,
+                max_reusable_screen_age_ms,
+                None,
             );
         }
     }
 
     if followup.requires_result_list {
+        if let Some(rank) = required_rank {
+            max_reusable_screen_age_ms = Some(required_result_followup_capture_age_ms(rank));
+            if rank > 1 {
+                recent_candidate_reuse_allowed = false;
+            }
+        }
         let Some(result_list) = context.result_list.as_ref() else {
             return policy(
                 ContinuationPolicyStatus::ResultListUnavailable,
                 false,
                 "the recent workflow did not record a reusable result-list expectation".into(),
+                false,
+                recent_candidate_reuse_allowed,
+                max_reusable_screen_age_ms,
+                None,
             );
         };
         if now_ms > result_list.expires_at_ms {
@@ -1541,6 +1694,10 @@ fn continuation_policy(
                 ContinuationPolicyStatus::ResultListStale,
                 false,
                 "the recorded result-list context exceeded its freshness window".into(),
+                false,
+                recent_candidate_reuse_allowed,
+                max_reusable_screen_age_ms,
+                None,
             );
         }
         if !screen_grounding_possible(manifest) {
@@ -1548,7 +1705,37 @@ fn continuation_policy(
                 ContinuationPolicyStatus::ScreenContextUnavailable,
                 false,
                 "screen observation or recent screen analysis is required for candidate-aware result selection".into(),
+                false,
+                recent_candidate_reuse_allowed,
+                max_reusable_screen_age_ms,
+                None,
             );
+        }
+        if let Some(max_age_ms) = max_reusable_screen_age_ms {
+            if let Some(age) = screen_age_ms {
+                if age > max_age_ms {
+                    let rank_label = required_rank
+                        .map(|rank| format!("rank {rank}"))
+                        .unwrap_or_else(|| "ranked result".into());
+                    let reason = format!(
+                        "{rank_label} continuation requires a capture fresher than {max_age_ms} ms, but the current screen context is {age} ms old"
+                    );
+                    if !manifest.screen.observation_enabled {
+                        return policy(
+                            ContinuationPolicyStatus::ScreenContextUnavailable,
+                            false,
+                            format!("{reason} and fresh observation is disabled"),
+                            true,
+                            false,
+                            Some(max_age_ms),
+                            Some(reason),
+                        );
+                    }
+                    fresh_capture_required = true;
+                    recent_candidate_reuse_allowed = false;
+                    freshness_reason = Some(reason);
+                }
+            }
         }
         if manifest
             .screen
@@ -1560,6 +1747,10 @@ fn continuation_policy(
                 ContinuationPolicyStatus::ScreenContextUnavailable,
                 false,
                 "the available screen capture is stale and fresh observation is disabled".into(),
+                fresh_capture_required,
+                recent_candidate_reuse_allowed,
+                max_reusable_screen_age_ms,
+                freshness_reason,
             );
         }
     }
@@ -1575,6 +1766,10 @@ fn continuation_policy(
             false,
             "the follow-up refers to 'that', but no recent selected or focused target is recorded"
                 .into(),
+            fresh_capture_required,
+            recent_candidate_reuse_allowed,
+            max_reusable_screen_age_ms,
+            freshness_reason,
         );
     }
 
@@ -1586,6 +1781,10 @@ fn continuation_policy(
             ContinuationPolicyStatus::TargetContextUnavailable,
             false,
             "typing follow-up has no recent focused input and cannot re-ground a visible input target".into(),
+            fresh_capture_required,
+            recent_candidate_reuse_allowed,
+            max_reusable_screen_age_ms,
+            freshness_reason,
         );
     }
 
@@ -1594,7 +1793,19 @@ fn continuation_policy(
         true,
         "recent context is fresh enough and the next step can be delegated to target grounding"
             .into(),
+        fresh_capture_required,
+        recent_candidate_reuse_allowed,
+        max_reusable_screen_age_ms,
+        freshness_reason,
     )
+}
+
+fn required_result_followup_capture_age_ms(rank: u32) -> u64 {
+    if rank > 1 {
+        MAX_HIGHER_ORDINAL_RESULT_SCREEN_AGE_MS
+    } else {
+        MAX_RANKED_RESULT_SCREEN_AGE_MS
+    }
 }
 
 fn interpret_contextual_followup(
@@ -2065,6 +2276,8 @@ fn mentions_result_list_item(lower: &str) -> bool {
         || lower.contains("result")
         || lower.contains("video")
         || lower.contains("link")
+        || lower.contains("sito")
+        || lower.contains("site")
 }
 
 fn refers_to_previous_target(lower: &str) -> bool {
@@ -2101,7 +2314,7 @@ fn ordinal_label(rank: u32) -> &'static str {
 fn result_item_kind(lower: &str) -> ResultListItemKind {
     if lower.contains("video") {
         ResultListItemKind::Video
-    } else if lower.contains("link") {
+    } else if lower.contains("link") || lower.contains("sito") || lower.contains("site") {
         ResultListItemKind::Link
     } else {
         ResultListItemKind::Result
@@ -2248,14 +2461,10 @@ fn most_common_candidate_field(values: impl Iterator<Item = String>) -> Option<S
 }
 
 fn browser_page_kind_from_hint(value: &str) -> Option<BrowserPageKind> {
-    match normalize_label(value).as_str() {
-        "search_results" | "results" | "result_list" | "youtube_results" => {
-            Some(BrowserPageKind::SearchResults)
-        }
-        "watch_page" | "video_page" | "youtube_watch" | "detail_page" => {
-            Some(BrowserPageKind::WatchPage)
-        }
-        "web_page" | "page" => Some(BrowserPageKind::WebPage),
+    match browser_page_semantic_kind(Some(value)) {
+        BrowserPageSemanticKind::SearchResults => Some(BrowserPageKind::SearchResults),
+        BrowserPageSemanticKind::WatchPage => Some(BrowserPageKind::WatchPage),
+        BrowserPageSemanticKind::WebPage => Some(BrowserPageKind::WebPage),
         _ => None,
     }
 }
@@ -2816,8 +3025,11 @@ fn result_item_kind_from_value(value: &str) -> ResultListItemKind {
 mod tests {
     use super::*;
     use crate::desktop_agent_types::{
-        CapabilityApprovalState, CapabilityPermissionState, CapabilityRuntimeState,
-        CapabilityScreenState, CapabilityToolAvailability, PageEvidenceSource, ScreenCaptureResult,
+        BrowserRecoveryStatus, CapabilityApprovalState, CapabilityPermissionState,
+        CapabilityRuntimeState, CapabilityScreenState, CapabilityToolAvailability, GoalConstraints,
+        GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus,
+        PageEvidenceSource, PlannerStepExecutionRecord, PlannerStepExecutionStatus,
+        ScreenCaptureResult, VisibleResultKind,
     };
     use crate::ui_control::{UIPrimitiveCapability, UIPrimitiveCapabilitySet, UIPrimitiveKind};
 
@@ -2994,6 +3206,18 @@ mod tests {
     }
 
     #[test]
+    fn browser_page_kind_hint_reuses_central_watch_alias_normalization() {
+        assert_eq!(
+            browser_page_kind_from_hint("video_watch"),
+            Some(BrowserPageKind::WatchPage)
+        );
+        assert_eq!(
+            browser_page_kind_from_hint("media_page"),
+            Some(BrowserPageKind::WatchPage)
+        );
+    }
+
+    #[test]
     fn edge_browser_detection_is_contextual_not_substring_based() {
         assert_eq!(browser_app_hint("edge of the screen"), None);
         assert_eq!(browser_app_hint("cutting edge tools"), None);
@@ -3067,6 +3291,143 @@ mod tests {
             SemanticPageValidationStatus::NeedsFreshCapture
         );
         assert!(validation.needs_fresh_capture);
+    }
+
+    #[test]
+    fn rank_two_followup_requires_fresh_capture_when_recent_screen_is_too_old() {
+        let resolution = resolve_workflow_continuation(
+            Some(youtube_context()),
+            &manifest_with_screen_age(Some(31_000), true),
+            "aprimi il secondo video",
+            2_000,
+        );
+
+        match resolution {
+            Some(WorkflowContinuationResolution::Workflow(workflow)) => {
+                let continuation = workflow.continuation.expect("continuation");
+                assert!(continuation.policy.fresh_capture_required);
+                assert!(!continuation.policy.recent_candidate_reuse_allowed);
+                assert_eq!(continuation.policy.max_reusable_screen_age_ms, Some(30_000));
+                assert!(continuation
+                    .policy
+                    .freshness_reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("rank 2"));
+            }
+            _ => panic!("expected workflow continuation"),
+        }
+    }
+
+    #[test]
+    fn rank_two_followup_refuses_when_fresh_capture_is_required_but_disabled() {
+        let resolution = resolve_workflow_continuation(
+            Some(youtube_context()),
+            &manifest_with_screen_age(Some(31_000), false),
+            "aprimi il secondo video",
+            2_000,
+        );
+
+        match resolution {
+            Some(WorkflowContinuationResolution::Refusal(refusal)) => {
+                assert_eq!(
+                    refusal.policy.status,
+                    ContinuationPolicyStatus::ScreenContextUnavailable
+                );
+                assert!(refusal.policy.fresh_capture_required);
+                assert!(!refusal.policy.recent_candidate_reuse_allowed);
+                assert!(refusal
+                    .policy
+                    .reason
+                    .contains("fresh observation is disabled"));
+            }
+            _ => panic!("expected refusal"),
+        }
+    }
+
+    #[test]
+    fn continuation_verification_promotes_goal_achieved_from_goal_loop() {
+        let descriptor = first_video_descriptor();
+        let verification = build_continuation_verification_result(
+            &descriptor,
+            &WorkflowRunStatus::Completed,
+            1,
+            1,
+            None,
+            Some(&GoalLoopRun {
+                run_id: "goal_loop".into(),
+                goal: GoalSpec {
+                    goal_id: "goal".into(),
+                    goal_type: GoalType::OpenMediaResult,
+                    constraints: GoalConstraints {
+                        provider: Some("youtube".into()),
+                        item_kind: Some("video".into()),
+                        result_kind: Some(VisibleResultKind::Video),
+                        rank_within_kind: Some(1),
+                        rank_overall: None,
+                        entity_name: None,
+                        attributes: Value::Null,
+                    },
+                    success_condition: "media_watch_page_visible".into(),
+                    utterance: "aprimi il primo video".into(),
+                    confidence: 0.9,
+                },
+                status: GoalLoopStatus::GoalAchieved,
+                iteration_count: 2,
+                retry_budget: 3,
+                retries_used: 0,
+                current_strategy: None,
+                fallback_strategy_state: None,
+                frames: Vec::new(),
+                planner_steps: Vec::new(),
+                planner_diagnostics: Vec::new(),
+                executed_steps: vec![PlannerStepExecutionRecord {
+                    step_id: "step".into(),
+                    status: PlannerStepExecutionStatus::Executed,
+                    primitive: "ClickTargetCandidate".into(),
+                    message: "clicked".into(),
+                    selected_target_candidate: None,
+                    geometry: None,
+                    fresh_capture_required: true,
+                    fresh_capture_used: true,
+                    target_signature: Some("video_1".into()),
+                }],
+                verification_history: vec![crate::desktop_agent_types::GoalVerificationRecord {
+                    iteration: 1,
+                    status: GoalVerificationStatus::GoalAchieved,
+                    confidence: 0.92,
+                    reason: "watch page visible".into(),
+                    frame_id: Some("frame_1".into()),
+                }],
+                focused_perception_requests: Vec::new(),
+                browser_handoff_history: Vec::new(),
+                browser_handoff: None,
+                focused_perception_used: false,
+                visible_refinement_used: false,
+                stale_capture_reuse_prevented: true,
+                browser_recovery_used: false,
+                browser_recovery_status: BrowserRecoveryStatus::NotNeeded,
+                post_action_progress_observed: true,
+                repeated_click_protection_triggered: false,
+                selected_target_candidate: None,
+                verifier_status: Some("GoalAchieved".into()),
+                failure_reason: None,
+            }),
+        );
+
+        assert_eq!(
+            verification.status,
+            ContinuationVerificationStatus::GoalAchieved
+        );
+        assert_eq!(
+            verification.goal_loop_status,
+            Some(GoalLoopStatus::GoalAchieved)
+        );
+        assert_eq!(
+            verification.goal_verifier_status,
+            Some(GoalVerificationStatus::GoalAchieved)
+        );
+        assert!(verification.post_action_progress_observed);
     }
 
     #[test]
@@ -3389,6 +3750,13 @@ mod tests {
     }
 
     fn manifest_with_screen(recent_capture: bool) -> CapabilityManifest {
+        manifest_with_screen_age(recent_capture.then_some(500), true)
+    }
+
+    fn manifest_with_screen_age(
+        recent_capture_age_ms: Option<u64>,
+        observation_enabled: bool,
+    ) -> CapabilityManifest {
         let ready = CapabilityToolAvailability {
             available: true,
             enabled: true,
@@ -3412,17 +3780,17 @@ mod tests {
             desktop_launch: ready,
             screen: CapabilityScreenState {
                 observation_supported: true,
-                observation_enabled: true,
+                observation_enabled,
                 capture_available: true,
                 analysis_available: true,
                 vision_model_available: true,
                 vision_model_name: Some("test-vision".into()),
-                recent_capture_available: recent_capture,
-                recent_capture_age_ms: recent_capture.then_some(500),
+                recent_capture_available: recent_capture_age_ms.is_some(),
+                recent_capture_age_ms,
                 fresh_capture_available: true,
                 fresh_capture_requires_observation_enabled: true,
-                last_capture_path: recent_capture.then(|| "screen.png".into()),
-                last_frame_at: recent_capture.then_some(1),
+                last_capture_path: recent_capture_age_ms.map(|_| "screen.png".into()),
+                last_frame_at: recent_capture_age_ms.map(|_| 1),
                 provider: "test".into(),
                 note: "test".into(),
             },
