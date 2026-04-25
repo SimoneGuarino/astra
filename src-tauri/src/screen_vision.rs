@@ -188,11 +188,32 @@ fn focused_perception_prompts(
     region: &str,
     resize_plan: &VisionResizePlan,
 ) -> (String, String) {
+    let surface_context = request
+        .verified_surface
+        .as_ref()
+        .map(|surface| {
+            let bounds = surface
+                .bounds
+                .as_ref()
+                .map(|bounds| {
+                    format!(
+                        "x={}, y={}, width={}, height={}, coordinate_space={}",
+                        bounds.x, bounds.y, bounds.width, bounds.height, bounds.coordinate_space
+                    )
+                })
+                .unwrap_or_else(|| "unavailable".into());
+            format!(
+                "kind={:?}, provider_hint={:?}, app_hint={:?}, source_frame_id={}, bounds={bounds}",
+                surface.kind, surface.provider_hint, surface.app_hint, surface.source_frame_id
+            )
+        })
+        .unwrap_or_else(|| "none".into());
     match request.mode {
         PerceptionRequestMode::TargetFocus => (
             [
                 "You are Astra Focused Semantic Perception. Return only strict JSON, no markdown. ",
                 "Inspect the full screenshot but focus your structured observations on the requested screen region. ",
+                "When a verified interaction surface is supplied, treat it as the browser ownership boundary and ignore Astra chat, terminal, and unrelated desktop content outside it. ",
                 "Do not choose actions or command the desktop. Return a semantic_frame compatible with the full-frame schema. ",
                 "When the focused region contains a result card, title link, thumbnail, avatar, or control, provide precise click_regions. ",
                 SHARED_REGION_OUTPUT_INSTRUCTIONS,
@@ -201,7 +222,7 @@ fn focused_perception_prompts(
             ]
             .concat(),
             format!(
-                "Goal: {goal}. Focus reason: {}. Routing decision: {:?}. Focus target item: {:?}. Focus target entity: {:?}. Focus region: {region}. Browser/app hint: {app_hint}. Expected content provider hint: {provider_hint}. Observation backend: {provider}. {} {SHARED_SEMANTIC_FRAME_OUTPUT_SUFFIX}",
+                "Goal: {goal}. Focus reason: {}. Routing decision: {:?}. Focus target item: {:?}. Focus target entity: {:?}. Focus region: {region}. Verified interaction surface: {surface_context}. Browser/app hint: {app_hint}. Expected content provider hint: {provider_hint}. Observation backend: {provider}. {} {SHARED_SEMANTIC_FRAME_OUTPUT_SUFFIX}",
                 request.reason,
                 request.routing_decision,
                 request.target_item_id,
@@ -214,6 +235,7 @@ fn focused_perception_prompts(
                 "You are Astra Visible Actionability Refinement. Return only strict JSON, no markdown. ",
                 "The page is already visually verified; refine the semantic understanding of what is currently visible before any off-screen inference. ",
                 "Inspect the full screenshot and improve visible_result_items, visible_entities, and actionable_controls for currently visible cards, rows, tiles, links, thumbnails, avatars, and controls. ",
+                "When a verified interaction surface is supplied, refine only inside that browser-owned surface and do not reinterpret Astra chat, terminal, or unrelated desktop UI as results. ",
                 "If visible items are weakly typed or missing titles, ranks, or click_regions, improve them conservatively. ",
                 SHARED_REGION_OUTPUT_INSTRUCTIONS,
                 "Do not invent off-screen targets or hidden content. Prefer explicit uncertainty over guessing. ",
@@ -221,7 +243,7 @@ fn focused_perception_prompts(
             ]
             .concat(),
             format!(
-                "Goal: {goal}. Refinement reason: {}. Routing decision: {:?}. Refinement mode: {:?}. Refinement strategy: {:?}. Target item context: {:?}. Target entity context: {:?}. Visible region cluster: {region}. Browser/app hint: {app_hint}. Expected content provider hint: {provider_hint}. Observation backend: {provider}. {} {SHARED_SEMANTIC_FRAME_OUTPUT_SUFFIX}",
+                "Goal: {goal}. Refinement reason: {}. Routing decision: {:?}. Refinement mode: {:?}. Refinement strategy: {:?}. Target item context: {:?}. Target entity context: {:?}. Visible region cluster: {region}. Verified interaction surface: {surface_context}. Browser/app hint: {app_hint}. Expected content provider hint: {provider_hint}. Observation backend: {provider}. {} {SHARED_SEMANTIC_FRAME_OUTPUT_SUFFIX}",
                 request.reason,
                 request.routing_decision,
                 request.mode,
@@ -1277,6 +1299,7 @@ mod tests {
             target_entity_id: None,
             region: None,
             target_region_anchor_present: false,
+            verified_surface: None,
         };
 
         let (system, user) = focused_perception_prompts(

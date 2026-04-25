@@ -103,6 +103,14 @@ export type PageSemanticEvidence = {
     uncertainty?: string[];
 };
 
+export type TargetRegion = {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    coordinate_space?: string;
+};
+
 export type PrimaryListItem = {
     item_id: string;
     rank: number;
@@ -239,6 +247,50 @@ export type BrowserRecoveryStatus =
     | "reacquired"
     | "failed";
 
+export type InteractionSurfaceKind =
+    | "browser"
+    | "desktop_agent"
+    | "terminal"
+    | "unknown";
+
+export type VerifiedInteractionSurface = {
+    kind: InteractionSurfaceKind;
+    provider_hint?: string | null;
+    app_hint?: string | null;
+    page_kind_hint?: string | null;
+    bounds?: TargetRegion | null;
+    verified_at_ms: number;
+    source_frame_id: string;
+    confidence?: number | null;
+};
+
+export type FocusedPerceptionFailureReason =
+    | "no_verified_surface"
+    | "surface_bounds_unavailable"
+    | "requested_region_outside_surface"
+    | "surface_ownership_lost"
+    | "structured_perception_empty";
+
+export type SurfaceOwnershipStatus =
+    | "not_required"
+    | "verified"
+    | "reacquired"
+    | "lost"
+    | "refused";
+
+export type SurfaceOwnershipDiagnostic = {
+    iteration: number;
+    status: SurfaceOwnershipStatus;
+    failure_reason?: FocusedPerceptionFailureReason | null;
+    surface?: VerifiedInteractionSurface | null;
+    observed_frame_id?: string | null;
+    provider_matches?: boolean | null;
+    browser_evidence_present?: boolean;
+    requested_region?: TargetRegion | null;
+    surface_bounds?: TargetRegion | null;
+    reason?: string | null;
+};
+
 export type ExecutableGeometryDiagnostic = {
     raw_region?: unknown | null;
     interpreted_region?: unknown | null;
@@ -274,8 +326,9 @@ export type FocusedPerceptionRequest = {
     refinement_strategy?: VisibleRefinementStrategy;
     target_item_id?: string | null;
     target_entity_id?: string | null;
-    region?: unknown | null;
+    region?: TargetRegion | null;
     target_region_anchor_present?: boolean;
+    verified_surface?: VerifiedInteractionSurface | null;
 };
 
 export type BrowserPageSemanticKind =
@@ -446,12 +499,16 @@ export type GoalLoopRun = {
     focused_perception_requests?: FocusedPerceptionRequest[];
     browser_handoff_history?: BrowserVisualHandoffRecord[];
     browser_handoff?: BrowserVisualHandoffRecord | null;
+    verified_surface?: VerifiedInteractionSurface | null;
+    surface_diagnostics?: SurfaceOwnershipDiagnostic[];
     focused_perception_used: boolean;
     visible_refinement_used?: boolean;
     stale_capture_reuse_prevented?: boolean;
     browser_recovery_used?: boolean;
     browser_recovery_status?: BrowserRecoveryStatus;
     post_action_progress_observed?: boolean;
+    surface_ownership_lost?: boolean;
+    focused_perception_failure_reason?: FocusedPerceptionFailureReason | null;
     repeated_click_protection_triggered?: boolean;
     selected_target_candidate?: unknown | null;
     verifier_status?: string | null;

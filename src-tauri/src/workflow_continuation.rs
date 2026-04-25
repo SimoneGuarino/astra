@@ -206,6 +206,7 @@ pub enum EntityRoleKind {
     ContentProvider,
     PageContext,
     QueryText,
+    EntityName,
     ResultReference,
     ContinuationControl,
     TextValue,
@@ -933,6 +934,7 @@ pub fn build_continuation_verification_result(
         goal_loop_executed_action(goal_loop)
             && goal_loop.status != GoalLoopStatus::GoalAchieved
             && (goal_loop.post_action_progress_observed
+                || goal_loop.surface_ownership_lost
                 || goal_loop_has_ambiguous_final_verification(goal_loop))
     });
     let status = if goal_achieved {
@@ -995,6 +997,9 @@ pub fn build_continuation_verification_result(
             "post_action_progress_observed={}",
             goal_loop.post_action_progress_observed
         ));
+        if goal_loop.surface_ownership_lost {
+            observed_evidence.push("surface_ownership_lost=true".into());
+        }
     }
     if let Some(status) = goal_verifier_status.as_ref() {
         observed_evidence.push(format!("goal_verifier_status={status:?}"));
@@ -1904,6 +1909,7 @@ fn interpret_contextual_followup(
         ordinal_label: ordinal_label(rank).into(),
         item_kind: result_item_kind(&lower),
     });
+    let (query_hint, _) = extract_followup_query_or_entity_name(message, &lower);
 
     if navigation && click_or_open && result_reference.is_some() {
         return Some(ContextualFollowupInterpretation {
@@ -1913,7 +1919,7 @@ fn interpret_contextual_followup(
             app_hint,
             provider_hint,
             page_context_hint: Some(PageContextHint::PreviousPage),
-            query_hint: extract_followup_query_hint(message),
+            query_hint: query_hint.clone(),
             text_value: None,
             result_reference,
             ordinal_reference: rank,
@@ -1969,7 +1975,7 @@ fn interpret_contextual_followup(
             app_hint,
             provider_hint,
             page_context_hint: page_context_hint.or(Some(PageContextHint::RecentResultsPage)),
-            query_hint: extract_followup_query_hint(message),
+            query_hint,
             text_value: None,
             ordinal_reference: rank.or(Some(1)),
             result_reference,
@@ -2074,6 +2080,13 @@ fn entities_for_followup(
             "contextual_merge": followup.merge_diagnostic.clone(),
         },
     });
+    if let Some(entity_name) = followup
+        .interpretation
+        .as_ref()
+        .and_then(|interpretation| entity_name_from_roles(&interpretation.entity_roles))
+    {
+        entities["entity_name"] = json!(entity_name);
+    }
 
     match followup.action_kind {
         FollowupActionKind::OpenResult | FollowupActionKind::ClickResult => {
@@ -2269,6 +2282,9 @@ fn looks_like_click_or_open(lower: &str) -> bool {
         || lower.contains("apri")
         || lower.contains("aprimi")
         || lower.contains("open")
+        || lower.contains("mostrami")
+        || lower.contains("show me")
+        || lower.contains("fammelo vedere")
 }
 
 fn mentions_result_list_item(lower: &str) -> bool {
@@ -2649,7 +2665,8 @@ fn entity_role_assignments(
             source: source.clone(),
         });
     }
-    if let Some(query) = extract_followup_query_hint(message) {
+    let (query_hint, entity_name) = extract_followup_query_or_entity_name(message, &lower);
+    if let Some(query) = query_hint {
         roles.push(EntityRoleAssignment {
             text: query.clone(),
             role: EntityRoleKind::QueryText,
@@ -2657,6 +2674,9 @@ fn entity_role_assignments(
             confidence: 0.70,
             source: source.clone(),
         });
+    }
+    if let Some(entity_name) = entity_name {
+        push_entity_name_role(&mut roles, &entity_name, source.clone());
     }
     if let Some(page) = page_context_hint(&lower, browser_app_hint(&lower).as_deref()) {
         roles.push(EntityRoleAssignment {
@@ -2757,6 +2777,29 @@ fn contextual_interpretation_from_model_params(
         continuation_kind,
         ContextualFollowupKind::ResumeRecentWorkflow
     );
+    let raw_query_hint = value_str(entities, "query_hint")
+        .or_else(|| value_str(entities, "query"))
+        .and_then(|value| normalize_followup_query_hint(value))
+        .or_else(|| extract_followup_query_hint(message));
+    let is_open_followup = matches!(
+        continuation_kind,
+        ContextualFollowupKind::OpenResult
+            | ContextualFollowupKind::ClickResult
+            | ContextualFollowupKind::NavigateBackThenOpenResult
+    ) && message_is_open_result_followup(&lower);
+    let (query_hint, entity_name) = match raw_query_hint {
+        Some(value) if is_open_followup => (None, Some(value)),
+        other => (other, None),
+    };
+    let mut entity_roles =
+        entity_role_assignments(message, FollowupResolutionSource::ModelAssistedClassifier);
+    if let Some(entity_name) = entity_name.as_deref() {
+        push_entity_name_role(
+            &mut entity_roles,
+            entity_name,
+            FollowupResolutionSource::ModelAssistedClassifier,
+        );
+    }
 
     Some(ContextualFollowupInterpretation {
         utterance: message.to_string(),
@@ -2765,10 +2808,7 @@ fn contextual_interpretation_from_model_params(
         app_hint: browser_hint,
         provider_hint,
         page_context_hint: page_context_hint(&lower, browser_app_hint(&lower).as_deref()),
-        query_hint: value_str(entities, "query_hint")
-            .or_else(|| value_str(entities, "query"))
-            .and_then(|value| normalize_followup_query_hint(value))
-            .or_else(|| extract_followup_query_hint(message)),
+        query_hint,
         text_value,
         result_reference,
         ordinal_reference: rank,
@@ -2779,10 +2819,7 @@ fn contextual_interpretation_from_model_params(
         confidence: confidence.clamp(0.0, 1.0),
         source: FollowupResolutionSource::ModelAssistedClassifier,
         rationale: "model-assisted contextual follow-up interpretation normalized by Rust".into(),
-        entity_roles: entity_role_assignments(
-            message,
-            FollowupResolutionSource::ModelAssistedClassifier,
-        ),
+        entity_roles,
     })
 }
 
@@ -2804,6 +2841,65 @@ fn extract_followup_query_hint(original: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn message_is_open_result_followup(lower: &str) -> bool {
+    let lower = lower.trim();
+    lower.starts_with("apri")
+        || lower.starts_with("open")
+        || lower.contains(" apri ")
+        || lower.starts_with("mostrami")
+        || lower.starts_with("show me")
+        || lower.starts_with("fammelo vedere")
+}
+
+fn extract_followup_query_or_entity_name(
+    message: &str,
+    lower: &str,
+) -> (Option<String>, Option<String>) {
+    let raw_query_hint = extract_followup_query_hint(message);
+    if message_is_open_result_followup(lower) {
+        (None, raw_query_hint)
+    } else {
+        (raw_query_hint, None)
+    }
+}
+
+fn push_entity_name_role(
+    roles: &mut Vec<EntityRoleAssignment>,
+    entity_name: &str,
+    source: FollowupResolutionSource,
+) {
+    if roles.iter().any(|role| {
+        role.role == EntityRoleKind::EntityName
+            && role
+                .normalized_value
+                .as_deref()
+                .is_some_and(|value| value == entity_name)
+    }) {
+        return;
+    }
+    roles.push(EntityRoleAssignment {
+        text: entity_name.to_string(),
+        role: EntityRoleKind::EntityName,
+        normalized_value: Some(entity_name.to_string()),
+        confidence: 0.70,
+        source,
+    });
+}
+
+fn entity_name_from_roles(roles: &[EntityRoleAssignment]) -> Option<String> {
+    roles
+        .iter()
+        .find(|role| role.role == EntityRoleKind::EntityName)
+        .and_then(|role| {
+            role.normalized_value
+                .as_deref()
+                .or(Some(role.text.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn normalize_followup_query_hint(value: &str) -> Option<String> {
@@ -3094,6 +3190,66 @@ mod tests {
             }
             _ => panic!("expected workflow continuation"),
         }
+    }
+
+    #[test]
+    fn open_result_with_title_di_does_not_become_query_hint() {
+        let resolution = resolve_workflow_continuation(
+            Some(youtube_context()),
+            &manifest_with_screen(true),
+            "aprimi il video di Finesse",
+            2_000,
+        );
+
+        match resolution {
+            Some(WorkflowContinuationResolution::Workflow(workflow)) => {
+                let continuation = workflow.continuation.as_ref().expect("continuation");
+                assert!(
+                    continuation.followup.query_hint.is_none(),
+                    "title reference after 'di' must not become a query_hint in open-result context"
+                );
+                let interpretation = continuation
+                    .followup
+                    .interpretation
+                    .as_ref()
+                    .expect("interpretation");
+                assert_eq!(
+                    interpretation
+                        .entity_roles
+                        .iter()
+                        .find(|role| role.role == EntityRoleKind::EntityName)
+                        .and_then(|role| role.normalized_value.as_deref()),
+                    Some("Finesse"),
+                    "title reference should be stored as entity_name role"
+                );
+                assert!(
+                    continuation
+                        .followup
+                        .merge_diagnostic
+                        .as_ref()
+                        .is_some_and(|merge| merge.conflicts.is_empty()),
+                    "entity title filter should not create a query mismatch"
+                );
+            }
+            _ => panic!("expected workflow continuation"),
+        }
+    }
+
+    #[test]
+    fn open_result_for_en_does_not_become_query_hint() {
+        let interpretation =
+            interpret_contextual_followup("open the video for Finesse", None, None)
+                .expect("interpretation");
+
+        assert!(interpretation.query_hint.is_none());
+        assert_eq!(
+            interpretation
+                .entity_roles
+                .iter()
+                .find(|role| role.role == EntityRoleKind::EntityName)
+                .and_then(|role| role.normalized_value.as_deref()),
+            Some("Finesse")
+        );
     }
 
     #[test]
@@ -3402,12 +3558,16 @@ mod tests {
                 focused_perception_requests: Vec::new(),
                 browser_handoff_history: Vec::new(),
                 browser_handoff: None,
+                verified_surface: None,
+                surface_diagnostics: Vec::new(),
                 focused_perception_used: false,
                 visible_refinement_used: false,
                 stale_capture_reuse_prevented: true,
                 browser_recovery_used: false,
                 browser_recovery_status: BrowserRecoveryStatus::NotNeeded,
                 post_action_progress_observed: true,
+                surface_ownership_lost: false,
+                focused_perception_failure_reason: None,
                 repeated_click_protection_triggered: false,
                 selected_target_candidate: None,
                 verifier_status: Some("GoalAchieved".into()),

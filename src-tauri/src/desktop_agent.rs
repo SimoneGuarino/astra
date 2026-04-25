@@ -571,6 +571,14 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
                 return Err("Permission denied for desktop observation".into());
             }
             let capture = self.runtime.capture_for_structured_grounding()?;
+            let app_hint = request
+                .verified_surface
+                .as_ref()
+                .and_then(|surface| surface.app_hint.as_deref());
+            let provider_hint = request
+                .verified_surface
+                .as_ref()
+                .and_then(|surface| surface.provider_hint.as_deref());
             self.runtime
                 .screen_vision
                 .perceive_focused_region(
@@ -579,8 +587,8 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
                     &capture.provider,
                     request,
                     Some(&request.reason),
-                    None,
-                    None,
+                    app_hint,
+                    provider_hint,
                 )
                 .await
                 .map(Some)
@@ -2215,6 +2223,7 @@ fn goal_loop_should_project_partial_completion(goal_loop: &GoalLoopRun) -> bool 
     goal_loop_has_executed_action(goal_loop)
         && (goal_loop.post_action_progress_observed
             || goal_loop_has_ambiguous_final_verification(goal_loop)
+            || goal_loop.surface_ownership_lost
             || matches!(
                 goal_loop.browser_recovery_status,
                 crate::desktop_agent_types::BrowserRecoveryStatus::Failed
@@ -2547,12 +2556,16 @@ mod tests {
             focused_perception_requests: Vec::new(),
             browser_handoff_history: Vec::new(),
             browser_handoff: None,
+            verified_surface: None,
+            surface_diagnostics: Vec::new(),
             focused_perception_used: false,
             visible_refinement_used: false,
             stale_capture_reuse_prevented: true,
             browser_recovery_used: false,
             browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
             post_action_progress_observed: true,
+            surface_ownership_lost: false,
+            focused_perception_failure_reason: None,
             repeated_click_protection_triggered: false,
             selected_target_candidate: Some(candidate),
             verifier_status: Some("GoalAchieved".into()),
@@ -2629,12 +2642,16 @@ mod tests {
             focused_perception_requests: Vec::new(),
             browser_handoff_history: Vec::new(),
             browser_handoff: None,
+            verified_surface: None,
+            surface_diagnostics: Vec::new(),
             focused_perception_used: false,
             visible_refinement_used: false,
             stale_capture_reuse_prevented: true,
             browser_recovery_used: false,
             browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
             post_action_progress_observed: true,
+            surface_ownership_lost: false,
+            focused_perception_failure_reason: None,
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: Some("Ambiguous".into()),
@@ -2798,12 +2815,16 @@ mod tests {
             focused_perception_requests: Vec::new(),
             browser_handoff_history: Vec::new(),
             browser_handoff: None,
+            verified_surface: None,
+            surface_diagnostics: Vec::new(),
             focused_perception_used: false,
             visible_refinement_used: false,
             stale_capture_reuse_prevented: true,
             browser_recovery_used: false,
             browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
             post_action_progress_observed: true,
+            surface_ownership_lost: false,
+            focused_perception_failure_reason: None,
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: Some("GoalAchieved".into()),
@@ -2862,12 +2883,16 @@ mod tests {
             focused_perception_requests: Vec::new(),
             browser_handoff_history: Vec::new(),
             browser_handoff: None,
+            verified_surface: None,
+            surface_diagnostics: Vec::new(),
             focused_perception_used: false,
             visible_refinement_used: false,
             stale_capture_reuse_prevented: false,
             browser_recovery_used: false,
             browser_recovery_status: crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
             post_action_progress_observed: false,
+            surface_ownership_lost: false,
+            focused_perception_failure_reason: None,
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: Some("Refused".into()),

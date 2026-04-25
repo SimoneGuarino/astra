@@ -3,14 +3,16 @@ use crate::{
         ActionableControl, BrowserHandoffStatus, BrowserHandoffVerificationDecision,
         BrowserHandoffVerificationDiagnostic, BrowserPageSemanticKind, BrowserRecoveryStatus,
         BrowserVisualHandoffResult, ClickRegion, ConfidenceSignalState, ExecutableFallbackSource,
-        ExecutableTargetConfidenceDiagnostic, FocusedPerceptionRequest, FrameUncertainty,
-        GoalConstraints, GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationRecord,
-        GoalVerificationStatus, OffscreenInferenceStage, PageEvidenceSource, PageSemanticEvidence,
-        PageState, PerceptionRequestMode, PerceptionRoutingDecision, PlannerContractDecision,
+        ExecutableTargetConfidenceDiagnostic, FocusedPerceptionFailureReason,
+        FocusedPerceptionRequest, FrameUncertainty, GoalConstraints, GoalLoopRun, GoalLoopStatus,
+        GoalSpec, GoalType, GoalVerificationRecord, GoalVerificationStatus, InteractionSurfaceKind,
+        OffscreenInferenceStage, PageEvidenceSource, PageSemanticEvidence, PageState,
+        PerceptionRequestMode, PerceptionRoutingDecision, PlannerContractDecision,
         PlannerContractInput, PlannerContractSource, PlannerDecisionDiagnostic,
         PlannerDecisionStatus, PlannerRejectionReason, PlannerScrollIntent, PlannerStep,
         PlannerStepExecutionRecord, PlannerStepExecutionStatus, PlannerStepKind,
         PlannerVisibilityAssessment, PrimaryList, PrimaryListItem, SemanticScreenFrame,
+        SurfaceOwnershipDiagnostic, SurfaceOwnershipStatus, VerifiedInteractionSurface,
         VisibleActionabilityDiagnostic, VisibleActionabilityStatus, VisibleEntity,
         VisibleEntityKind, VisibleGroundingGap, VisibleRefinementStrategy, VisibleResultItem,
         VisibleResultKind,
@@ -261,12 +263,16 @@ pub fn run_goal_loop_once(goal: GoalSpec, frame: SemanticScreenFrame) -> GoalLoo
         focused_perception_requests: Vec::new(),
         browser_handoff_history: Vec::new(),
         browser_handoff: None,
+        verified_surface: None,
+        surface_diagnostics: Vec::new(),
         focused_perception_used: false,
         visible_refinement_used: false,
         stale_capture_reuse_prevented: false,
         browser_recovery_used: false,
         browser_recovery_status: BrowserRecoveryStatus::NotNeeded,
         post_action_progress_observed: false,
+        surface_ownership_lost: false,
+        focused_perception_failure_reason: None,
         repeated_click_protection_triggered: false,
         selected_target_candidate: None,
         verifier_status: None,
@@ -399,12 +405,16 @@ impl GoalLoopRuntime {
             focused_perception_requests: Vec::new(),
             browser_handoff_history: Vec::new(),
             browser_handoff: None,
+            verified_surface: None,
+            surface_diagnostics: Vec::new(),
             focused_perception_used: false,
             visible_refinement_used: false,
             stale_capture_reuse_prevented: false,
             browser_recovery_used: false,
             browser_recovery_status: BrowserRecoveryStatus::NotNeeded,
             post_action_progress_observed: false,
+            surface_ownership_lost: false,
+            focused_perception_failure_reason: None,
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: None,
@@ -445,6 +455,15 @@ impl GoalLoopRuntime {
                                 return run;
                             }
                             if let Some(frame) = outcome.verified_frame {
+                                let surface =
+                                    verified_browser_surface_from_frame(&run.goal, &frame);
+                                run.verified_surface = Some(surface.clone());
+                                run.surface_diagnostics.push(surface_verified_diagnostic(
+                                    iteration,
+                                    &surface,
+                                    SurfaceOwnershipStatus::Verified,
+                                    "browser visual handoff established browser surface ownership",
+                                ));
                                 run.frames.push(frame);
                                 handoff_supplied_frame = true;
                             }
@@ -495,6 +514,28 @@ impl GoalLoopRuntime {
                     .frames
                     .last()
                     .expect("frame after post-click perception");
+                let mut surface_lost_after_click = false;
+                if let Some(surface) = run.verified_surface.clone() {
+                    let diagnostic = surface_continuity_diagnostic(
+                        &run.goal,
+                        &surface,
+                        current_frame,
+                        iteration,
+                    );
+                    surface_lost_after_click = diagnostic.status == SurfaceOwnershipStatus::Lost
+                        && verify_goal_against_frame(&run.goal, current_frame).is_none();
+                    if surface_lost_after_click {
+                        run.surface_ownership_lost = true;
+                        run.focused_perception_failure_reason =
+                            Some(FocusedPerceptionFailureReason::SurfaceOwnershipLost);
+                    } else if diagnostic.status == SurfaceOwnershipStatus::Verified {
+                        run.verified_surface = Some(verified_browser_surface_from_frame(
+                            &run.goal,
+                            current_frame,
+                        ));
+                    }
+                    run.surface_diagnostics.push(diagnostic);
+                }
                 let post_click = evaluate_post_click_frame(&run.goal, &pending, current_frame);
                 if post_click.progress_observed {
                     run.post_action_progress_observed = true;
@@ -529,9 +570,13 @@ impl GoalLoopRuntime {
 
                 if !post_click.goal_achieved
                     && browser_recovery_attempts < MAX_BROWSER_RECOVERY_ATTEMPTS
-                    && (post_click.browser_surface_suspect || post_click.frame_unchanged)
+                    && (surface_lost_after_click
+                        || post_click.browser_surface_suspect
+                        || post_click.frame_unchanged)
                 {
-                    let reason = if post_click.browser_surface_suspect {
+                    let reason = if surface_lost_after_click {
+                        "surface_ownership_lost_after_click"
+                    } else if post_click.browser_surface_suspect {
                         "browser_surface_lost_after_click"
                     } else {
                         "post_click_page_unchanged"
@@ -548,6 +593,19 @@ impl GoalLoopRuntime {
                             run.browser_handoff = Some(outcome.record.clone());
                             run.browser_handoff_history.push(outcome.record.clone());
                             if let Some(frame) = outcome.verified_frame {
+                                if outcome.record.status == BrowserHandoffStatus::VisuallyVerified {
+                                    let surface =
+                                        verified_browser_surface_from_frame(&run.goal, &frame);
+                                    run.verified_surface = Some(surface.clone());
+                                    run.surface_diagnostics.push(surface_verified_diagnostic(
+                                        iteration,
+                                        &surface,
+                                        SurfaceOwnershipStatus::Reacquired,
+                                        "bounded browser recovery reacquired browser surface ownership",
+                                    ));
+                                    run.surface_ownership_lost = false;
+                                    run.focused_perception_failure_reason = None;
+                                }
                                 run.frames.push(frame);
                             }
                         }
@@ -561,6 +619,15 @@ impl GoalLoopRuntime {
                             run.verifier_status = Some(format!("browser_recovery_failed:{error}"));
                         }
                     }
+                }
+                if surface_lost_after_click && run.surface_ownership_lost {
+                    run.status = GoalLoopStatus::VerificationFailed;
+                    run.failure_reason = Some(
+                        "browser interaction surface ownership was lost after the governed click and bounded recovery did not reacquire it"
+                            .into(),
+                    );
+                    run.verifier_status = Some("surface_ownership_lost".into());
+                    return run;
                 }
             }
 
@@ -584,15 +651,30 @@ impl GoalLoopRuntime {
                 self.config.max_visible_refinement_passes,
             );
             let deterministic = deterministic_planner_contract_decision(&planner_input);
-            let decision = match driver.plan(&planner_input).await {
-                Ok(Some(model_decision)) => {
-                    validate_model_planner_decision(&planner_input, model_decision, deterministic)
+            let decision = if deterministic_visible_ordinal_fast_path(
+                &planner_input,
+                &deterministic.proposed_step,
+            ) {
+                PlannerContractDecision {
+                    strategy_rationale: format!(
+                        "deterministic_visible_ordinal_fast_path: {}",
+                        deterministic.strategy_rationale
+                    ),
+                    ..deterministic
                 }
-                Ok(None) => deterministic,
-                Err(error) => planner_fallback_decision(
-                    deterministic,
-                    format!("model planner unavailable: {error}"),
-                ),
+            } else {
+                match driver.plan(&planner_input).await {
+                    Ok(Some(model_decision)) => validate_model_planner_decision(
+                        &planner_input,
+                        model_decision,
+                        deterministic,
+                    ),
+                    Ok(None) => deterministic,
+                    Err(error) => planner_fallback_decision(
+                        deterministic,
+                        format!("model planner unavailable: {error}"),
+                    ),
+                }
             };
             let step = decision.proposed_step.clone();
             run.planner_diagnostics.push(PlannerDecisionDiagnostic {
@@ -703,6 +785,24 @@ impl GoalLoopRuntime {
                                         run.browser_handoff = Some(outcome.record.clone());
                                         run.browser_handoff_history.push(outcome.record.clone());
                                         if let Some(frame) = outcome.verified_frame {
+                                            if outcome.record.status
+                                                == BrowserHandoffStatus::VisuallyVerified
+                                            {
+                                                let surface = verified_browser_surface_from_frame(
+                                                    &run.goal, &frame,
+                                                );
+                                                run.verified_surface = Some(surface.clone());
+                                                run.surface_diagnostics.push(
+                                                    surface_verified_diagnostic(
+                                                        iteration,
+                                                        &surface,
+                                                        SurfaceOwnershipStatus::Reacquired,
+                                                        "bounded browser recovery reacquired browser surface after execution failure",
+                                                    ),
+                                                );
+                                                run.surface_ownership_lost = false;
+                                                run.focused_perception_failure_reason = None;
+                                            }
                                             run.frames.push(frame);
                                             recovery_supplied_frame = true;
                                         }
@@ -776,6 +876,33 @@ impl GoalLoopRuntime {
                         }
                         return run;
                     };
+                    let browser_owned_workflow = run.verified_surface.is_some()
+                        || run.browser_handoff.as_ref().is_some_and(|record| {
+                            record.status == BrowserHandoffStatus::VisuallyVerified
+                        });
+                    let request = match bind_focused_perception_request_to_surface(
+                        request,
+                        run.verified_surface.as_ref(),
+                        browser_owned_workflow,
+                        iteration,
+                    ) {
+                        Ok(request) => request,
+                        Err(diagnostic) => {
+                            run.focused_perception_failure_reason =
+                                diagnostic.failure_reason.clone();
+                            run.surface_diagnostics.push(diagnostic.clone());
+                            run.status = GoalLoopStatus::Refused;
+                            run.failure_reason = diagnostic.reason.clone().or_else(|| {
+                                Some(
+                                    "focused perception was refused outside the verified browser surface"
+                                        .into(),
+                                )
+                            });
+                            run.verifier_status =
+                                Some("focused_perception_surface_bound_refused".into());
+                            return run;
+                        }
+                    };
                     if focused_passes >= self.config.max_focused_perception_passes {
                         run.status = GoalLoopStatus::BudgetExhausted;
                         run.failure_reason =
@@ -792,16 +919,42 @@ impl GoalLoopRuntime {
                     run.focused_perception_requests.push(request.clone());
                     match driver.focused_perception(&request).await {
                         Ok(Some(frame)) => {
+                            if let Some(surface) = run.verified_surface.clone() {
+                                let diagnostic = surface_continuity_diagnostic(
+                                    &run.goal, &surface, &frame, iteration,
+                                );
+                                if diagnostic.status == SurfaceOwnershipStatus::Lost {
+                                    run.surface_ownership_lost = true;
+                                    run.focused_perception_failure_reason =
+                                        Some(FocusedPerceptionFailureReason::SurfaceOwnershipLost);
+                                    run.surface_diagnostics.push(diagnostic);
+                                    run.status = GoalLoopStatus::VerificationFailed;
+                                    run.failure_reason = Some(
+                                        "focused perception returned a frame outside the verified browser surface"
+                                            .into(),
+                                    );
+                                    run.verifier_status =
+                                        Some("focused_perception_surface_ownership_lost".into());
+                                    return run;
+                                }
+                                run.verified_surface =
+                                    Some(verified_browser_surface_from_frame(&run.goal, &frame));
+                                run.surface_diagnostics.push(diagnostic);
+                            }
                             run.frames.push(frame);
                             should_perceive = false;
                         }
                         Ok(None) => {
+                            run.focused_perception_failure_reason =
+                                Some(FocusedPerceptionFailureReason::StructuredPerceptionEmpty);
                             run.status = GoalLoopStatus::NeedsPerception;
                             run.failure_reason =
                                 Some("focused perception returned no semantic frame".into());
                             return run;
                         }
                         Err(error) => {
+                            run.focused_perception_failure_reason =
+                                Some(FocusedPerceptionFailureReason::StructuredPerceptionEmpty);
                             run.status = GoalLoopStatus::NeedsPerception;
                             run.failure_reason =
                                 Some(format!("focused perception failed: {error}"));
@@ -3949,6 +4102,7 @@ fn focused_perception_request_for_step(
                 target_entity_id: step.target_entity_id.clone(),
                 region: Some(region),
                 target_region_anchor_present: true,
+                verified_surface: None,
             });
         }
 
@@ -3967,6 +4121,7 @@ fn focused_perception_request_for_step(
             target_entity_id: step.target_entity_id.clone(),
             region: visible_cluster_region(frame),
             target_region_anchor_present: false,
+            verified_surface: None,
         });
     }
 
@@ -3985,6 +4140,7 @@ fn focused_perception_request_for_step(
         target_entity_id: None,
         region: visible_cluster_region(frame),
         target_region_anchor_present: false,
+        verified_surface: None,
     })
 }
 
@@ -4128,6 +4284,272 @@ fn merge_regions(regions: &[TargetRegion]) -> Option<TargetRegion> {
         height: bottom - top,
         coordinate_space: first.coordinate_space.clone(),
     })
+}
+
+fn expanded_region(region: &TargetRegion, padding: f64) -> TargetRegion {
+    TargetRegion {
+        x: region.x - padding,
+        y: region.y - padding,
+        width: region.width + (padding * 2.0),
+        height: region.height + (padding * 2.0),
+        coordinate_space: region.coordinate_space.clone(),
+    }
+}
+
+fn region_is_valid(region: &TargetRegion) -> bool {
+    region.x.is_finite()
+        && region.y.is_finite()
+        && region.width.is_finite()
+        && region.height.is_finite()
+        && region.width > 0.0
+        && region.height > 0.0
+}
+
+fn region_contains_region(outer: &TargetRegion, inner: &TargetRegion) -> bool {
+    if !region_is_valid(outer) || !region_is_valid(inner) {
+        return false;
+    }
+    normalize_label(&outer.coordinate_space) == normalize_label(&inner.coordinate_space)
+        && inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.x + inner.width <= outer.x + outer.width
+        && inner.y + inner.height <= outer.y + outer.height
+}
+
+fn inferred_browser_surface_bounds(frame: &SemanticScreenFrame) -> Option<TargetRegion> {
+    visible_cluster_region(frame).map(|region| expanded_region(&region, 64.0))
+}
+
+fn verified_browser_surface_from_frame(
+    goal: &GoalSpec,
+    frame: &SemanticScreenFrame,
+) -> VerifiedInteractionSurface {
+    VerifiedInteractionSurface {
+        kind: InteractionSurfaceKind::Browser,
+        provider_hint: goal
+            .constraints
+            .provider
+            .clone()
+            .or_else(|| frame.page_evidence.content_provider_hint.clone()),
+        app_hint: frame.page_evidence.browser_app_hint.clone(),
+        page_kind_hint: frame.page_evidence.page_kind_hint.clone(),
+        bounds: inferred_browser_surface_bounds(frame),
+        verified_at_ms: frame.captured_at,
+        source_frame_id: frame.frame_id.clone(),
+        confidence: Some(frame.page_evidence.confidence),
+    }
+}
+
+fn browser_surface_evidence_present(goal: &GoalSpec, frame: &SemanticScreenFrame) -> bool {
+    if frame.page_evidence.browser_app_hint.is_some() {
+        return true;
+    }
+    if provider_context_compatible(
+        goal.constraints.provider.as_deref(),
+        frame.page_evidence.content_provider_hint.as_deref(),
+    ) && frame.page_evidence.content_provider_hint.is_some()
+    {
+        return true;
+    }
+    if structural_list_surface_visible(frame) || structural_detail_surface_visible(frame) {
+        return true;
+    }
+    if browser_page_semantic_kind_for_frame(frame) != BrowserPageSemanticKind::Unknown {
+        return true;
+    }
+    let summary = normalize_label(&frame.scene_summary);
+    summary.contains("browser")
+        || summary.contains("web_page")
+        || summary.contains("result")
+        || summary.contains("player")
+        || summary.contains("article")
+}
+
+fn frame_looks_like_desktop_agent_surface(frame: &SemanticScreenFrame) -> bool {
+    [
+        frame.page_evidence.browser_app_hint.as_deref(),
+        frame.page_evidence.content_provider_hint.as_deref(),
+        frame.page_evidence.page_kind_hint.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(normalize_label)
+    .any(|label| {
+        label.contains("astra")
+            || label.contains("desktop_agent")
+            || label.contains("assistant_chat")
+            || label.contains("chat_window")
+            || label.contains("terminal")
+    }) || {
+        let summary = normalize_label(&frame.scene_summary);
+        summary.contains("astra")
+            || summary.contains("assistant_chat")
+            || summary.contains("desktop_agent")
+            || summary.contains("terminal")
+    }
+}
+
+fn surface_continuity_diagnostic(
+    goal: &GoalSpec,
+    surface: &VerifiedInteractionSurface,
+    frame: &SemanticScreenFrame,
+    iteration: usize,
+) -> SurfaceOwnershipDiagnostic {
+    let provider_matches = provider_context_compatible(
+        surface
+            .provider_hint
+            .as_deref()
+            .or(goal.constraints.provider.as_deref()),
+        frame.page_evidence.content_provider_hint.as_deref(),
+    );
+    let browser_evidence_present = browser_surface_evidence_present(goal, frame);
+    let desktop_agent_surface = frame_looks_like_desktop_agent_surface(frame);
+    let lost = surface.kind == InteractionSurfaceKind::Browser
+        && (desktop_agent_surface
+            || (!provider_matches && frame.page_evidence.content_provider_hint.is_some())
+            || (!browser_evidence_present
+                && verify_goal_against_frame(goal, frame).is_none()
+                && !structural_detail_surface_visible(frame)));
+    SurfaceOwnershipDiagnostic {
+        iteration,
+        status: if lost {
+            SurfaceOwnershipStatus::Lost
+        } else {
+            SurfaceOwnershipStatus::Verified
+        },
+        failure_reason: lost.then_some(FocusedPerceptionFailureReason::SurfaceOwnershipLost),
+        surface: Some(surface.clone()),
+        observed_frame_id: Some(frame.frame_id.clone()),
+        provider_matches: Some(provider_matches),
+        browser_evidence_present,
+        requested_region: None,
+        surface_bounds: surface.bounds.clone(),
+        reason: Some(if lost {
+            "fresh frame no longer supports the verified browser interaction surface".into()
+        } else {
+            "fresh frame still supports the verified browser interaction surface".into()
+        }),
+    }
+}
+
+fn surface_verified_diagnostic(
+    iteration: usize,
+    surface: &VerifiedInteractionSurface,
+    status: SurfaceOwnershipStatus,
+    reason: impl Into<String>,
+) -> SurfaceOwnershipDiagnostic {
+    SurfaceOwnershipDiagnostic {
+        iteration,
+        status,
+        failure_reason: None,
+        surface: Some(surface.clone()),
+        observed_frame_id: Some(surface.source_frame_id.clone()),
+        provider_matches: None,
+        browser_evidence_present: true,
+        requested_region: None,
+        surface_bounds: surface.bounds.clone(),
+        reason: Some(reason.into()),
+    }
+}
+
+fn bind_focused_perception_request_to_surface(
+    mut request: FocusedPerceptionRequest,
+    surface: Option<&VerifiedInteractionSurface>,
+    require_verified_surface: bool,
+    iteration: usize,
+) -> Result<FocusedPerceptionRequest, SurfaceOwnershipDiagnostic> {
+    let Some(surface) = surface else {
+        if require_verified_surface {
+            return Err(SurfaceOwnershipDiagnostic {
+                iteration,
+                status: SurfaceOwnershipStatus::Refused,
+                failure_reason: Some(FocusedPerceptionFailureReason::NoVerifiedSurface),
+                surface: None,
+                observed_frame_id: None,
+                provider_matches: None,
+                browser_evidence_present: false,
+                requested_region: request.region.clone(),
+                surface_bounds: None,
+                reason: Some(
+                    "browser-owned focused perception requires a verified interaction surface"
+                        .into(),
+                ),
+            });
+        }
+        return Ok(request);
+    };
+
+    if surface.kind != InteractionSurfaceKind::Browser {
+        request.verified_surface = Some(surface.clone());
+        return Ok(request);
+    }
+
+    let Some(bounds) = surface.bounds.as_ref() else {
+        return Err(SurfaceOwnershipDiagnostic {
+            iteration,
+            status: SurfaceOwnershipStatus::Refused,
+            failure_reason: Some(FocusedPerceptionFailureReason::SurfaceBoundsUnavailable),
+            surface: Some(surface.clone()),
+            observed_frame_id: None,
+            provider_matches: None,
+            browser_evidence_present: true,
+            requested_region: request.region.clone(),
+            surface_bounds: None,
+            reason: Some(
+                "browser-owned focused perception has no safe bounded browser region".into(),
+            ),
+        });
+    };
+
+    match request.region.as_ref() {
+        Some(region) if !region_contains_region(bounds, region) => {
+            Err(SurfaceOwnershipDiagnostic {
+                iteration,
+                status: SurfaceOwnershipStatus::Refused,
+                failure_reason: Some(FocusedPerceptionFailureReason::RequestedRegionOutsideSurface),
+                surface: Some(surface.clone()),
+                observed_frame_id: None,
+                provider_matches: None,
+                browser_evidence_present: true,
+                requested_region: request.region.clone(),
+                surface_bounds: Some(bounds.clone()),
+                reason: Some(
+                    "focused perception region lies outside the verified browser surface".into(),
+                ),
+            })
+        }
+        Some(_) => {
+            request.verified_surface = Some(surface.clone());
+            Ok(request)
+        }
+        None => {
+            request.region = Some(bounds.clone());
+            request.verified_surface = Some(surface.clone());
+            Ok(request)
+        }
+    }
+}
+
+fn deterministic_visible_ordinal_fast_path(
+    input: &PlannerContractInput,
+    step: &PlannerStep,
+) -> bool {
+    if !matches!(
+        input.goal.goal_type,
+        GoalType::OpenListItem | GoalType::OpenMediaResult
+    ) || step.kind != PlannerStepKind::ClickResultRegion
+        || !step_is_executable(step, MIN_PLANNER_CLICK_CONFIDENCE)
+    {
+        return false;
+    }
+
+    let Some(target_item_id) = step.target_item_id.as_deref() else {
+        return false;
+    };
+    find_primary_list_item_match(&input.goal, &input.current_frame)
+        .is_some_and(|item| item.item_id == target_item_id)
+        || find_ranked_result_match(&input.goal, &input.current_frame)
+            .is_some_and(|item| item.item_id == target_item_id)
 }
 
 fn candidate_signature(candidate: &UITargetCandidate) -> String {
@@ -4416,6 +4838,7 @@ pub(crate) fn browser_page_semantic_kind(value: Option<&str>) -> BrowserPageSema
         Some(
             "search_results"
             | "search_results_page"
+            | "search_result_page"
             | "results_page"
             | "result_page"
             | "youtube_results"
@@ -4423,7 +4846,13 @@ pub(crate) fn browser_page_semantic_kind(value: Option<&str>) -> BrowserPageSema
             | "search"
             | "search_page"
             | "result_list"
-            | "result",
+            | "results_list"
+            | "ranked_list"
+            | "result"
+            | "serp"
+            | "listing"
+            | "catalog"
+            | "list",
         ) => BrowserPageSemanticKind::SearchResults,
         Some(
             "watch_page" | "video_page" | "youtube_watch" | "detail_page" | "watch" | "video"
@@ -4951,9 +5380,17 @@ fn normalize_item_kind_label(value: &str) -> String {
 
 fn normalize_structural_list_kind(value: &str) -> String {
     match normalize_label(value).as_str() {
-        "result_list" | "results_list" | "ranked_list" | "list" | "search_results" => {
-            "result_list".into()
-        }
+        "result_list"
+        | "results_list"
+        | "ranked_list"
+        | "list"
+        | "search_results"
+        | "search_results_page"
+        | "search_result_page"
+        | "results_page"
+        | "serp"
+        | "listing"
+        | "catalog" => "result_list".into(),
         "youtube" | "google" | "amazon" | "github" => "result_list".into(),
         _ => "result_list".into(),
     }
@@ -4961,7 +5398,19 @@ fn normalize_structural_list_kind(value: &str) -> String {
 
 fn normalize_page_state_kind(value: &str) -> String {
     match normalize_label(value).as_str() {
-        "list" | "results" | "result_list" | "search_results" | "search" => "list".into(),
+        "list"
+        | "results"
+        | "result_list"
+        | "results_list"
+        | "ranked_list"
+        | "search_results"
+        | "search_results_page"
+        | "search_result_page"
+        | "results_page"
+        | "serp"
+        | "listing"
+        | "catalog"
+        | "search" => "list".into(),
         "detail" | "details" | "detail_page" | "web_page" | "article_page" | "product_page" => {
             "detail".into()
         }
@@ -4977,9 +5426,19 @@ fn normalize_page_state_kind(value: &str) -> String {
 
 fn normalize_dominant_content_kind(value: &str) -> String {
     match normalize_label(value).as_str() {
-        "result_list" | "results" | "results_list" | "search_results" | "search" | "list" => {
-            "result_list".into()
-        }
+        "result_list"
+        | "results"
+        | "results_list"
+        | "ranked_list"
+        | "search_results"
+        | "search_results_page"
+        | "search_result_page"
+        | "results_page"
+        | "serp"
+        | "listing"
+        | "catalog"
+        | "search"
+        | "list" => "result_list".into(),
         "detail" | "details" | "detail_view" | "web_page" => "detail_view".into(),
         "video_player" | "player" | "watch" | "watch_page" | "video" => "video_player".into(),
         "article" | "article_page" => "article".into(),
@@ -5168,6 +5627,151 @@ mod tests {
             Vec::new(),
         )
         .expect("watch frame")
+    }
+
+    fn youtube_primary_list_frame(
+        frame_id: &str,
+        captured_at: u64,
+        item_count: u32,
+    ) -> SemanticScreenFrame {
+        let items = (1..=item_count)
+            .map(|rank| {
+                json!({
+                    "item_id": format!("video_{rank}"),
+                    "rank": rank,
+                    "title": format!("Video {rank}"),
+                    "item_kind": "video",
+                    "click_regions": {
+                        "primary": {
+                            "x": 100,
+                            "y": 100 + ((rank - 1) as i64 * 90),
+                            "width": 320,
+                            "height": 60,
+                            "coordinate_space": "screen",
+                            "confidence": 0.95
+                        }
+                    },
+                    "confidence": 0.95
+                })
+            })
+            .collect::<Vec<_>>();
+        semantic_frame_from_vision_value(
+            &json!({
+                "frame_id": frame_id,
+                "page_evidence": {
+                    "browser_app_hint": "chrome",
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "results",
+                    "result_list_visible": true,
+                    "confidence": 0.94
+                },
+                "scene_summary": "A browser page shows a ranked list of videos.",
+                "page_state": {
+                    "kind": "list",
+                    "dominant_content": "result_list",
+                    "list_visible": true,
+                    "detail_visible": false
+                },
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": item_count,
+                    "items": items,
+                    "confidence": 0.94
+                }
+            }),
+            captured_at,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("primary list frame")
+    }
+
+    fn ambiguous_browser_detail_frame(frame_id: &str, captured_at: u64) -> SemanticScreenFrame {
+        semantic_frame_from_vision_value(
+            &json!({
+                "frame_id": frame_id,
+                "page_evidence": {
+                    "browser_app_hint": "chrome",
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "detail_page",
+                    "result_list_visible": true,
+                    "confidence": 0.86
+                },
+                "scene_summary": "The browser still shows a list surface and a detail/player panel.",
+                "page_state": {
+                    "kind": "mixed",
+                    "dominant_content": "detail_view",
+                    "list_visible": true,
+                    "detail_visible": true
+                },
+                "primary_list": {
+                    "cluster_id": "main",
+                    "container_kind": "result_list",
+                    "item_count": 1,
+                    "items": [{
+                        "item_id": "video_1",
+                        "rank": 1,
+                        "title": "Video 1",
+                        "item_kind": "video",
+                        "attributes": {
+                            "region": {"x": 100, "y": 100, "width": 320, "height": 60, "coordinate_space": "screen"}
+                        },
+                        "confidence": 0.9
+                    }],
+                    "confidence": 0.88
+                }
+            }),
+            captured_at,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("ambiguous browser frame")
+    }
+
+    fn astra_chat_frame(frame_id: &str, captured_at: u64) -> SemanticScreenFrame {
+        semantic_frame_from_vision_value(
+            &json!({
+                "frame_id": frame_id,
+                "page_evidence": {
+                    "browser_app_hint": "astra",
+                    "content_provider_hint": "astra",
+                    "page_kind_hint": "chat_window",
+                    "confidence": 0.92
+                },
+                "scene_summary": "Astra assistant chat window is visible instead of the browser page."
+            }),
+            captured_at,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("astra chat frame")
+    }
+
+    fn verified_handoff_for_frame(frame: SemanticScreenFrame) -> BrowserVisualHandoffResult {
+        BrowserVisualHandoffResult {
+            record: BrowserVisualHandoffRecord {
+                iteration: 0,
+                status: BrowserHandoffStatus::VisuallyVerified,
+                activation_status:
+                    crate::desktop_agent_types::BrowserHandoffActivationStatus::NotAttempted,
+                failure_reason: None,
+                app_hint: Some("chrome".into()),
+                provider_hint: frame.page_evidence.content_provider_hint.clone(),
+                page_kind_hint: frame.page_evidence.page_kind_hint.clone(),
+                verification: None,
+                activation_attempted: false,
+                page_verified: true,
+                frame_id: Some(frame.frame_id.clone()),
+                confidence: Some(frame.page_evidence.confidence),
+                attempts: 1,
+                reason: Some("verified test browser surface".into()),
+            },
+            verified_frame: Some(frame),
+        }
     }
 
     fn open_list_item_goal(
@@ -5505,6 +6109,8 @@ mod tests {
         handoff: Option<BrowserVisualHandoffResult>,
         recovery: Option<BrowserVisualHandoffResult>,
         recovery_attempts: usize,
+        model_decision: Option<PlannerContractDecision>,
+        plan_calls: usize,
     }
 
     impl MockGoalLoopDriver {
@@ -5518,6 +6124,8 @@ mod tests {
                 handoff: None,
                 recovery: None,
                 recovery_attempts: 0,
+                model_decision: None,
+                plan_calls: 0,
             }
         }
     }
@@ -5590,6 +6198,185 @@ mod tests {
                 Ok(self.recovery.take())
             })
         }
+
+        fn plan<'a>(
+            &'a mut self,
+            _input: &'a PlannerContractInput,
+        ) -> GoalLoopDriverFuture<'a, Result<Option<PlannerContractDecision>, String>> {
+            Box::pin(async move {
+                self.plan_calls += 1;
+                Ok(self.model_decision.take())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn visible_ordinal_fast_path_opens_third_video_without_planner_discovery() {
+        let list_frame = youtube_primary_list_frame("list", 1_000, 3);
+        let watch_frame = youtube_watch_frame("watch", 2_000);
+        let goal = open_list_item_goal(
+            "aprimi il terzo video",
+            Some("youtube"),
+            Some("video"),
+            Some(3),
+            None,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![list_frame, watch_frame]);
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(driver.plan_calls, 0);
+        assert_eq!(run.status, GoalLoopStatus::GoalAchieved);
+        assert_eq!(driver.executed_steps.len(), 1);
+        assert_eq!(
+            driver.executed_steps[0].target_item_id.as_deref(),
+            Some("video_3")
+        );
+    }
+
+    #[test]
+    fn focused_perception_outside_verified_browser_surface_is_typed_refusal() {
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+        let frame = youtube_primary_list_frame("list", 1_000, 1);
+        let mut surface = verified_browser_surface_from_frame(&goal, &frame);
+        surface.bounds = Some(TargetRegion {
+            x: 0.0,
+            y: 0.0,
+            width: 200.0,
+            height: 200.0,
+            coordinate_space: "screen".into(),
+        });
+        let request = FocusedPerceptionRequest {
+            request_id: "outside".into(),
+            iteration: 1,
+            reason: "test outside surface".into(),
+            mode: PerceptionRequestMode::TargetFocus,
+            routing_decision: PerceptionRoutingDecision::TargetRegionAnchor,
+            refinement_strategy: VisibleRefinementStrategy::TargetRegion,
+            target_item_id: Some("video_1".into()),
+            target_entity_id: None,
+            region: Some(TargetRegion {
+                x: 500.0,
+                y: 500.0,
+                width: 80.0,
+                height: 40.0,
+                coordinate_space: "screen".into(),
+            }),
+            target_region_anchor_present: true,
+            verified_surface: None,
+        };
+
+        let diagnostic =
+            bind_focused_perception_request_to_surface(request, Some(&surface), true, 1)
+                .expect_err("outside region should be refused");
+
+        assert_eq!(diagnostic.status, SurfaceOwnershipStatus::Refused);
+        assert_eq!(
+            diagnostic.failure_reason,
+            Some(FocusedPerceptionFailureReason::RequestedRegionOutsideSurface)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_post_click_browser_frame_uses_bounded_focused_perception() {
+        let list_frame = youtube_primary_list_frame("list", 1_000, 1);
+        let ambiguous_frame = ambiguous_browser_detail_frame("mixed", 2_000);
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![ambiguous_frame]);
+        driver.handoff = Some(verified_handoff_for_frame(list_frame));
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(run.status, GoalLoopStatus::NeedsPerception);
+        assert_eq!(driver.focused_requests.len(), 1);
+        let request = &driver.focused_requests[0];
+        assert!(request.region.is_some());
+        assert!(request.verified_surface.is_some());
+        assert_eq!(
+            run.focused_perception_failure_reason,
+            Some(FocusedPerceptionFailureReason::StructuredPerceptionEmpty)
+        );
+    }
+
+    #[tokio::test]
+    async fn post_click_astra_chat_frame_reports_surface_ownership_lost() {
+        let list_frame = youtube_primary_list_frame("list", 1_000, 1);
+        let astra_frame = astra_chat_frame("astra", 2_000);
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![astra_frame]);
+        driver.handoff = Some(verified_handoff_for_frame(list_frame));
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(run.status, GoalLoopStatus::VerificationFailed);
+        assert!(run.surface_ownership_lost);
+        assert_eq!(
+            run.focused_perception_failure_reason,
+            Some(FocusedPerceptionFailureReason::SurfaceOwnershipLost)
+        );
+        assert_eq!(driver.recovery_attempts, 1);
+        assert!(driver.focused_requests.is_empty());
+        assert!(run
+            .surface_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.status == SurfaceOwnershipStatus::Lost));
+    }
+
+    #[tokio::test]
+    async fn browser_reacquisition_after_surface_loss_is_bounded_and_rechecked() {
+        let list_frame = youtube_primary_list_frame("list", 1_000, 1);
+        let astra_frame = astra_chat_frame("astra", 2_000);
+        let recovered_frame = youtube_watch_frame("watch", 3_000);
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![astra_frame]);
+        driver.handoff = Some(verified_handoff_for_frame(list_frame));
+        driver.recovery = Some(verified_handoff_for_frame(recovered_frame));
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(driver.recovery_attempts, 1);
+        assert_eq!(run.status, GoalLoopStatus::GoalAchieved);
+        assert!(!run.surface_ownership_lost);
+        assert!(run
+            .surface_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.status == SurfaceOwnershipStatus::Reacquired));
     }
 
     #[test]
@@ -5782,6 +6569,24 @@ mod tests {
                 browser_page_semantic_kind(Some(alias)),
                 BrowserPageSemanticKind::WatchPage,
                 "alias `{alias}` should normalize to watch_page"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_page_semantic_kind_normalizes_google_serp_variants() {
+        for raw in [
+            "search_result_page",
+            "serp",
+            "listing",
+            "catalog",
+            "results_page",
+        ] {
+            assert_eq!(
+                browser_page_semantic_kind(Some(raw)),
+                BrowserPageSemanticKind::SearchResults,
+                "expected SearchResults for raw kind {:?}",
+                raw
             );
         }
     }

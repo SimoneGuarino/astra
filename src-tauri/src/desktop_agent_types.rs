@@ -689,6 +689,74 @@ impl Default for PerceptionRoutingDecision {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionSurfaceKind {
+    Browser,
+    DesktopAgent,
+    Terminal,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedInteractionSurface {
+    pub kind: InteractionSurfaceKind,
+    #[serde(default)]
+    pub provider_hint: Option<String>,
+    #[serde(default)]
+    pub app_hint: Option<String>,
+    #[serde(default)]
+    pub page_kind_hint: Option<String>,
+    #[serde(default)]
+    pub bounds: Option<TargetRegion>,
+    pub verified_at_ms: u64,
+    pub source_frame_id: String,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusedPerceptionFailureReason {
+    NoVerifiedSurface,
+    SurfaceBoundsUnavailable,
+    RequestedRegionOutsideSurface,
+    SurfaceOwnershipLost,
+    StructuredPerceptionEmpty,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceOwnershipStatus {
+    NotRequired,
+    Verified,
+    Reacquired,
+    Lost,
+    Refused,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurfaceOwnershipDiagnostic {
+    pub iteration: usize,
+    pub status: SurfaceOwnershipStatus,
+    #[serde(default)]
+    pub failure_reason: Option<FocusedPerceptionFailureReason>,
+    #[serde(default)]
+    pub surface: Option<VerifiedInteractionSurface>,
+    #[serde(default)]
+    pub observed_frame_id: Option<String>,
+    #[serde(default)]
+    pub provider_matches: Option<bool>,
+    #[serde(default)]
+    pub browser_evidence_present: bool,
+    #[serde(default)]
+    pub requested_region: Option<TargetRegion>,
+    #[serde(default)]
+    pub surface_bounds: Option<TargetRegion>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FocusedPerceptionRequest {
     pub request_id: String,
@@ -708,6 +776,8 @@ pub struct FocusedPerceptionRequest {
     pub region: Option<TargetRegion>,
     #[serde(default)]
     pub target_region_anchor_present: bool,
+    #[serde(default)]
+    pub verified_surface: Option<VerifiedInteractionSurface>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1086,6 +1156,10 @@ pub struct GoalLoopRun {
     pub browser_handoff_history: Vec<BrowserVisualHandoffRecord>,
     #[serde(default)]
     pub browser_handoff: Option<BrowserVisualHandoffRecord>,
+    #[serde(default)]
+    pub verified_surface: Option<VerifiedInteractionSurface>,
+    #[serde(default)]
+    pub surface_diagnostics: Vec<SurfaceOwnershipDiagnostic>,
     pub focused_perception_used: bool,
     pub visible_refinement_used: bool,
     #[serde(default)]
@@ -1096,6 +1170,10 @@ pub struct GoalLoopRun {
     pub browser_recovery_status: BrowserRecoveryStatus,
     #[serde(default)]
     pub post_action_progress_observed: bool,
+    #[serde(default)]
+    pub surface_ownership_lost: bool,
+    #[serde(default)]
+    pub focused_perception_failure_reason: Option<FocusedPerceptionFailureReason>,
     #[serde(default)]
     pub repeated_click_protection_triggered: bool,
     #[serde(default)]

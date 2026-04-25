@@ -633,6 +633,7 @@ mod tests {
             target_entity_id: None,
             region: None,
             target_region_anchor_present: false,
+            verified_surface: None,
         };
         let input = planner_contract_input_with_perception(
             &goal,
