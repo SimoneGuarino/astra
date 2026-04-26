@@ -95,6 +95,7 @@ pub fn build_capability_manifest(
             .map(|captured_at| generated_at.saturating_sub(captured_at)),
         fresh_capture_available: screen_status.provider != "not_supported",
         fresh_capture_requires_observation_enabled: true,
+        accessibility_snapshot_enabled: policy.accessibility_snapshot_enabled,
         last_capture_path: screen_status.last_capture_path.clone(),
         last_frame_at: screen_status.last_frame_at,
         provider: screen_status.provider.clone(),

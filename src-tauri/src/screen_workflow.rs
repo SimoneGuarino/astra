@@ -627,6 +627,11 @@ pub fn render_screen_workflow_run_response(run: &ScreenWorkflowRun, italian: boo
             }
         }
         WorkflowRunStatus::NeedsTargetGrounding => {
+            if let Some(message) =
+                render_goal_loop_no_click_response(run.workflow.grounding.goal_loop.as_ref(), italian)
+            {
+                return message;
+            }
             if italian {
                 format!(
                     "Ho capito quale azione vuoi fare sullo schermo, ma non ho un target abbastanza sicuro per cliccare o mettere il focus: {stopped}"
@@ -690,6 +695,14 @@ fn render_continuation_workflow_run_response(
 
     match run.status {
         WorkflowRunStatus::Completed => {
+            if let Some(message) = render_goal_loop_completion_response(
+                run.workflow.grounding.goal_loop.as_ref(),
+                completed,
+                planned,
+                italian,
+            ) {
+                return message;
+            }
             if continuation_verification.is_some_and(|verification| {
                 verification.status == ContinuationVerificationStatus::GoalAchieved
             }) {
@@ -723,6 +736,11 @@ fn render_continuation_workflow_run_response(
             }
         }
         WorkflowRunStatus::NeedsTargetGrounding => {
+            if let Some(message) =
+                render_goal_loop_no_click_response(run.workflow.grounding.goal_loop.as_ref(), italian)
+            {
+                return message;
+            }
             if italian {
                 format!(
                     "Ho capito la richiesta come continuazione del workflow recente ({provider}, {query}), ma non ho identificato un candidato abbastanza sicuro per il passaggio richiesto: {stopped}"
@@ -813,20 +831,34 @@ fn goal_loop_executed_but_final_confirmation_uncertain(goal_loop: &GoalLoopRun) 
 
 fn render_goal_loop_completion_response(
     goal_loop: Option<&GoalLoopRun>,
-    completed: usize,
-    planned: usize,
+    _completed: usize,
+    _planned: usize,
     italian: bool,
 ) -> Option<String> {
     goal_loop.filter(|goal_loop| goal_loop.status == GoalLoopStatus::GoalAchieved)?;
 
     Some(if italian {
-        format!(
-            "Ho completato il workflow screen-grounded: {completed}/{planned} passaggi eseguiti. La verifica finale ha confermato il raggiungimento del risultato richiesto."
-        )
+        "Ho aperto il video/risultato richiesto.".into()
     } else {
-        format!(
-            "I completed the screen-grounded workflow: {completed}/{planned} steps executed. Final verification confirmed the requested outcome."
-        )
+        "I opened the requested video/result.".into()
+    })
+}
+
+fn render_goal_loop_no_click_response(
+    goal_loop: Option<&GoalLoopRun>,
+    italian: bool,
+) -> Option<String> {
+    let _goal_loop = goal_loop.filter(|goal_loop| {
+        goal_loop.status != GoalLoopStatus::GoalAchieved
+            && !goal_loop
+                .executed_steps
+                .iter()
+                .any(|step| step.status == PlannerStepExecutionStatus::Executed)
+    })?;
+    Some(if italian {
+        "Non ho eseguito il click perché non ho trovato un target sufficientemente sicuro.".into()
+    } else {
+        "I did not click because I did not find a sufficiently safe target.".into()
     })
 }
 
@@ -861,18 +893,14 @@ fn render_goal_loop_partial_completion_response(
 
     Some(if italian {
         if goal_loop.post_action_progress_observed {
-            format!(
-                "Ho eseguito il click richiesto nel workflow screen-grounded: {completed}/{planned} passaggi completati. La pagina sembra essere cambiata correttamente, ma la verifica visiva finale non e' stata confermata con certezza.{suffix}"
-            )
+            format!("Ho eseguito il click sul candidato selezionato, ma la verifica finale non conferma con certezza che sia stato aperto il contenuto richiesto.{suffix}")
         } else {
             format!(
                 "Ho eseguito il click richiesto nel workflow screen-grounded: {completed}/{planned} passaggi completati. L'azione e' stata eseguita, ma la verifica visiva finale resta incerta.{suffix}"
             )
         }
     } else if goal_loop.post_action_progress_observed {
-        format!(
-            "I executed the requested click in the screen-grounded workflow: {completed}/{planned} steps completed. The page appears to have changed correctly, but final visual verification was not confirmed with enough certainty.{suffix}"
-        )
+        format!("I clicked the selected candidate, but final verification does not confirm with certainty that the requested content opened.{suffix}")
     } else {
         format!(
             "I executed the requested click in the screen-grounded workflow: {completed}/{planned} steps completed. The action ran, but final visual verification is still uncertain.{suffix}"
@@ -904,18 +932,14 @@ fn render_goal_loop_continuation_partial_completion_response(
 
     Some(if italian {
         if goal_loop.post_action_progress_observed {
-            format!(
-                "Ho continuato il workflow recente ({provider}, {query}) ed eseguito {completed}/{planned} passaggi. Ho cliccato il risultato {rank}; la pagina sembra essere cambiata correttamente, ma la verifica visiva finale non e' stata confermata con certezza.{suffix}"
-            )
+            format!("Ho eseguito il click sul candidato selezionato, ma la verifica finale non conferma con certezza che sia stato aperto il contenuto richiesto.{suffix}")
         } else {
             format!(
                 "Ho continuato il workflow recente ({provider}, {query}) ed eseguito {completed}/{planned} passaggi. Ho cliccato il risultato {rank}, ma la verifica visiva finale resta incerta.{suffix}"
             )
         }
     } else if goal_loop.post_action_progress_observed {
-        format!(
-            "I continued the recent workflow ({provider}, {query}) and executed {completed}/{planned} steps. I clicked result {rank}; the page appears to have changed correctly, but final visual verification was not confirmed with enough certainty.{suffix}"
-        )
+        format!("I clicked the selected candidate, but final verification does not confirm with certainty that the requested content opened.{suffix}")
     } else {
         format!(
             "I continued the recent workflow ({provider}, {query}) and executed {completed}/{planned} steps. I clicked result {rank}, but final visual verification is still uncertain.{suffix}"
@@ -1503,8 +1527,8 @@ mod tests {
     use crate::desktop_agent_types::{
         CapabilityApprovalState, CapabilityPermissionState, CapabilityRuntimeState,
         CapabilityScreenState, CapabilityToolAvailability, GoalConstraints, GoalLoopStatus,
-        GoalSpec, GoalType, Permission, PlannerStepExecutionRecord, PlannerStepExecutionStatus,
-        VisibleResultKind,
+        GoalSpec, GoalType, GoalVerificationRecord, GoalVerificationStatus, Permission,
+        PlannerStepExecutionRecord, PlannerStepExecutionStatus, VisibleResultKind,
     };
     use crate::ui_control::{UIPrimitiveCapability, UIPrimitiveKind};
     use crate::ui_target_grounding::{TargetGroundingSource, TargetRegion, UITargetCandidate};
@@ -1930,9 +1954,140 @@ mod tests {
             true,
         );
 
-        assert!(response.contains("Ho eseguito il click richiesto"));
-        assert!(response.contains("verifica visiva finale"));
+        assert!(response.contains("Ho eseguito il click sul candidato selezionato"));
+        assert!(response.contains("verifica finale non conferma"));
+        assert!(!response.contains("cambiata correttamente"));
         assert!(!response.contains("non ho un target abbastanza sicuro"));
+    }
+
+    #[test]
+    fn post_click_message_does_not_claim_success_when_goal_not_achieved() {
+        let response = render_screen_workflow_run_response(
+            &ScreenWorkflowRun {
+                run_id: "run".into(),
+                status: WorkflowRunStatus::PartiallyCompleted,
+                workflow: ScreenWorkflow {
+                    operation: ActionOperation::ScreenGuidedFollowupAction,
+                    domain: ScreenWorkflowDomain::BrowserScreenInteraction,
+                    requires_screen_context: true,
+                    depends_on_recent_screen_context: true,
+                    continuation: None,
+                    grounding: ScreenGroundingState {
+                        observation_supported: true,
+                        observation_enabled: true,
+                        capture_available: true,
+                        analysis_available: true,
+                        recent_capture_available: true,
+                        recent_capture_age_ms: Some(100),
+                        last_capture_path: Some("screen.png".into()),
+                        freshness: ScreenFreshness::RecentAvailable,
+                        fresh_capture_required: false,
+                        sufficient_for_workflow: true,
+                        visible_target_candidates: Vec::new(),
+                        page_evidence: Vec::new(),
+                        semantic_frame: None,
+                        goal_loop: Some(GoalLoopRun {
+                            run_id: "goal_loop".into(),
+                            goal: GoalSpec {
+                                goal_id: "goal".into(),
+                                goal_type: GoalType::OpenMediaResult,
+                                constraints: GoalConstraints {
+                                    provider: None,
+                                    item_kind: Some("video".into()),
+                                    result_kind: Some(VisibleResultKind::Video),
+                                    rank_within_kind: Some(1),
+                                    rank_overall: None,
+                                    entity_name: None,
+                                    attributes: Value::Null,
+                                },
+                                success_condition: "media_watch_page_visible".into(),
+                                utterance: "aprimi il primo video".into(),
+                                confidence: 0.9,
+                            },
+                            status: GoalLoopStatus::VerificationFailed,
+                            iteration_count: 2,
+                            retry_budget: 3,
+                            retries_used: 0,
+                            current_strategy: None,
+                            fallback_strategy_state: None,
+                            frames: Vec::new(),
+                            planner_steps: Vec::new(),
+                            planner_diagnostics: Vec::new(),
+                            executed_steps: vec![PlannerStepExecutionRecord {
+                                step_id: "step".into(),
+                                status: PlannerStepExecutionStatus::Executed,
+                                primitive: "ClickTargetCandidate".into(),
+                                message: "clicked".into(),
+                                selected_target_candidate: None,
+                                geometry: None,
+                                fresh_capture_required: true,
+                                fresh_capture_used: true,
+                                target_signature: Some("video_1".into()),
+                            }],
+                            verification_history: vec![GoalVerificationRecord {
+                                iteration: 1,
+                                status: GoalVerificationStatus::GoalNotAchieved,
+                                confidence: 0.40,
+                                reason: "not achieved".into(),
+                                frame_id: Some("frame".into()),
+                            }],
+                            focused_perception_requests: Vec::new(),
+                            browser_handoff_history: Vec::new(),
+                            browser_handoff: None,
+                            verified_surface: None,
+                            surface_diagnostics: Vec::new(),
+                            focused_perception_used: false,
+                            visible_refinement_used: false,
+                            stale_capture_reuse_prevented: true,
+                            browser_recovery_used: false,
+                            browser_recovery_status:
+                                crate::desktop_agent_types::BrowserRecoveryStatus::NotNeeded,
+                            post_action_progress_observed: true,
+                            surface_ownership_lost: false,
+                            focused_perception_failure_reason: None,
+                            repeated_click_protection_triggered: false,
+                            selected_target_candidate: None,
+                            verifier_status: Some("GoalNotAchieved".into()),
+                            failure_reason: Some("goal was not confirmed".into()),
+                        }),
+                        recent_target_candidates: Vec::new(),
+                        generated_at_ms: Some(1_000),
+                        page_validation: None,
+                        regrounding: None,
+                        uncertainty: Vec::new(),
+                    },
+                    steps: vec![WorkflowStep {
+                        step_id: "step".into(),
+                        step_kind: WorkflowStepKind::OpenRankedResult,
+                        target: json!({}),
+                        value: None,
+                        selection: json!({}),
+                        expected_outcome: None,
+                    }],
+                    step_plans: Vec::new(),
+                    support: WorkflowSupportSummary {
+                        executable: true,
+                        requires_screen_context: true,
+                        unsupported_steps: Vec::new(),
+                        reason: "test".into(),
+                    },
+                    confidence: 0.9,
+                    source: ResolutionSource::RustNormalizer,
+                    rationale: None,
+                },
+                primitive_capabilities: pointer_test_capabilities(
+                    UIPrimitiveKind::ClickTargetCandidate,
+                ),
+                step_runs: Vec::new(),
+                completed_steps: 1,
+                stopped_reason: Some("goal was not confirmed".into()),
+                continuation_verification: None,
+            },
+            true,
+        );
+
+        assert!(response.contains("verifica finale non conferma"));
+        assert!(!response.contains("cambiata correttamente"));
     }
 
     #[test]
@@ -2173,6 +2328,7 @@ mod tests {
                 recent_capture_age_ms: recent_capture.then_some(500),
                 fresh_capture_available: true,
                 fresh_capture_requires_observation_enabled: true,
+                accessibility_snapshot_enabled: cfg!(target_os = "windows"),
                 last_capture_path: recent_capture.then(|| "screen.png".into()),
                 last_frame_at: recent_capture.then_some(1),
                 provider: "test".into(),
@@ -2239,6 +2395,8 @@ mod tests {
     fn recent_search_candidate() -> UITargetCandidate {
         UITargetCandidate {
             candidate_id: "recent_search".into(),
+            element_id: None,
+            accessibility_snapshot_id: None,
             role: UITargetRole::SearchInput,
             region: Some(TargetRegion {
                 x: 100.0,

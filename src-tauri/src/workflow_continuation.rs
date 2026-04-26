@@ -3776,6 +3776,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn continuation_with_missing_screen_context_triggers_fresh_observation_when_available() {
+        let resolution = resolve_workflow_continuation(
+            Some(youtube_context()),
+            &manifest_with_screen_age(None, true),
+            "aprimi il primo video",
+            2_000,
+        );
+
+        match resolution {
+            Some(WorkflowContinuationResolution::Workflow(workflow)) => {
+                assert!(workflow.grounding.fresh_capture_required);
+                assert_eq!(
+                    workflow.grounding.freshness,
+                    crate::screen_workflow::ScreenFreshness::FreshAvailable
+                );
+                assert!(workflow.grounding.sufficient_for_workflow);
+            }
+            _ => panic!("expected fresh-observation workflow continuation"),
+        }
+    }
+
     fn youtube_context() -> RecentWorkflowContext {
         RecentWorkflowContext {
             context_id: "ctx".into(),
@@ -3869,6 +3891,8 @@ mod tests {
     fn ranked_candidate(id: &str, provider: &str, rank: u32) -> UITargetCandidate {
         UITargetCandidate {
             candidate_id: id.into(),
+            element_id: None,
+            accessibility_snapshot_id: None,
             role: UITargetRole::RankedResult,
             region: None,
             center_x: Some(640.0),
@@ -3949,6 +3973,7 @@ mod tests {
                 recent_capture_age_ms,
                 fresh_capture_available: true,
                 fresh_capture_requires_observation_enabled: true,
+                accessibility_snapshot_enabled: cfg!(target_os = "windows"),
                 last_capture_path: recent_capture_age_ms.map(|_| "screen.png".into()),
                 last_frame_at: recent_capture_age_ms.map(|_| 1),
                 provider: "test".into(),

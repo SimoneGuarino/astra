@@ -12,6 +12,8 @@ pub struct DesktopAgentPolicy {
     pub approval_required_for_high_risk: bool,
     pub browser_enabled: bool,
     pub desktop_control_enabled: bool,
+    #[serde(default = "default_accessibility_snapshot_enabled")]
+    pub accessibility_snapshot_enabled: bool,
 }
 
 impl DesktopAgentPolicy {
@@ -47,6 +49,7 @@ impl DesktopAgentPolicy {
             approval_required_for_high_risk: true,
             browser_enabled: true,
             desktop_control_enabled: true,
+            accessibility_snapshot_enabled: default_accessibility_snapshot_enabled(),
         }
     }
 
@@ -58,7 +61,12 @@ impl DesktopAgentPolicy {
             approval_required_for_high_risk: self.approval_required_for_high_risk,
             browser_enabled: self.browser_enabled,
             desktop_control_enabled: self.desktop_control_enabled,
+            accessibility_snapshot_enabled: self.accessibility_snapshot_enabled,
         }
+    }
+
+    pub fn accessibility_snapshot_enabled(&self) -> bool {
+        self.accessibility_snapshot_enabled && cfg!(target_os = "windows")
     }
 
     pub fn requires_approval(&self, risk_level: &RiskLevel) -> bool {
@@ -72,4 +80,8 @@ impl DesktopAgentPolicy {
             _ => true,
         }
     }
+}
+
+fn default_accessibility_snapshot_enabled() -> bool {
+    cfg!(target_os = "windows")
 }

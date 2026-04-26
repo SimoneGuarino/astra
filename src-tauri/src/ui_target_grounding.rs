@@ -60,6 +60,7 @@ impl UITargetRole {
 pub enum TargetGroundingSource {
     WorkflowMetadata,
     ScreenAnalysis,
+    AccessibilityLayer,
     RecentContext,
     UserProvided,
 }
@@ -90,6 +91,10 @@ impl TargetRegion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UITargetCandidate {
     pub candidate_id: String,
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub accessibility_snapshot_id: Option<String>,
     pub role: UITargetRole,
     #[serde(default)]
     pub region: Option<TargetRegion>,
@@ -147,6 +152,8 @@ impl UITargetCandidate {
             .unwrap_or((None, None));
         json!({
             "candidate_id": self.candidate_id,
+            "element_id": self.element_id.clone(),
+            "accessibility_snapshot_id": self.accessibility_snapshot_id.clone(),
             "role": self.role.as_str(),
             "region": self.region,
             "center_x": center_x,
@@ -886,6 +893,14 @@ fn candidate_from_value(
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("target_candidate_{}", index + 1)),
+        element_id: value
+            .get("element_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        accessibility_snapshot_id: value
+            .get("accessibility_snapshot_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         role,
         region,
         center_x,
@@ -1500,6 +1515,8 @@ mod tests {
             selection: json!({}),
             screen_candidates: vec![UITargetCandidate {
                 candidate_id: "screen_search".into(),
+                element_id: None,
+                accessibility_snapshot_id: None,
                 role: UITargetRole::SearchInput,
                 region: Some(TargetRegion {
                     x: 100.0,
@@ -1559,6 +1576,8 @@ mod tests {
             screen_candidates: Vec::new(),
             recent_candidates: vec![UITargetCandidate {
                 candidate_id: "recent_search".into(),
+                element_id: None,
+                accessibility_snapshot_id: None,
                 role: UITargetRole::SearchInput,
                 region: None,
                 center_x: Some(250.0),
@@ -1611,6 +1630,8 @@ mod tests {
             screen_candidates: Vec::new(),
             recent_candidates: vec![UITargetCandidate {
                 candidate_id: "stale_search".into(),
+                element_id: None,
+                accessibility_snapshot_id: None,
                 role: UITargetRole::SearchInput,
                 region: None,
                 center_x: Some(250.0),
@@ -1656,5 +1677,104 @@ mod tests {
             selection.diagnostics.rejected_phase,
             Some(TargetCandidateFilterPhase::Freshness)
         );
+    }
+
+    #[test]
+    fn uia_candidate_carries_element_id_in_execution_payload() {
+        let candidate = UITargetCandidate {
+            candidate_id: "planner_primary_list_a11y_7_primary".into(),
+            element_id: Some("a11y_7".into()),
+            accessibility_snapshot_id: Some("uia_1000_1".into()),
+            role: UITargetRole::RankedResult,
+            region: Some(TargetRegion {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 30.0,
+                coordinate_space: "screen".into(),
+            }),
+            center_x: None,
+            center_y: None,
+            app_hint: Some("browser".into()),
+            browser_app_hint: Some("browser".into()),
+            provider_hint: None,
+            content_provider_hint: None,
+            page_kind_hint: Some("result_list".into()),
+            capture_backend: Some("powershell_uia".into()),
+            observation_source: Some("uia_snapshot".into()),
+            result_kind: Some("generic".into()),
+            confidence: 0.97,
+            source: TargetGroundingSource::AccessibilityLayer,
+            label: Some("Example".into()),
+            rank: Some(1),
+            observed_at_ms: Some(1_000),
+            reuse_eligible: false,
+            supports_focus: false,
+            supports_click: true,
+            rationale: "test uia candidate".into(),
+        };
+
+        let payload = candidate.execution_payload();
+
+        assert_eq!(payload["element_id"], "a11y_7");
+        assert_eq!(payload["accessibility_snapshot_id"], "uia_1000_1");
+    }
+
+    #[test]
+    fn open_list_item_does_not_click_when_uia_candidates_are_ambiguous_without_selector() {
+        let candidate = |id: &str, y: f64| UITargetCandidate {
+            candidate_id: id.into(),
+            element_id: Some(id.into()),
+            accessibility_snapshot_id: Some("uia_ambiguous".into()),
+            role: UITargetRole::RankedResult,
+            region: Some(TargetRegion {
+                x: 100.0,
+                y,
+                width: 300.0,
+                height: 40.0,
+                coordinate_space: "screen".into(),
+            }),
+            center_x: None,
+            center_y: None,
+            app_hint: Some("browser".into()),
+            browser_app_hint: Some("browser".into()),
+            provider_hint: None,
+            content_provider_hint: None,
+            page_kind_hint: Some("result_list".into()),
+            capture_backend: Some("powershell_uia".into()),
+            observation_source: Some("uia_snapshot".into()),
+            result_kind: Some("generic".into()),
+            confidence: 0.94,
+            source: TargetGroundingSource::AccessibilityLayer,
+            label: Some(format!("Result {id}")),
+            rank: None,
+            observed_at_ms: Some(1_000),
+            reuse_eligible: false,
+            supports_focus: false,
+            supports_click: true,
+            rationale: "ambiguous uia test candidate".into(),
+        };
+        let state = TargetGroundingState {
+            requested_role: UITargetRole::RankedResult,
+            rank_hint: None,
+            result_kind_hint: Some("generic".into()),
+            now_ms: Some(1_000),
+            max_recent_age_ms: 0,
+            candidates: vec![candidate("a11y_1", 100.0), candidate("a11y_2", 200.0)],
+            current_app_hint: Some("browser".into()),
+            provider_hint: None,
+            sufficient_for_selection: true,
+            ambiguous: false,
+            uncertainty: Vec::new(),
+        };
+
+        let selection = select_target_candidate(
+            &state,
+            TargetAction::Click,
+            &TargetSelectionPolicy::default(),
+        );
+
+        assert_eq!(selection.status, TargetSelectionStatus::Ambiguous);
+        assert!(selection.selected_candidate.is_none());
     }
 }

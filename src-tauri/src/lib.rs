@@ -1,3 +1,4 @@
+mod accessibility_layer;
 mod action_policy;
 mod action_resolution;
 mod assistant_context;

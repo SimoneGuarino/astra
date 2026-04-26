@@ -4,10 +4,11 @@ use crate::{
         BrowserHandoffVerificationDiagnostic, BrowserPageSemanticKind, BrowserRecoveryStatus,
         BrowserVisualHandoffResult, ClickRegion, ConfidenceSignalState, ExecutableFallbackSource,
         ExecutableTargetConfidenceDiagnostic, FocusedPerceptionFailureReason,
-        FocusedPerceptionRequest, FrameUncertainty, GoalConstraints, GoalLoopRun, GoalLoopStatus,
-        GoalSpec, GoalType, GoalVerificationRecord, GoalVerificationStatus, InteractionSurfaceKind,
-        OffscreenInferenceStage, PageEvidenceSource, PageSemanticEvidence, PageState,
-        PerceptionRequestMode, PerceptionRoutingDecision, PlannerContractDecision,
+        FocusedPerceptionRequest, FrameUncertainty, GoalConstraints, GoalLoopCompletionDiagnostics,
+        GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationRecord,
+        GoalVerificationStatus, InteractionSurfaceKind, OffscreenInferenceStage, PageEvidenceSource,
+        PageSemanticEvidence, PageState, PerceptionRequestMode, PerceptionRoutingDecision,
+        PlannerContractDecision,
         PlannerContractInput, PlannerContractSource, PlannerDecisionDiagnostic,
         PlannerDecisionStatus, PlannerRejectionReason, PlannerScrollIntent, PlannerStep,
         PlannerStepExecutionRecord, PlannerStepExecutionStatus, PlannerStepKind,
@@ -23,7 +24,7 @@ use crate::{
         TargetRegion, TargetSelectionPolicy, UITargetCandidate, UITargetRole,
     },
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{collections::HashMap, future::Future, pin::Pin};
 use uuid::Uuid;
 
@@ -246,6 +247,11 @@ pub fn run_goal_loop_once(goal: GoalSpec, frame: SemanticScreenFrame) -> GoalLoo
         PlannerStepKind::RequestClarification => GoalLoopStatus::NeedsClarification,
         PlannerStepKind::Refuse => GoalLoopStatus::Refused,
     };
+    let completion_diagnostics = GoalLoopCompletionDiagnostics {
+        goal_success_condition: Some(goal.success_condition.clone()),
+        planned_steps: 1,
+        ..GoalLoopCompletionDiagnostics::default()
+    };
     GoalLoopRun {
         run_id: Uuid::new_v4().to_string(),
         goal,
@@ -277,6 +283,7 @@ pub fn run_goal_loop_once(goal: GoalSpec, frame: SemanticScreenFrame) -> GoalLoo
         selected_target_candidate: None,
         verifier_status: None,
         failure_reason: None,
+        completion_diagnostics,
     }
 }
 
@@ -359,14 +366,27 @@ struct PendingPostClickVerification {
     geometry_signature: Option<String>,
     pre_click_frame_signature: String,
     pre_click_list_surface_visible: bool,
+    pre_click_page_context: String,
+    pre_click_page_kind: Option<String>,
+    pre_click_provider_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PostClickVerificationOutcome {
     goal_achieved: bool,
     progress_observed: bool,
     frame_unchanged: bool,
     browser_surface_suspect: bool,
+    achieved_reason: Option<String>,
+    transition_kind: Option<String>,
+    title_or_entity_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListItemDetailTransitionEvidence {
+    reason: String,
+    transition_kind: String,
+    title_or_entity_evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,6 +408,11 @@ impl GoalLoopRuntime {
         driver: &mut D,
     ) -> GoalLoopRun {
         let run_id = Uuid::new_v4().to_string();
+        let completion_diagnostics = GoalLoopCompletionDiagnostics {
+            goal_success_condition: Some(goal.success_condition.clone()),
+            planned_steps: 1,
+            ..GoalLoopCompletionDiagnostics::default()
+        };
         let mut run = GoalLoopRun {
             run_id,
             goal,
@@ -419,6 +444,7 @@ impl GoalLoopRuntime {
             selected_target_candidate: None,
             verifier_status: None,
             failure_reason: None,
+            completion_diagnostics,
         };
 
         let mut focused_passes = 0usize;
@@ -513,17 +539,18 @@ impl GoalLoopRuntime {
                 let current_frame = run
                     .frames
                     .last()
-                    .expect("frame after post-click perception");
+                    .expect("frame after post-click perception")
+                    .clone();
                 let mut surface_lost_after_click = false;
                 if let Some(surface) = run.verified_surface.clone() {
                     let diagnostic = surface_continuity_diagnostic(
                         &run.goal,
                         &surface,
-                        current_frame,
+                        &current_frame,
                         iteration,
                     );
                     surface_lost_after_click = diagnostic.status == SurfaceOwnershipStatus::Lost
-                        && verify_goal_against_frame(&run.goal, current_frame).is_none();
+                        && verify_goal_against_frame(&run.goal, &current_frame).is_none();
                     if surface_lost_after_click {
                         run.surface_ownership_lost = true;
                         run.focused_perception_failure_reason =
@@ -531,14 +558,48 @@ impl GoalLoopRuntime {
                     } else if diagnostic.status == SurfaceOwnershipStatus::Verified {
                         run.verified_surface = Some(verified_browser_surface_from_frame(
                             &run.goal,
-                            current_frame,
+                            &current_frame,
                         ));
                     }
                     run.surface_diagnostics.push(diagnostic);
                 }
-                let post_click = evaluate_post_click_frame(&run.goal, &pending, current_frame);
+                let post_click = evaluate_post_click_frame(&run.goal, &pending, &current_frame);
+                record_post_click_completion_diagnostics(
+                    &mut run,
+                    &pending,
+                    &current_frame,
+                    &post_click,
+                );
                 if post_click.progress_observed {
                     run.post_action_progress_observed = true;
+                }
+                if post_click.goal_achieved {
+                    let reason = post_click
+                        .achieved_reason
+                        .clone()
+                        .unwrap_or_else(|| {
+                            "post-click frame shows list_item_detail_open transition".into()
+                        });
+                    let verification = GoalVerificationRecord {
+                        iteration,
+                        status: GoalVerificationStatus::GoalAchieved,
+                        confidence: current_frame.page_evidence.confidence.max(0.86),
+                        reason: reason.clone(),
+                        frame_id: Some(current_frame.frame_id.clone()),
+                    };
+                    run.verification_history.push(verification);
+                    run.verifier_status = Some("GoalAchieved".into());
+                    run.status = GoalLoopStatus::GoalAchieved;
+                    run.failure_reason = None;
+                    run.surface_ownership_lost = false;
+                    run.focused_perception_failure_reason = None;
+                    run.completion_diagnostics.goal_verifier_status =
+                        Some(GoalVerificationStatus::GoalAchieved);
+                    run.completion_diagnostics.goal_achieved_reason = Some(reason);
+                    run.completion_diagnostics.logical_steps_completed = 1;
+                    run.completion_diagnostics.executed_attempts = run.executed_steps.len();
+                    run.completion_diagnostics.success_terminal_stop = true;
+                    return run;
                 }
                 if let Some(signature) = pending.geometry_signature.clone() {
                     if post_click.progress_observed {
@@ -635,8 +696,20 @@ impl GoalLoopRuntime {
             let verification = verify_goal_state(&run.goal, frame, iteration);
             run.verifier_status = Some(format!("{:?}", verification.status));
             run.verification_history.push(verification.clone());
+            run.completion_diagnostics.goal_verifier_status = Some(verification.status.clone());
             if verification.status == GoalVerificationStatus::GoalAchieved {
                 run.status = GoalLoopStatus::GoalAchieved;
+                run.failure_reason = None;
+                run.completion_diagnostics.goal_achieved_reason =
+                    Some(verification.reason.clone());
+                run.completion_diagnostics.logical_steps_completed =
+                    if !run.executed_steps.is_empty() || run.planner_steps.is_empty() {
+                        1
+                    } else {
+                        0
+                    };
+                run.completion_diagnostics.executed_attempts = run.executed_steps.len();
+                run.completion_diagnostics.success_terminal_stop = true;
                 return run;
             }
 
@@ -766,6 +839,7 @@ impl GoalLoopRuntime {
                         execution.fresh_capture_required = true;
                     }
                     run.executed_steps.push(execution);
+                    run.completion_diagnostics.executed_attempts = run.executed_steps.len();
                     let mut recovery_supplied_frame = false;
                     if !executed {
                         if let Some(reason) = browser_recovery_reason_for_execution(
@@ -843,6 +917,12 @@ impl GoalLoopRuntime {
                             geometry_signature: step_geometry_signature(&step),
                             pre_click_frame_signature: current_frame_signature,
                             pre_click_list_surface_visible: structural_list_surface_visible(frame),
+                            pre_click_page_context: page_context_summary(frame),
+                            pre_click_page_kind: frame.page_evidence.page_kind_hint.clone(),
+                            pre_click_provider_hint: frame
+                                .page_evidence
+                                .content_provider_hint
+                                .clone(),
                         });
                         force_fresh_capture = true;
                     }
@@ -964,6 +1044,12 @@ impl GoalLoopRuntime {
                 }
                 PlannerStepKind::VerifyGoal | PlannerStepKind::NoOp => {
                     run.status = GoalLoopStatus::GoalAchieved;
+                    run.failure_reason = None;
+                    run.completion_diagnostics.goal_verifier_status =
+                        Some(GoalVerificationStatus::GoalAchieved);
+                    run.completion_diagnostics.logical_steps_completed = 1;
+                    run.completion_diagnostics.executed_attempts = run.executed_steps.len();
+                    run.completion_diagnostics.success_terminal_stop = true;
                     return run;
                 }
                 PlannerStepKind::RequestClarification => {
@@ -1071,6 +1157,8 @@ pub fn verify_browser_handoff_page(
     if verify_goal_against_frame(goal, frame).is_some() {
         diagnostic.accepted = true;
         diagnostic.decision = BrowserHandoffVerificationDecision::GoalSatisfied;
+        diagnostic.structural_grounding_allowed = true;
+        diagnostic.page_verification_status = Some("verified".into());
         diagnostic.reason =
             Some("goal already appears satisfied on the current visible browser page".into());
         return Ok(diagnostic);
@@ -1084,6 +1172,8 @@ pub fn verify_browser_handoff_page(
             if diagnostic.normalized_page_kind == BrowserPageSemanticKind::WatchPage {
                 diagnostic.accepted = true;
                 diagnostic.decision = BrowserHandoffVerificationDecision::NormalizedPageKind;
+                diagnostic.structural_grounding_allowed = true;
+                diagnostic.page_verification_status = Some("verified".into());
                 diagnostic.reason = Some(format!(
                     "page kind {:?} normalized to watch_page and is valid for channel continuation",
                     diagnostic.raw_page_kind_hint
@@ -1101,6 +1191,8 @@ pub fn verify_browser_handoff_page(
         GoalType::InspectScreen => {
             diagnostic.accepted = true;
             diagnostic.decision = BrowserHandoffVerificationDecision::NotRequired;
+            diagnostic.structural_grounding_allowed = true;
+            diagnostic.page_verification_status = Some("not_required".into());
             diagnostic.reason =
                 Some("inspect_screen goals do not require browser page-kind verification".into());
             Ok(diagnostic)
@@ -1204,6 +1296,8 @@ fn browser_handoff_verification_diagnostic(
         normalized_page_kind,
         decision: BrowserHandoffVerificationDecision::Rejected,
         accepted: false,
+        structural_grounding_allowed: false,
+        page_verification_status: Some("rejected".into()),
         provider_matches,
         goal_expects_results_context,
         generic_provider_page_kind_hint,
@@ -1232,6 +1326,8 @@ fn verify_list_handoff_context(
     if diagnostic.normalized_page_kind == BrowserPageSemanticKind::SearchResults {
         diagnostic.accepted = true;
         diagnostic.decision = BrowserHandoffVerificationDecision::NormalizedPageKind;
+        diagnostic.structural_grounding_allowed = true;
+        diagnostic.page_verification_status = Some("verified".into());
         diagnostic.reason = Some(format!(
             "page kind {:?} normalized to search_results",
             diagnostic.raw_page_kind_hint
@@ -1255,6 +1351,8 @@ fn verify_list_handoff_context(
     {
         diagnostic.accepted = true;
         diagnostic.decision = BrowserHandoffVerificationDecision::SupportingEvidence;
+        diagnostic.structural_grounding_allowed = true;
+        diagnostic.page_verification_status = Some("verified".into());
         diagnostic.reason = Some(format!(
             "visible page was accepted as a provider-agnostic list context using primary_list/page_state evidence; raw page kind {:?}",
             diagnostic.raw_page_kind_hint
@@ -1272,6 +1370,8 @@ fn verify_list_handoff_context(
     if generic_provider_results_context {
         diagnostic.accepted = true;
         diagnostic.decision = BrowserHandoffVerificationDecision::SupportingEvidence;
+        diagnostic.structural_grounding_allowed = true;
+        diagnostic.page_verification_status = Some("verified".into());
         diagnostic.reason = Some(format!(
             "generic provider page kind {:?} was accepted as a result-list context using goal-aware supporting evidence",
             diagnostic.raw_page_kind_hint
@@ -1285,8 +1385,45 @@ fn verify_list_handoff_context(
     {
         diagnostic.accepted = true;
         diagnostic.decision = BrowserHandoffVerificationDecision::SupportingEvidence;
+        diagnostic.structural_grounding_allowed = true;
+        diagnostic.page_verification_status = Some("verified".into());
         diagnostic.reason = Some(format!(
             "page kind {:?} was accepted as a result-list context using supporting semantic evidence",
+            diagnostic.raw_page_kind_hint
+        ));
+        return Ok(diagnostic);
+    }
+
+    let dominant_detail_without_list = matches!(
+        diagnostic
+            .page_state_dominant_content
+            .as_deref()
+            .map(normalize_label)
+            .as_deref(),
+        Some("video_player" | "detail_view" | "product_detail" | "article")
+    ) && !diagnostic.structural_list_surface_visible
+        && diagnostic.visible_result_item_count == 0
+        && diagnostic.primary_list_item_count == 0;
+    let structurally_groundable = diagnostic.goal_expects_results_context
+        && diagnostic.provider_matches
+        && !dominant_detail_without_list
+        && has_structural_result_signal
+        && has_scene_or_query_signal
+        && diagnostic.supporting_signal_count >= 4
+        && (diagnostic.structural_list_surface_visible
+            || diagnostic.visible_result_item_count > 0
+            || diagnostic.primary_list_item_count > 0);
+
+    if structurally_groundable {
+        diagnostic.accepted = true;
+        diagnostic.decision = BrowserHandoffVerificationDecision::StructurallyGroundable;
+        diagnostic.structural_grounding_allowed = true;
+        diagnostic.page_verification_status = Some("structurally_groundable".into());
+        diagnostic
+            .supporting_evidence
+            .push("page_kind_hint_weak_but_structural_grounding_allowed".into());
+        diagnostic.reason = Some(format!(
+            "page kind {:?} was weak or unknown, but provider/query/list structural evidence is sufficient to allow target grounding; execution still requires a validated high-confidence target candidate",
             diagnostic.raw_page_kind_hint
         ));
         return Ok(diagnostic);
@@ -1913,16 +2050,18 @@ fn find_ranked_result_match<'a>(
     frame: &'a SemanticScreenFrame,
 ) -> Option<&'a VisibleResultItem> {
     let desired_kind = requested_item_kind_label(goal);
-    let desired_rank = goal
+    let explicit_rank = goal
         .constraints
         .rank_within_kind
-        .or(goal.constraints.rank_overall)
-        .unwrap_or(1);
+        .or(goal.constraints.rank_overall);
+    let desired_rank = explicit_rank.or(Some(1));
+    let desired_rank = desired_rank.unwrap_or(1);
     let provider = goal
         .constraints
         .provider
         .as_deref()
         .or(frame.page_evidence.content_provider_hint.as_deref());
+    let desired_name = goal.constraints.entity_name.as_deref();
     frame.visible_result_items.iter().find(|item| {
         item_kind_compatibility(desired_kind.as_deref(), Some(result_kind_label(&item.kind)))
             .is_some()
@@ -1931,7 +2070,15 @@ fn find_ranked_result_match<'a>(
                 frame.page_evidence.content_provider_hint.as_deref(),
                 item,
             )
-            && effective_rank_for_goal(frame, item, desired_kind.as_deref()) == Some(desired_rank)
+            && desired_name.map_or(true, |name| {
+                item.title
+                    .as_deref()
+                    .or(item.channel_name.as_deref())
+                    .map_or(false, |observed| loose_text_match(name, observed))
+            })
+            && (desired_name.is_some() && explicit_rank.is_none()
+                || effective_rank_for_goal(frame, item, desired_kind.as_deref())
+                    == Some(desired_rank))
     })
 }
 
@@ -1940,24 +2087,35 @@ fn find_primary_list_item_match<'a>(
     frame: &'a SemanticScreenFrame,
 ) -> Option<&'a PrimaryListItem> {
     let desired_kind = requested_item_kind_label(goal);
-    let desired_rank = goal
+    let explicit_rank = goal
         .constraints
         .rank_within_kind
-        .or(goal.constraints.rank_overall)
-        .unwrap_or(1);
+        .or(goal.constraints.rank_overall);
+    let desired_rank = explicit_rank.unwrap_or(1);
+    let desired_name = goal.constraints.entity_name.as_deref();
     let list = frame.primary_list.as_ref()?;
     list.items
         .iter()
         .filter(|item| {
             item_kind_compatibility(desired_kind.as_deref(), item.item_kind.as_deref()).is_some()
+                && desired_name.map_or(true, |name| {
+                    item.title
+                        .as_deref()
+                        .map_or(false, |observed| loose_text_match(name, observed))
+                })
         })
-        .find(|item| item.rank == desired_rank)
+        .find(|item| desired_name.is_some() && explicit_rank.is_none() || item.rank == desired_rank)
         .or_else(|| {
             list.items
                 .iter()
                 .filter(|item| {
                     item_kind_compatibility(desired_kind.as_deref(), item.item_kind.as_deref())
                         .is_some()
+                        && desired_name.map_or(true, |name| {
+                            item.title
+                                .as_deref()
+                                .map_or(false, |observed| loose_text_match(name, observed))
+                        })
                 })
                 .nth((desired_rank.saturating_sub(1)) as usize)
         })
@@ -2423,6 +2581,8 @@ fn candidate_from_actionable_control(
 
     Some(UITargetCandidate {
         candidate_id: format!("planner_control_{}", control.control_id),
+        element_id: None,
+        accessibility_snapshot_id: None,
         role,
         region: Some(region),
         center_x: None,
@@ -3099,6 +3259,21 @@ fn provider_context_compatible(
         (Some(expected), Some(observed)) => labels_match(expected, observed),
         _ => true,
     }
+}
+
+fn open_list_item_goal_expects_detail(goal: &GoalSpec) -> bool {
+    if !matches!(
+        goal.goal_type,
+        GoalType::OpenListItem | GoalType::OpenMediaResult
+    ) {
+        return false;
+    }
+    let condition = normalize_label(&goal.success_condition);
+    condition == "list_item_detail_open"
+        || condition == "video_watch_page_open"
+        || condition.contains("detail")
+        || condition.contains("watch_page")
+        || condition.contains("content_open")
 }
 
 fn list_context_visible(frame: &SemanticScreenFrame) -> bool {
@@ -3861,8 +4036,25 @@ fn candidate_from_result_item(
     requested_rank: Option<u32>,
     confidence: f32,
 ) -> UITargetCandidate {
+    let element_id = item.element_id.clone().or_else(|| {
+        item.attributes
+            .get("element_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    let accessibility_snapshot_id = accessibility_snapshot_id_from_attributes(&item.attributes);
+    let reuse_eligible = element_id
+        .as_deref()
+        .map(|id| !id.starts_with("a11y_"))
+        .unwrap_or(true);
+    let accessibility_sourced = element_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("a11y_"))
+        || accessibility_snapshot_id.is_some();
     UITargetCandidate {
         candidate_id: format!("planner_result_{}_{}", item.item_id, region_key),
+        element_id,
+        accessibility_snapshot_id,
         role: UITargetRole::RankedResult,
         region: Some(click_region.region.clone()),
         center_x: None,
@@ -3872,17 +4064,25 @@ fn candidate_from_result_item(
         provider_hint: provider.clone().or_else(|| item.provider.clone()),
         content_provider_hint: provider.or_else(|| item.provider.clone()),
         page_kind_hint: Some("result_list".into()),
-        capture_backend: None,
-        observation_source: Some("planner_semantic_frame".into()),
+        capture_backend: accessibility_sourced.then_some("powershell_uia".into()),
+        observation_source: Some(if accessibility_sourced {
+            "uia_snapshot".into()
+        } else {
+            "planner_semantic_frame".into()
+        }),
         result_kind: Some(result_kind_label(&item.kind).into()),
         confidence,
-        source: TargetGroundingSource::ScreenAnalysis,
+        source: if accessibility_sourced {
+            TargetGroundingSource::AccessibilityLayer
+        } else {
+            TargetGroundingSource::ScreenAnalysis
+        },
         label: item.title.clone(),
         rank: requested_rank
             .or(item.rank_within_kind)
             .or(item.rank_overall),
         observed_at_ms: None,
-        reuse_eligible: true,
+        reuse_eligible,
         supports_focus: false,
         supports_click: true,
         rationale: format!("planner selected semantic {:?} result", item.kind),
@@ -3897,8 +4097,25 @@ fn candidate_from_primary_list_item(
     requested_rank: Option<u32>,
     confidence: f32,
 ) -> UITargetCandidate {
+    let element_id = item.element_id.clone().or_else(|| {
+        item.attributes
+            .get("element_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    });
+    let accessibility_snapshot_id = accessibility_snapshot_id_from_attributes(&item.attributes);
+    let reuse_eligible = element_id
+        .as_deref()
+        .map(|id| !id.starts_with("a11y_"))
+        .unwrap_or(true);
+    let accessibility_sourced = element_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with("a11y_"))
+        || accessibility_snapshot_id.is_some();
     UITargetCandidate {
         candidate_id: format!("planner_primary_list_{}_{}", item.item_id, region_key),
+        element_id,
+        accessibility_snapshot_id,
         role: UITargetRole::RankedResult,
         region: Some(click_region.region.clone()),
         center_x: None,
@@ -3908,15 +4125,23 @@ fn candidate_from_primary_list_item(
         provider_hint: provider.clone(),
         content_provider_hint: provider,
         page_kind_hint: Some("result_list".into()),
-        capture_backend: None,
-        observation_source: Some("planner_primary_list".into()),
+        capture_backend: accessibility_sourced.then_some("powershell_uia".into()),
+        observation_source: Some(if accessibility_sourced {
+            "uia_snapshot".into()
+        } else {
+            "planner_primary_list".into()
+        }),
         result_kind: item.item_kind.clone().or_else(|| Some("generic".into())),
         confidence,
-        source: TargetGroundingSource::ScreenAnalysis,
+        source: if accessibility_sourced {
+            TargetGroundingSource::AccessibilityLayer
+        } else {
+            TargetGroundingSource::ScreenAnalysis
+        },
         label: item.title.clone(),
         rank: requested_rank.or(Some(item.rank)),
         observed_at_ms: None,
-        reuse_eligible: true,
+        reuse_eligible,
         supports_focus: false,
         supports_click: true,
         rationale: format!(
@@ -3926,9 +4151,17 @@ fn candidate_from_primary_list_item(
     }
 }
 
+fn accessibility_snapshot_id_from_attributes(attributes: &Value) -> Option<String> {
+    attributes
+        .get("accessibility_snapshot_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn visible_result_item_from_primary_list_item(item: &PrimaryListItem) -> VisibleResultItem {
     VisibleResultItem {
         item_id: item.item_id.clone(),
+        element_id: item.element_id.clone(),
         kind: result_kind_from_value(item.item_kind.as_deref()),
         title: item.title.clone(),
         channel_name: None,
@@ -3952,6 +4185,8 @@ fn candidate_from_entity(
 ) -> Option<UITargetCandidate> {
     Some(UITargetCandidate {
         candidate_id: format!("planner_entity_{}", entity.entity_id),
+        element_id: None,
+        accessibility_snapshot_id: None,
         role: UITargetRole::Link,
         region: Some(entity.region.clone()?),
         center_x: None,
@@ -4543,6 +4778,10 @@ fn deterministic_visible_ordinal_fast_path(
         return false;
     }
 
+    if frame_has_current_accessibility_candidates(&input.current_frame) {
+        return false;
+    }
+
     let Some(target_item_id) = step.target_item_id.as_deref() else {
         return false;
     };
@@ -4550,6 +4789,35 @@ fn deterministic_visible_ordinal_fast_path(
         .is_some_and(|item| item.item_id == target_item_id)
         || find_ranked_result_match(&input.goal, &input.current_frame)
             .is_some_and(|item| item.item_id == target_item_id)
+}
+
+fn frame_has_current_accessibility_candidates(frame: &SemanticScreenFrame) -> bool {
+    frame
+        .legacy_target_candidates
+        .iter()
+        .any(candidate_has_uia_identity)
+        || frame.visible_result_items.iter().any(|item| {
+            item.element_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("a11y_"))
+        })
+        || frame.primary_list.as_ref().is_some_and(|list| {
+            list.items.iter().any(|item| {
+                item.element_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("a11y_"))
+            })
+        })
+}
+
+fn candidate_has_uia_identity(candidate: &UITargetCandidate) -> bool {
+    candidate.source == TargetGroundingSource::AccessibilityLayer
+        || candidate.observation_source.as_deref() == Some("uia_snapshot")
+        || candidate
+            .element_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("a11y_"))
+        || candidate.accessibility_snapshot_id.is_some()
 }
 
 fn candidate_signature(candidate: &UITargetCandidate) -> String {
@@ -4697,16 +4965,24 @@ fn evaluate_post_click_frame(
     pending: &PendingPostClickVerification,
     frame: &SemanticScreenFrame,
 ) -> PostClickVerificationOutcome {
-    let structural_transition_achieved = matches!(
-        goal.goal_type,
-        GoalType::OpenListItem | GoalType::OpenMediaResult
-    ) && pending.pre_click_list_surface_visible
-        && matches!(
-            structural_open_list_item_state(goal, frame),
-            OpenListItemVerificationState::Achieved(_)
-        );
-    let goal_achieved =
-        verify_goal_against_frame(goal, frame).is_some() || structural_transition_achieved;
+    let transition = list_item_detail_transition_evidence(goal, pending, frame);
+    let current_frame_goal = if open_list_item_goal_expects_detail(goal) {
+        None
+    } else {
+        verify_goal_against_frame(goal, frame)
+    };
+    let achieved_reason = transition
+        .as_ref()
+        .map(|evidence| evidence.reason.clone())
+        .or(current_frame_goal);
+    let title_or_entity_evidence = transition
+        .as_ref()
+        .map(|evidence| evidence.title_or_entity_evidence.clone())
+        .unwrap_or_else(|| opened_content_title_or_entity_evidence(frame));
+    let transition_kind = transition
+        .as_ref()
+        .map(|evidence| evidence.transition_kind.clone());
+    let goal_achieved = achieved_reason.is_some();
     let frame_unchanged = frame_progress_signature(frame) == pending.pre_click_frame_signature;
     let browser_surface_suspect = !goal_achieved
         && goal.constraints.provider.is_some()
@@ -4717,6 +4993,81 @@ fn evaluate_post_click_frame(
         progress_observed: goal_achieved || !frame_unchanged,
         frame_unchanged,
         browser_surface_suspect,
+        achieved_reason,
+        transition_kind,
+        title_or_entity_evidence,
+    }
+}
+
+fn list_item_detail_transition_evidence(
+    goal: &GoalSpec,
+    pending: &PendingPostClickVerification,
+    frame: &SemanticScreenFrame,
+) -> Option<ListItemDetailTransitionEvidence> {
+    if !open_list_item_goal_expects_detail(goal) || !pending.pre_click_list_surface_visible {
+        return None;
+    }
+    if !provider_context_compatible(
+        goal.constraints.provider.as_deref(),
+        frame.page_evidence.content_provider_hint.as_deref(),
+    ) {
+        return None;
+    }
+
+    let detail_visible = structural_detail_surface_visible(frame);
+    let detail_dominant = structural_detail_surface_dominant(frame);
+    let list_still_dominant = structural_list_surface_dominant(frame) && !detail_dominant;
+    if !detail_visible || list_still_dominant {
+        return None;
+    }
+
+    let title_or_entity_evidence = opened_content_title_or_entity_evidence(frame);
+    let structural_content_evidence = !title_or_entity_evidence.is_empty()
+        || scene_summary_suggests_opened_content(&frame.scene_summary)
+        || frame
+            .page_evidence
+            .page_kind_hint
+            .as_deref()
+            .is_some_and(page_kind_is_detail_like)
+        || page_state_is_detail_like(frame.page_state.as_ref());
+    if !structural_content_evidence {
+        return None;
+    }
+
+    let post_context = page_context_summary(frame);
+    Some(ListItemDetailTransitionEvidence {
+        reason: "post-click frame shows list_item_detail_open transition".into(),
+        transition_kind: format!("{}->{}", pending.pre_click_page_context, post_context),
+        title_or_entity_evidence,
+    })
+}
+
+fn record_post_click_completion_diagnostics(
+    run: &mut GoalLoopRun,
+    pending: &PendingPostClickVerification,
+    frame: &SemanticScreenFrame,
+    outcome: &PostClickVerificationOutcome,
+) {
+    let diagnostics = &mut run.completion_diagnostics;
+    let mut previous_context = pending.pre_click_page_context.clone();
+    if let Some(kind) = pending.pre_click_page_kind.as_deref() {
+        previous_context.push_str(&format!("; page_kind={kind}"));
+    }
+    if let Some(provider) = pending.pre_click_provider_hint.as_deref() {
+        previous_context.push_str(&format!("; provider={provider}"));
+    }
+    diagnostics.previous_page_context = Some(previous_context);
+    diagnostics.post_click_page_context = Some(page_context_summary(frame));
+    diagnostics.post_click_page_kind = post_click_page_kind_label(frame);
+    diagnostics.post_click_provider_hint = frame.page_evidence.content_provider_hint.clone();
+    diagnostics.post_click_title_or_entity_evidence =
+        outcome.title_or_entity_evidence.clone();
+    diagnostics.post_click_transition_kind = outcome.transition_kind.clone();
+    diagnostics.goal_success_condition = Some(run.goal.success_condition.clone());
+    diagnostics.executed_attempts = run.executed_steps.len();
+    if outcome.goal_achieved {
+        diagnostics.goal_verifier_status = Some(GoalVerificationStatus::GoalAchieved);
+        diagnostics.goal_achieved_reason = outcome.achieved_reason.clone();
     }
 }
 
@@ -4730,13 +5081,13 @@ fn is_search_results_page(frame: &SemanticScreenFrame) -> bool {
 }
 
 fn structural_list_surface_visible(frame: &SemanticScreenFrame) -> bool {
-    if let Some(state) = frame.page_state.as_ref() {
-        return state.list_visible == Some(true)
-            || state.kind == "list"
-            || state.dominant_content == "result_list";
-    }
-
-    frame
+    page_state_is_list_like(frame.page_state.as_ref())
+        || frame
+            .page_evidence
+            .page_kind_hint
+            .as_deref()
+            .is_some_and(page_kind_is_list_like)
+        || frame
         .primary_list
         .as_ref()
         .is_some_and(|list| !list.items.is_empty())
@@ -4744,31 +5095,186 @@ fn structural_list_surface_visible(frame: &SemanticScreenFrame) -> bool {
         || !frame.visible_result_items.is_empty()
 }
 
-fn structural_detail_surface_visible(frame: &SemanticScreenFrame) -> bool {
+fn structural_list_surface_dominant(frame: &SemanticScreenFrame) -> bool {
     frame.page_state.as_ref().is_some_and(|state| {
-        state.detail_visible == Some(true)
-            || matches!(state.kind.as_str(), "detail" | "player")
-            || matches!(
-                state.dominant_content.as_str(),
-                "detail_view" | "video_player" | "article" | "product_detail"
-            )
-    })
+        state.kind == "list" || state.dominant_content == "result_list"
+    }) || frame
+        .page_evidence
+        .page_kind_hint
+        .as_deref()
+        .is_some_and(page_kind_is_list_like)
+}
+
+fn structural_detail_surface_visible(frame: &SemanticScreenFrame) -> bool {
+    page_state_is_detail_like(frame.page_state.as_ref())
+        || frame
+            .page_evidence
+            .page_kind_hint
+            .as_deref()
+            .is_some_and(page_kind_is_detail_like)
 }
 
 fn structural_detail_surface_dominant(frame: &SemanticScreenFrame) -> bool {
     frame.page_state.as_ref().is_some_and(|state| {
         matches!(state.kind.as_str(), "detail" | "player")
-            || matches!(
-                state.dominant_content.as_str(),
-                "detail_view" | "video_player" | "article" | "product_detail"
-            )
+            || detail_dominant_content_kind(state.dominant_content.as_str())
+    }) || frame
+        .page_evidence
+        .page_kind_hint
+        .as_deref()
+        .is_some_and(page_kind_is_detail_like)
+}
+
+fn page_state_is_list_like(state: Option<&PageState>) -> bool {
+    state.is_some_and(|state| {
+        state.list_visible == Some(true)
+            || state.kind == "list"
+            || state.dominant_content == "result_list"
     })
+}
+
+fn page_state_is_detail_like(state: Option<&PageState>) -> bool {
+    state.is_some_and(|state| {
+        state.detail_visible == Some(true)
+            || matches!(state.kind.as_str(), "detail" | "player")
+            || detail_dominant_content_kind(state.dominant_content.as_str())
+    })
+}
+
+fn detail_dominant_content_kind(value: &str) -> bool {
+    matches!(
+        value,
+        "detail_view" | "video_player" | "article" | "document" | "content_page"
+            | "product_detail" | "profile_detail"
+    )
+}
+
+fn page_kind_is_list_like(value: &str) -> bool {
+    matches!(
+        normalize_label(value).as_str(),
+        "search_results"
+            | "search_results_page"
+            | "search_result_page"
+            | "results_page"
+            | "result_page"
+            | "results"
+            | "search"
+            | "search_page"
+            | "result_list"
+            | "results_list"
+            | "ranked_list"
+            | "serp"
+            | "listing"
+            | "catalog"
+            | "list"
+    )
+}
+
+fn page_kind_is_detail_like(value: &str) -> bool {
+    matches!(
+        normalize_label(value).as_str(),
+        "detail"
+            | "details"
+            | "detail_page"
+            | "watch_page"
+            | "watch"
+            | "video_page"
+            | "video_watch"
+            | "video_player"
+            | "player"
+            | "media_page"
+            | "media_player"
+            | "content_page"
+            | "article"
+            | "article_page"
+            | "document"
+            | "document_page"
+            | "product_detail"
+            | "product_page"
+            | "profile_detail"
+            | "profile_page"
+    )
+}
+
+fn opened_content_title_or_entity_evidence(frame: &SemanticScreenFrame) -> Vec<String> {
+    let mut evidence = Vec::new();
+    if let Some(query) = frame
+        .page_evidence
+        .query_hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        evidence.push(format!("query_hint={query}"));
+    }
+    for entity in frame.visible_entities.iter().take(3) {
+        if let Some(name) = entity.name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+            evidence.push(format!("visible_entity={name}"));
+        }
+    }
+    if evidence.is_empty() && !structural_list_surface_visible(frame) {
+        for item in frame.visible_result_items.iter().take(2) {
+            if let Some(title) = item.title.as_deref().map(str::trim).filter(|title| !title.is_empty()) {
+                evidence.push(format!("visible_title={title}"));
+            }
+        }
+    }
+    evidence
+}
+
+fn scene_summary_suggests_opened_content(summary: &str) -> bool {
+    let normalized = normalize_label(summary);
+    [
+        "viewing",
+        "opened",
+        "open",
+        "playing",
+        "player",
+        "watch",
+        "watching",
+        "detail",
+        "detail_page",
+        "content",
+        "article",
+        "document",
+        "reading",
+    ]
+    .iter()
+    .any(|token| normalized.contains(token))
+}
+
+fn page_context_summary(frame: &SemanticScreenFrame) -> String {
+    let list = structural_list_surface_visible(frame);
+    let detail = structural_detail_surface_visible(frame);
+    match (list, detail) {
+        (true, false) => "list/search/results".into(),
+        (false, true) => "detail/player/content".into(),
+        (true, true) => "mixed_list_detail".into(),
+        (false, false) => "unknown".into(),
+    }
+}
+
+fn post_click_page_kind_label(frame: &SemanticScreenFrame) -> Option<String> {
+    frame
+        .page_evidence
+        .page_kind_hint
+        .clone()
+        .or_else(|| {
+            frame
+                .page_state
+                .as_ref()
+                .map(|state| state.dominant_content.clone())
+        })
+        .filter(|value| !value.trim().is_empty() && value != "unknown")
 }
 
 fn structural_open_list_item_state(
     goal: &GoalSpec,
     frame: &SemanticScreenFrame,
 ) -> OpenListItemVerificationState {
+    if !open_list_item_goal_expects_detail(goal) {
+        return OpenListItemVerificationState::NotAchieved;
+    }
     if !provider_context_compatible(
         goal.constraints.provider.as_deref(),
         frame.page_evidence.content_provider_hint.as_deref(),
@@ -4776,24 +5282,23 @@ fn structural_open_list_item_state(
         return OpenListItemVerificationState::NotAchieved;
     }
 
-    if frame.page_state.is_some() {
-        let list_visible = structural_list_surface_visible(frame);
-        let detail_visible = structural_detail_surface_visible(frame);
-        let detail_dominant = structural_detail_surface_dominant(frame);
-        if detail_dominant && !list_visible {
-            return OpenListItemVerificationState::Achieved(
-                "list_to_detail_structural_transition_visible",
-            );
-        }
-        if detail_dominant && detail_visible && list_visible {
-            return OpenListItemVerificationState::Ambiguous(
-                "detail_surface_visible_but_list_still_visible",
-            );
-        }
-        return OpenListItemVerificationState::NotAchieved;
+    let list_visible = structural_list_surface_visible(frame);
+    let detail_visible = structural_detail_surface_visible(frame);
+    let detail_dominant = structural_detail_surface_dominant(frame);
+    let current_content_evidence = !opened_content_title_or_entity_evidence(frame).is_empty()
+        || scene_summary_suggests_opened_content(&frame.scene_summary);
+    if detail_dominant && !list_visible && current_content_evidence {
+        return OpenListItemVerificationState::Achieved(
+            "list_to_detail_structural_transition_visible",
+        );
+    }
+    if detail_dominant && detail_visible && list_visible {
+        return OpenListItemVerificationState::Ambiguous(
+            "detail_surface_visible_but_list_still_visible",
+        );
     }
 
-    if is_watch_page(frame) {
+    if is_watch_page(frame) && current_content_evidence && !list_visible {
         return OpenListItemVerificationState::Achieved("media_watch_page_visible");
     }
 
@@ -4809,6 +5314,7 @@ fn structural_open_list_item_state(
             .primary_list
             .as_ref()
             .map_or(true, |list| list.items.is_empty())
+        && current_content_evidence
     {
         return OpenListItemVerificationState::Achieved("generic_web_detail_page_visible");
     }
@@ -4856,7 +5362,7 @@ pub(crate) fn browser_page_semantic_kind(value: Option<&str>) -> BrowserPageSema
         ) => BrowserPageSemanticKind::SearchResults,
         Some(
             "watch_page" | "video_page" | "youtube_watch" | "detail_page" | "watch" | "video"
-            | "video_watch" | "player" | "media_page",
+            | "video_watch" | "video_player" | "player" | "media_page" | "media_player",
         ) => BrowserPageSemanticKind::WatchPage,
         Some("web_page" | "page") => BrowserPageSemanticKind::WebPage,
         _ => BrowserPageSemanticKind::Unknown,
@@ -5054,6 +5560,10 @@ fn parse_primary_list_item(value: &Value, index: usize) -> Option<PrimaryListIte
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("primary_item_{}", index + 1)),
+        element_id: object
+            .get("element_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         rank,
         title: object
             .get("title")
@@ -5109,6 +5619,10 @@ fn parse_visible_result_item(value: &Value, index: usize) -> Option<VisibleResul
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("result_{}", index + 1)),
+        element_id: object
+            .get("element_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         kind: result_kind_from_value(
             object
                 .get("kind")
@@ -5287,6 +5801,7 @@ fn result_items_from_candidates(candidates: &[UITargetCandidate]) -> Vec<Visible
                 .unwrap_or(VisibleResultKind::Generic);
             Some(VisibleResultItem {
                 item_id: candidate.candidate_id.clone(),
+                element_id: candidate.element_id.clone(),
                 kind,
                 title: candidate.label.clone(),
                 channel_name: None,
@@ -5300,7 +5815,17 @@ fn result_items_from_candidates(candidates: &[UITargetCandidate]) -> Vec<Visible
                 raw_confidence: Some(candidate.confidence),
                 confidence: candidate.confidence,
                 rationale: Some(candidate.rationale.clone()),
-                attributes: Value::Null,
+                attributes: candidate
+                    .accessibility_snapshot_id
+                    .as_ref()
+                    .map(|snapshot_id| {
+                        json!({
+                            "element_id": candidate.element_id.clone(),
+                            "accessibility_snapshot_id": snapshot_id,
+                            "accessibility_sourced": true
+                        })
+                    })
+                    .unwrap_or(Value::Null),
             })
         })
         .collect()
@@ -5411,10 +5936,10 @@ fn normalize_page_state_kind(value: &str) -> String {
         | "listing"
         | "catalog"
         | "search" => "list".into(),
-        "detail" | "details" | "detail_page" | "web_page" | "article_page" | "product_page" => {
-            "detail".into()
-        }
-        "player" | "watch" | "watch_page" | "video" | "video_page" | "media_page" => {
+        "detail" | "details" | "detail_page" | "web_page" | "article_page"
+        | "content_page" | "document_page" | "product_page" | "profile_page" => "detail".into(),
+        "player" | "watch" | "watch_page" | "video" | "video_page" | "video_player"
+        | "media_page" | "media_player" => {
             "player".into()
         }
         "form" | "input_form" => "form".into(),
@@ -5440,9 +5965,14 @@ fn normalize_dominant_content_kind(value: &str) -> String {
         | "search"
         | "list" => "result_list".into(),
         "detail" | "details" | "detail_view" | "web_page" => "detail_view".into(),
-        "video_player" | "player" | "watch" | "watch_page" | "video" => "video_player".into(),
+        "video_player" | "player" | "watch" | "watch_page" | "video" | "media_player" => {
+            "video_player".into()
+        }
         "article" | "article_page" => "article".into(),
+        "document" | "document_page" => "document".into(),
+        "content" | "content_page" => "content_page".into(),
         "product" | "product_detail" | "product_page" => "product_detail".into(),
+        "profile" | "profile_detail" | "profile_page" => "profile_detail".into(),
         "generic" => "generic".into(),
         "youtube" | "google" | "amazon" | "github" => "unknown".into(),
         _ => "unknown".into(),
@@ -5771,6 +6301,41 @@ mod tests {
                 reason: Some("verified test browser surface".into()),
             },
             verified_frame: Some(frame),
+        }
+    }
+
+    fn uia_ranked_candidate(element_id: &str, rank: u32) -> UITargetCandidate {
+        UITargetCandidate {
+            candidate_id: element_id.into(),
+            element_id: Some(element_id.into()),
+            accessibility_snapshot_id: Some("uia_current".into()),
+            role: UITargetRole::RankedResult,
+            region: Some(TargetRegion {
+                x: 120.0,
+                y: 120.0 + ((rank - 1) as f64 * 90.0),
+                width: 300.0,
+                height: 56.0,
+                coordinate_space: "screen".into(),
+            }),
+            center_x: None,
+            center_y: None,
+            app_hint: Some("browser".into()),
+            browser_app_hint: Some("browser".into()),
+            provider_hint: None,
+            content_provider_hint: None,
+            page_kind_hint: Some("result_list".into()),
+            capture_backend: Some("powershell_uia".into()),
+            observation_source: Some("uia_snapshot".into()),
+            result_kind: Some("generic".into()),
+            confidence: 0.94,
+            source: TargetGroundingSource::AccessibilityLayer,
+            label: Some(format!("UIA result {rank}")),
+            rank: Some(rank),
+            observed_at_ms: Some(1_000),
+            reuse_eligible: false,
+            supports_focus: false,
+            supports_click: true,
+            rationale: "test UIA candidate".into(),
         }
     }
 
@@ -6235,6 +6800,85 @@ mod tests {
             driver.executed_steps[0].target_item_id.as_deref(),
             Some("video_3")
         );
+    }
+
+    #[tokio::test]
+    async fn browser_open_list_item_allows_vision_fallback_only_when_uia_unavailable() {
+        let list_frame = youtube_primary_list_frame("list", 1_000, 1);
+        let watch_frame = youtube_watch_frame("watch", 2_000);
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![list_frame, watch_frame]);
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(driver.plan_calls, 0);
+        assert_eq!(driver.executed_steps.len(), 1);
+        assert_eq!(run.status, GoalLoopStatus::GoalAchieved);
+    }
+
+    #[tokio::test]
+    async fn browser_open_list_item_does_not_execute_vision_only_candidate_when_uia_available() {
+        let mut list_frame = youtube_primary_list_frame("list", 1_000, 1);
+        list_frame
+            .legacy_target_candidates
+            .push(uia_ranked_candidate("a11y_1", 1));
+        let goal = open_list_item_goal(
+            "aprimi il primo video",
+            Some("youtube"),
+            Some("video"),
+            Some(1),
+            None,
+        );
+        let runtime = GoalLoopRuntime::new(GoalLoopRuntimeConfig::default());
+        let mut driver = MockGoalLoopDriver::new(vec![list_frame]);
+        driver.model_decision = Some(PlannerContractDecision {
+            source: PlannerContractSource::ModelAssisted,
+            proposed_step: PlannerStep {
+                step_id: "refuse".into(),
+                kind: PlannerStepKind::Refuse,
+                confidence: MIN_PLANNER_CLICK_CONFIDENCE,
+                rationale: "uia selector did not validate a target".into(),
+                target_item_id: None,
+                target_entity_id: None,
+                click_region_key: None,
+                executable_candidate: None,
+                expected_state: Some("media_watch_page_visible".into()),
+            },
+            strategy_rationale: "vision_only_candidate_suppressed=true; uia_selector_required=true"
+                .into(),
+            focused_perception_needed: false,
+            replan_needed: false,
+            expected_verification_target: Some("media_watch_page_visible".into()),
+            planner_confidence: MIN_PLANNER_CLICK_CONFIDENCE,
+            accepted: true,
+            fallback_used: false,
+            rejection_reason: None,
+            decision_status: PlannerDecisionStatus::Accepted,
+            rejection_code: None,
+            visibility_assessment: PlannerVisibilityAssessment::Unknown,
+            scroll_intent: PlannerScrollIntent::NotNeeded,
+            visible_actionability: VisibleActionabilityDiagnostic::default(),
+            target_confidence: None,
+            normalized: false,
+            downgraded: false,
+        });
+
+        let run = runtime
+            .run_goal_loop_until_complete(goal, &mut driver)
+            .await;
+
+        assert_eq!(driver.plan_calls, 1);
+        assert!(driver.executed_steps.is_empty());
+        assert_eq!(run.status, GoalLoopStatus::Refused);
     }
 
     #[test]
@@ -7192,6 +7836,100 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("supporting evidence was not strong enough"));
+    }
+
+    #[test]
+    fn list_handoff_accepts_structural_evidence_with_generic_page_kind() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "browser",
+                    "query_hint": "shiva",
+                    "confidence": 0.88
+                },
+                "scene_summary": "A browser page shows search results for the requested query",
+                "page_state": {
+                    "kind": "list",
+                    "dominant_content": "result_list",
+                    "list_visible": true,
+                    "detail_visible": false
+                },
+                "visible_entities": [{
+                    "entity_id": "title_1",
+                    "kind": "title_link",
+                    "name": "Shiva result",
+                    "confidence": 0.86
+                }],
+                "visible_result_items": [{
+                    "item_id": "result_1",
+                    "kind": "generic",
+                    "title": "Shiva result",
+                    "rank_overall": 1,
+                    "confidence": 0.9
+                }]
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = goal_for_open_media_result(
+            "aprimi il primo video",
+            Some("youtube".into()),
+            VisibleResultKind::Video,
+            1,
+        );
+
+        let verification = verify_browser_handoff_page(&goal, &frame).expect("groundable");
+
+        assert!(verification.accepted);
+        assert!(verification.structural_grounding_allowed);
+        assert_eq!(
+            verification.decision,
+            BrowserHandoffVerificationDecision::StructurallyGroundable
+        );
+        assert_eq!(
+            verification.page_verification_status.as_deref(),
+            Some("structurally_groundable")
+        );
+    }
+
+    #[test]
+    fn list_handoff_rejects_generic_page_without_structural_list_evidence() {
+        let frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "youtube",
+                    "page_kind_hint": "browser",
+                    "query_hint": "shiva",
+                    "confidence": 0.88
+                },
+                "scene_summary": "A generic browser page is visible"
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("frame");
+        let goal = goal_for_open_media_result(
+            "aprimi il primo video",
+            Some("youtube".into()),
+            VisibleResultKind::Video,
+            1,
+        );
+
+        let verification =
+            verify_browser_handoff_page(&goal, &frame).expect_err("generic page rejected");
+
+        assert!(!verification.accepted);
+        assert!(!verification.structural_grounding_allowed);
+        assert_eq!(
+            verification.page_verification_status.as_deref(),
+            Some("rejected")
+        );
     }
 
     #[test]

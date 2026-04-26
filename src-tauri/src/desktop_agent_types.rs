@@ -205,6 +205,8 @@ pub struct VisibleEntity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisibleResultItem {
     pub item_id: String,
+    #[serde(default)]
+    pub element_id: Option<String>,
     pub kind: VisibleResultKind,
     #[serde(default)]
     pub title: Option<String>,
@@ -230,6 +232,8 @@ pub struct VisibleResultItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrimaryListItem {
     pub item_id: String,
+    #[serde(default)]
+    pub element_id: Option<String>,
     pub rank: u32,
     #[serde(default)]
     pub title: Option<String>,
@@ -425,6 +429,8 @@ pub struct ExecutableGeometryDiagnostic {
     pub validation_passed: bool,
     #[serde(default)]
     pub translation_applied: bool,
+    #[serde(default)]
+    pub accessibility_sourced: bool,
     #[serde(default)]
     pub screen_bounds: Option<TargetRegion>,
     #[serde(default)]
@@ -839,6 +845,7 @@ pub enum BrowserHandoffVerificationDecision {
     GoalSatisfied,
     NormalizedPageKind,
     SupportingEvidence,
+    StructurallyGroundable,
     Rejected,
     NotRequired,
 }
@@ -859,6 +866,10 @@ pub struct BrowserHandoffVerificationDiagnostic {
     pub decision: BrowserHandoffVerificationDecision,
     #[serde(default)]
     pub accepted: bool,
+    #[serde(default)]
+    pub structural_grounding_allowed: bool,
+    #[serde(default)]
+    pub page_verification_status: Option<String>,
     #[serde(default)]
     pub provider_matches: bool,
     #[serde(default)]
@@ -1128,6 +1139,38 @@ pub enum GoalLoopStatus {
     VerificationFailed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GoalLoopCompletionDiagnostics {
+    #[serde(default)]
+    pub previous_page_context: Option<String>,
+    #[serde(default)]
+    pub post_click_page_context: Option<String>,
+    #[serde(default)]
+    pub post_click_page_kind: Option<String>,
+    #[serde(default)]
+    pub post_click_provider_hint: Option<String>,
+    #[serde(default)]
+    pub post_click_title_or_entity_evidence: Vec<String>,
+    #[serde(default)]
+    pub post_click_transition_kind: Option<String>,
+    #[serde(default)]
+    pub goal_success_condition: Option<String>,
+    #[serde(default)]
+    pub goal_verifier_status: Option<GoalVerificationStatus>,
+    #[serde(default)]
+    pub goal_achieved_reason: Option<String>,
+    #[serde(default)]
+    pub logical_steps_completed: usize,
+    #[serde(default)]
+    pub planned_steps: usize,
+    #[serde(default)]
+    pub executed_attempts: usize,
+    #[serde(default)]
+    pub success_terminal_stop: bool,
+    #[serde(default)]
+    pub status_downgrade_prevented: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalLoopRun {
     pub run_id: String,
@@ -1182,6 +1225,8 @@ pub struct GoalLoopRun {
     pub verifier_status: Option<String>,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    #[serde(default)]
+    pub completion_diagnostics: GoalLoopCompletionDiagnostics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1232,6 +1277,7 @@ pub struct DesktopPolicySnapshot {
     pub approval_required_for_high_risk: bool,
     pub browser_enabled: bool,
     pub desktop_control_enabled: bool,
+    pub accessibility_snapshot_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1281,6 +1327,7 @@ pub struct CapabilityScreenState {
     pub recent_capture_age_ms: Option<u64>,
     pub fresh_capture_available: bool,
     pub fresh_capture_requires_observation_enabled: bool,
+    pub accessibility_snapshot_enabled: bool,
     pub last_capture_path: Option<String>,
     pub last_frame_at: Option<u64>,
     pub provider: String,

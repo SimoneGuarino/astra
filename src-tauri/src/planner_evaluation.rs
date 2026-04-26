@@ -577,6 +577,8 @@ mod tests {
         let goal = youtube_first_video_goal();
         let legacy_candidate = UITargetCandidate {
             candidate_id: "legacy_video".into(),
+            element_id: None,
+            accessibility_snapshot_id: None,
             role: UITargetRole::RankedResult,
             region: Some(TargetRegion {
                 x: 430.0,

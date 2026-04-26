@@ -405,6 +405,7 @@ fn validate_pointer_target(
     allow_live_environment_bounds: bool,
 ) -> Result<PointerTarget, PointerTargetValidationFailure> {
     let candidate = request.target.get("candidate").unwrap_or(&request.target);
+    let accessibility_sourced = is_accessibility_sourced_candidate(candidate);
     let confidence = candidate
         .get("confidence")
         .and_then(Value::as_f64)
@@ -470,15 +471,20 @@ fn validate_pointer_target(
                 None,
                 None,
                 None,
+                accessibility_sourced,
                 ExecutableCoordinateInterpretation::RejectedUntrustedGeometry,
                 "pointer target did not contain usable center coordinates or region geometry",
             )),
         })?;
-    let browser_window_bounds = extract_browser_window_bounds(request, candidate).or_else(|| {
-        allow_live_environment_bounds
-            .then(|| browser_window_bounds_for_candidate(candidate))
-            .flatten()
-    });
+    let browser_window_bounds = if accessibility_sourced {
+        None
+    } else {
+        extract_browser_window_bounds(request, candidate).or_else(|| {
+            allow_live_environment_bounds
+                .then(|| browser_window_bounds_for_candidate(candidate))
+                .flatten()
+        })
+    };
     let screen_bounds = extract_screen_bounds(request, candidate).or_else(|| {
         allow_live_environment_bounds
             .then(query_virtual_screen_bounds_windows)
@@ -520,6 +526,7 @@ fn validate_pointer_target(
                         browser_window_bounds,
                         screen_bounds,
                         Some(coordinate_space),
+                        accessibility_sourced,
                         interpretation,
                         reason,
                     );
@@ -540,6 +547,7 @@ fn validate_pointer_target(
                     browser_window_bounds,
                     screen_bounds,
                     Some(coordinate_space),
+                    accessibility_sourced,
                     ExecutableCoordinateInterpretation::RejectedUntrustedGeometry,
                     "pointer target uses window-relative coordinates but browser window bounds are unavailable",
                 );
@@ -557,6 +565,7 @@ fn validate_pointer_target(
                     browser_window_bounds,
                     screen_bounds,
                     Some(coordinate_space),
+                    accessibility_sourced,
                     ExecutableCoordinateInterpretation::RejectedOutsideBrowserSurface,
                     "window-relative pointer target lies outside the browser window extent",
                 );
@@ -580,6 +589,7 @@ fn validate_pointer_target(
                 browser_window_bounds,
                 screen_bounds,
                 Some(coordinate_space),
+                accessibility_sourced,
                 ExecutableCoordinateInterpretation::RejectedUnsupportedCoordinateSpace,
                 "normalized pointer coordinates are not safely executable in this runtime",
             );
@@ -596,6 +606,7 @@ fn validate_pointer_target(
                 browser_window_bounds,
                 screen_bounds,
                 Some(coordinate_space),
+                accessibility_sourced,
                 ExecutableCoordinateInterpretation::RejectedUnsupportedCoordinateSpace,
                 "pointer target used an unsupported coordinate space",
             );
@@ -615,6 +626,7 @@ fn validate_pointer_target(
                 browser_window_bounds,
                 screen_bounds,
                 Some(coordinate_space),
+                accessibility_sourced,
                 ExecutableCoordinateInterpretation::RejectedOutsideScreenBounds,
                 "pointer target lies outside the current virtual screen bounds",
             );
@@ -635,6 +647,7 @@ fn validate_pointer_target(
                 browser_window_bounds.clone(),
                 screen_bounds.clone(),
                 Some(coordinate_space.clone()),
+                accessibility_sourced,
                 ExecutableCoordinateInterpretation::RejectedUntrustedGeometry,
                 &message,
             )),
@@ -648,6 +661,7 @@ fn validate_pointer_target(
                 browser_window_bounds.clone(),
                 screen_bounds.clone(),
                 Some(coordinate_space.clone()),
+                accessibility_sourced,
                 ExecutableCoordinateInterpretation::RejectedUntrustedGeometry,
                 &message,
             )),
@@ -664,6 +678,7 @@ fn validate_pointer_target(
             interpretation,
             validation_passed: true,
             translation_applied,
+            accessibility_sourced,
             screen_bounds,
             browser_window_bounds,
             final_x: Some(final_x),
@@ -675,6 +690,26 @@ fn validate_pointer_target(
             }),
         },
     })
+}
+
+fn is_accessibility_sourced_candidate(candidate: &Value) -> bool {
+    candidate
+        .get("accessibility_sourced")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || candidate
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source == "accessibility_layer")
+        || candidate
+            .get("observation_source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| source == "uia_snapshot")
+        || candidate
+            .get("element_id")
+            .and_then(Value::as_str)
+            .map(|id| id.starts_with("a11y_"))
+            .unwrap_or(false)
 }
 
 fn extract_center_point(value: &Value) -> Option<(f64, f64)> {
@@ -829,6 +864,7 @@ fn rejected_geometry(
     browser_window_bounds: Option<TargetRegion>,
     screen_bounds: Option<TargetRegion>,
     raw_coordinate_space: Option<String>,
+    accessibility_sourced: bool,
     interpretation: ExecutableCoordinateInterpretation,
     reason: &str,
 ) -> ExecutableGeometryDiagnostic {
@@ -839,6 +875,7 @@ fn rejected_geometry(
         interpretation,
         validation_passed: false,
         translation_applied: false,
+        accessibility_sourced,
         screen_bounds,
         browser_window_bounds,
         final_x: None,
@@ -881,11 +918,31 @@ using System.Runtime.InteropServices;
 public static class AstraWin32 {{
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 }}
 "@
-$candidate = Get-Process | Where-Object {{
-  $names -contains $_.ProcessName -and $_.MainWindowHandle -ne 0
-}} | Sort-Object StartTime -Descending | Select-Object -First 1
+$foregroundHandle = [AstraWin32]::GetForegroundWindow()
+[uint32]$fgPid = 0
+[AstraWin32]::GetWindowThreadProcessId($foregroundHandle, [ref]$fgPid) | Out-Null
+$fgProcess = if ($fgPid -gt 0) {{
+  Get-Process -Id ([int]$fgPid) -ErrorAction SilentlyContinue
+}} else {{
+  $null
+}}
+$activationSource = "fallback_recent_browser"
+$candidate = if (
+  $fgProcess -ne $null `
+  -and $names -contains $fgProcess.ProcessName `
+  -and $fgProcess.MainWindowHandle -ne 0
+) {{
+  $activationSource = "foreground_browser"
+  $fgProcess
+}} else {{
+  Get-Process | Where-Object {{
+    $names -contains $_.ProcessName -and $_.MainWindowHandle -ne 0
+  }} | Sort-Object StartTime -Descending | Select-Object -First 1
+}}
 if ($null -eq $candidate) {{
   Write-Error "No matching browser window found."
   exit 2
@@ -893,7 +950,7 @@ if ($null -eq $candidate) {{
 [AstraWin32]::ShowWindowAsync($candidate.MainWindowHandle, 9) | Out-Null
 Start-Sleep -Milliseconds 80
 if ([AstraWin32]::SetForegroundWindow($candidate.MainWindowHandle)) {{
-  Write-Output ("Activated " + $candidate.ProcessName)
+  Write-Output ("Activated " + $candidate.ProcessName + " via " + $activationSource)
   exit 0
 }}
 Write-Error "SetForegroundWindow returned false."
@@ -1410,6 +1467,78 @@ mod tests {
             geometry.interpretation,
             ExecutableCoordinateInterpretation::RejectedOutsideBrowserSurface
         );
+    }
+
+    #[test]
+    fn pointer_target_accepts_accessibility_screen_bounds_without_browser_translation() {
+        let runtime = UIControlRuntime::dry_run();
+        let caps = UIPrimitiveCapabilitySet {
+            platform: "test".into(),
+            desktop_control_enabled: true,
+            primitives: vec![capability(
+                UIPrimitiveKind::ClickTargetCandidate,
+                true,
+                true,
+                true,
+                true,
+                false,
+                "test",
+            )],
+        };
+        let result = runtime.execute(
+            &UIPrimitiveRequest {
+                primitive: UIPrimitiveKind::ClickTargetCandidate,
+                value: None,
+                target: serde_json::json!({
+                    "browser_window_bounds": {
+                        "x": 900,
+                        "y": 120,
+                        "width": 1000,
+                        "height": 800,
+                        "coordinate_space": "screen"
+                    },
+                    "screen_bounds": {
+                        "x": 0,
+                        "y": 0,
+                        "width": 3440,
+                        "height": 1440,
+                        "coordinate_space": "screen"
+                    },
+                    "candidate": {
+                        "region": {
+                            "x": 2100,
+                            "y": 900,
+                            "width": 400,
+                            "height": 60,
+                            "coordinate_space": "screen"
+                        },
+                        "confidence": 0.93,
+                        "supports_click": true,
+                        "accessibility_sourced": true,
+                        "observation_source": "uia_snapshot"
+                    }
+                }),
+                reason: None,
+            },
+            &caps,
+        );
+
+        assert_eq!(result.status, UIPrimitiveStatus::Executed);
+        let geometry = result.geometry.expect("geometry");
+        assert!(geometry.validation_passed);
+        assert!(geometry.accessibility_sourced);
+        assert!(!geometry.translation_applied);
+        assert_eq!(geometry.final_x, Some(2300));
+        assert_eq!(geometry.final_y, Some(930));
+    }
+
+    #[test]
+    fn is_accessibility_sourced_detects_via_element_id_field() {
+        let candidate = serde_json::json!({
+            "element_id": "a11y_3"
+        });
+
+        assert!(is_accessibility_sourced_candidate(&candidate));
     }
 
     #[test]

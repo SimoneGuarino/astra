@@ -1,12 +1,18 @@
 use crate::{
+    accessibility_layer::{
+        parse_accessibility_target_selection_response, AccessibilitySnapshot,
+        AccessibilityTargetSelection,
+    },
     desktop_agent_types::{
-        FocusedPerceptionRequest, PageEvidenceSource, PageSemanticEvidence, PerceptionRequestMode,
-        ScreenAnalysisResult, SemanticScreenFrame, VisionAvailability,
+        BrowserHandoffVerificationDiagnostic, FocusedPerceptionRequest, GoalSpec,
+        PageEvidenceSource, PageSemanticEvidence, PerceptionRequestMode, ScreenAnalysisResult,
+        SemanticScreenFrame, VisionAvailability,
     },
     semantic_frame::semantic_frame_from_vision_value,
     structured_vision::{
         parse_structured_vision_candidates_from_value, StructuredVisionExtraction,
     },
+    ui_target_grounding::UITargetCandidate,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use image::{imageops::FilterType, GenericImageView, ImageFormat};
@@ -152,8 +158,10 @@ struct PreparedVisionImage {
     resize_plan: VisionResizePlan,
 }
 
-fn semantic_perception_system_prompt() -> String {
-    [
+fn semantic_perception_system_prompt(
+    accessibility_snapshot: Option<&AccessibilitySnapshot>,
+) -> String {
+    let mut prompt = [
         "You are Astra Semantic Perception. Return only strict JSON, no markdown. ",
         "Produce a goal-aware semantic_frame for a Rust-governed desktop assistant. ",
         "Do not choose actions or command the desktop. Describe only visible or strongly inferable screen state. ",
@@ -163,7 +171,11 @@ fn semantic_perception_system_prompt() -> String {
         "For each visible_result_item include rank_overall, rank_within_kind, confidence, and click_regions for executable visible regions when clear. ",
         SHARED_REGION_OUTPUT_INSTRUCTIONS,
     ]
-    .concat()
+    .concat();
+    if let Some(context) = accessibility_prompt_context(accessibility_snapshot) {
+        prompt.push_str(&context);
+    }
+    prompt
 }
 
 fn semantic_perception_user_prompt(
@@ -177,6 +189,61 @@ fn semantic_perception_user_prompt(
         "Goal: {goal}. Browser/app hint: {app_hint}. Expected content provider hint: {provider_hint}. Observation backend: {provider}. {} {SHARED_SEMANTIC_FRAME_OUTPUT_SUFFIX}",
         resize_plan.resolution_prompt()
     )
+}
+
+fn accessibility_prompt_context(
+    accessibility_snapshot: Option<&AccessibilitySnapshot>,
+) -> Option<String> {
+    let snapshot = accessibility_snapshot?;
+    if snapshot.elements.is_empty() {
+        return None;
+    }
+    let mut elements = snapshot.elements.iter().collect::<Vec<_>>();
+    elements.sort_by_key(|element| {
+        let named = element
+            .name
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|v| !v.is_empty());
+        let preferred_role = matches!(
+            element.role.as_str(),
+            "hyperlink" | "listitem" | "button" | "edit"
+        );
+        (!named, !preferred_role, element.depth)
+    });
+    let compact = elements
+        .into_iter()
+        .take(80)
+        .map(|element| {
+            json!({
+                "element_id": &element.element_id,
+                "role": &element.role,
+                "name": &element.name,
+                "depth": element.depth,
+                "parent_id": &element.parent_id,
+                "bounding_rect": &element.bounding_rect,
+            })
+        })
+        .collect::<Vec<_>>();
+    let tree_json = serde_json::to_string(&compact).ok()?;
+    Some(format!(
+        concat!(
+            "\nAccessibility tree context (Windows UI Automation):\n",
+            "The following elements are confirmed interactive by the OS. Coordinates are OS-certified.\n",
+            "Use element_id values to reference elements in your response.\n",
+            "Limit: showing first {} of {} total elements (viewport-focused).\n",
+            "{}\n",
+            "When the accessibility tree is provided:\n",
+            "- Prefer element_id references over coordinate estimation for click targets\n",
+            "- Use the tree to identify the primary list cluster and its items\n",
+            "- The model's task is semantic: which element satisfies the goal?\n",
+            "- Return element_id in the primary_list items and visible_result_items alongside or instead of click_regions\n",
+            "- If an element in the tree matches a visible result item, set its item_id to the corresponding element_id\n"
+        ),
+        compact.len(),
+        snapshot.element_count,
+        tree_json
+    ))
 }
 
 fn focused_perception_prompts(
@@ -402,6 +469,115 @@ fn page_evidence_value_mut(parsed: &mut Value) -> Option<&mut Value> {
         return parsed.pointer_mut("/frame/page_evidence");
     }
     None
+}
+
+fn preserve_accessibility_element_ids(parsed: &mut Value) {
+    let Some(frame) = frame_value_mut(parsed) else {
+        return;
+    };
+    if let Some(items) = frame
+        .get_mut("visible_result_items")
+        .and_then(Value::as_array_mut)
+    {
+        for item in items {
+            preserve_item_accessibility_element_id(item);
+        }
+    }
+    if let Some(items) = frame
+        .get_mut("primary_list")
+        .and_then(|primary_list| primary_list.get_mut("items"))
+        .and_then(Value::as_array_mut)
+    {
+        for item in items {
+            preserve_item_accessibility_element_id(item);
+        }
+    }
+}
+
+fn preserve_item_accessibility_element_id(item: &mut Value) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    let Some(element_id) = object
+        .get("element_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    object
+        .entry("item_id")
+        .or_insert_with(|| Value::String(element_id.clone()));
+    let attributes = object
+        .entry("attributes")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(attributes) = attributes.as_object_mut() {
+        attributes.insert("element_id".into(), Value::String(element_id));
+        attributes.insert("accessibility_sourced".into(), Value::Bool(true));
+    }
+    if object
+        .get("click_regions")
+        .and_then(Value::as_object)
+        .is_some_and(|regions| regions.is_empty())
+    {
+        object.remove("click_regions");
+    }
+}
+
+fn compact_accessibility_target_candidates(
+    candidates: &[UITargetCandidate],
+    snapshot: Option<&AccessibilitySnapshot>,
+    limit: usize,
+) -> Vec<Value> {
+    let parent_name_for = |parent_id: Option<&str>| {
+        let parent_id = parent_id?;
+        snapshot?
+            .elements
+            .iter()
+            .find(|element| element.element_id == parent_id)
+            .and_then(|element| element.name.clone())
+    };
+
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let element_id = candidate.element_id.as_deref()?;
+            let element = snapshot.and_then(|snapshot| {
+                snapshot
+                    .elements
+                    .iter()
+                    .find(|element| element.element_id == element_id)
+            });
+            let parent_id = element.and_then(|element| element.parent_id.as_deref());
+            Some(json!({
+                "element_id": element_id,
+                "accessibility_snapshot_id": candidate.accessibility_snapshot_id.clone(),
+                "role": element
+                    .map(|element| element.role.clone())
+                    .unwrap_or_else(|| candidate.role.as_str().to_string()),
+                "name": element.and_then(|element| element.name.clone()).or_else(|| candidate.label.clone()),
+                "value": element.and_then(|element| element.value.clone()),
+                "rank_guess": candidate.rank,
+                "kind_guess": candidate.result_kind.clone().unwrap_or_else(|| candidate.role.as_str().to_string()),
+                "confidence": candidate.confidence,
+                "bounds_summary": candidate.region.as_ref().map(|region| {
+                    json!({
+                        "x": region.x,
+                        "y": region.y,
+                        "width": region.width,
+                        "height": region.height,
+                    })
+                }),
+                "parent_id": parent_id,
+                "parent_name": parent_name_for(parent_id),
+                "depth": element.map(|element| element.depth),
+                "is_enabled": element.map(|element| element.is_enabled).unwrap_or(true),
+                "is_offscreen": element.map(|element| element.is_offscreen).unwrap_or(false),
+                "source": "uia_snapshot",
+            }))
+        })
+        .take(limit)
+        .collect()
 }
 
 fn process_frame_prompt_geometry(
@@ -854,6 +1030,7 @@ impl ScreenVisionRuntime {
                 Some(&question),
                 None,
                 None,
+                None,
             )
             .await
             .ok();
@@ -881,6 +1058,7 @@ impl ScreenVisionRuntime {
         goal: Option<&str>,
         app_hint: Option<&str>,
         provider_hint: Option<&str>,
+        accessibility_snapshot: Option<&AccessibilitySnapshot>,
     ) -> Result<SemanticScreenFrame, String> {
         let installed_models = self.fetch_installed_models().await.unwrap_or_default();
         let model = select_vision_model(&installed_models)
@@ -890,7 +1068,7 @@ impl ScreenVisionRuntime {
         let goal = goal.unwrap_or("understand the visible screen for safe desktop assistance");
         let app_hint = app_hint.unwrap_or("unknown");
         let provider_hint = provider_hint.unwrap_or("unknown");
-        let system = semantic_perception_system_prompt();
+        let system = semantic_perception_system_prompt(accessibility_snapshot);
         let user = semantic_perception_user_prompt(
             goal,
             app_hint,
@@ -942,6 +1120,7 @@ impl ScreenVisionRuntime {
             .ok_or_else(|| "Ollama semantic perception returned an empty response".to_string())?;
         let mut parsed = parse_model_json(content, "semantic screen perception")?;
         sanitize_suspicious_prompt_template_geometry(&mut parsed);
+        preserve_accessibility_element_ids(&mut parsed);
         maybe_reproject_model_coordinates(&mut parsed, &prepared_image.resize_plan);
         sanitize_invalid_primary_list_geometry(&mut parsed, &prepared_image.resize_plan);
         let mut frame = semantic_frame_from_vision_value(
@@ -1194,6 +1373,106 @@ impl ScreenVisionRuntime {
         Ok(extraction)
     }
 
+    pub async fn select_accessibility_target_for_goal(
+        &self,
+        goal: &GoalSpec,
+        verification: Option<&BrowserHandoffVerificationDiagnostic>,
+        snapshot: Option<&AccessibilitySnapshot>,
+        frame: Option<&SemanticScreenFrame>,
+        candidates: &[UITargetCandidate],
+    ) -> Result<AccessibilityTargetSelection, String> {
+        let installed_models = self.fetch_installed_models().await.unwrap_or_default();
+        let model = select_vision_model(&installed_models).ok_or_else(|| {
+            "No compatible Ollama model found for accessibility target selection".to_string()
+        })?;
+        let compact_candidates = compact_accessibility_target_candidates(candidates, snapshot, 30);
+        if compact_candidates.is_empty() {
+            return Err("No accessibility candidates available for target selection".into());
+        }
+        let system = concat!(
+            "You are Astra Accessibility Target Selector. Return only strict JSON, no markdown. ",
+            "Choose the element_id of the actual page content item that best satisfies the user goal. ",
+            "Do not select browser UI controls. Do not select secondary navigation, sidebars, or search boxes when the user requested a result item. ",
+            "Never return coordinates. Never command the desktop. ",
+            "If no candidate safely matches, return selected_element_id:null, selection_kind:\"none\", rank:null, confidence:0.0."
+        );
+        let user = json!({
+            "user_utterance": goal.utterance.clone(),
+            "normalized_goal": {
+                "goal_type": format!("{:?}", goal.goal_type),
+                "rank": goal.constraints.rank_within_kind.or(goal.constraints.rank_overall),
+                "item_kind": goal.constraints.item_kind.clone(),
+                "result_kind": goal.constraints.result_kind.as_ref().map(|kind| format!("{kind:?}")),
+                "provider": goal.constraints.provider.clone(),
+                "query": goal.constraints.attributes.get("query_hint").and_then(Value::as_str),
+                "entity_name": goal.constraints.entity_name.clone(),
+            },
+            "page_context": {
+                "surface": "browser",
+                "provider_hint": goal.constraints.provider.clone(),
+                "page_verification_status": verification.and_then(|diagnostic| diagnostic.page_verification_status.clone()),
+                "structural_grounding_allowed": verification.map(|diagnostic| diagnostic.structural_grounding_allowed),
+                "supporting_evidence": verification.map(|diagnostic| diagnostic.supporting_evidence.clone()),
+                "scene_summary": frame.map(|frame| frame.scene_summary.clone()),
+            },
+            "candidates": compact_candidates,
+            "response_schema": {
+                "selected_element_id": "a11y_N or null",
+                "accessibility_snapshot_id": "current snapshot id if present in candidate",
+                "selection_kind": "ranked_result|link|button|none",
+                "rank": 1,
+                "confidence": 0.0,
+                "rationale": "short reason"
+            }
+        })
+        .to_string();
+
+        let payload = json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "options": {
+                "temperature": 0.0,
+                "num_ctx": 4096,
+            },
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
+            ]
+        });
+
+        let response = self
+            .client
+            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| format!("Ollama accessibility target selector failed: {error}"))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Ollama accessibility target selector HTTP error {status}: {body}"
+            ));
+        }
+
+        let body: Value = response.json().await.map_err(|error| {
+            format!("Ollama accessibility target selector parse failed: {error}")
+        })?;
+        let content = body
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "Ollama accessibility target selector returned an empty response".to_string()
+            })?;
+
+        parse_accessibility_target_selection_response(content)
+    }
+
     async fn fetch_installed_models(&self) -> Result<Vec<String>, String> {
         let response = self
             .client
@@ -1269,10 +1548,14 @@ mod tests {
         FocusedPerceptionRequest, PerceptionRequestMode, PerceptionRoutingDecision,
         VisibleRefinementStrategy,
     };
+    use crate::{
+        accessibility_layer::{AccessibilitySnapshot, AccessibleElement},
+        ui_target_grounding::TargetRegion,
+    };
 
     #[test]
     fn semantic_perception_prompt_includes_region_schema_examples() {
-        let prompt = semantic_perception_system_prompt();
+        let prompt = semantic_perception_system_prompt(None);
         assert!(prompt.contains("\"click_regions\""));
         assert!(prompt.contains("\"actionable_controls\""));
         assert!(prompt.contains("\"primary_list\""));
@@ -1284,6 +1567,51 @@ mod tests {
         assert!(prompt.contains("fake placeholders"));
         assert!(!prompt.contains("\"x\":120"));
         assert!(!prompt.contains("\"x\":90"));
+    }
+
+    #[test]
+    fn semantic_perception_prompt_includes_accessibility_context_when_available() {
+        let snapshot = AccessibilitySnapshot {
+            snapshot_id: "uia_prompt_test".into(),
+            elements: vec![AccessibleElement {
+                element_id: "a11y_1".into(),
+                automation_id: Some("link".into()),
+                runtime_id: Some("1,2".into()),
+                role: "hyperlink".into(),
+                name: Some("Example result".into()),
+                value: Some("internal".into()),
+                bounding_rect: Some(TargetRegion {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 200.0,
+                    height: 40.0,
+                    coordinate_space: "screen".into(),
+                }),
+                is_enabled: true,
+                is_offscreen: false,
+                depth: 2,
+                parent_id: None,
+                children: Vec::new(),
+            }],
+            browser_url: Some("https://example.com".into()),
+            browser_window_bounds: None,
+            captured_at_ms: 1_000,
+            capture_backend: "powershell_uia".into(),
+            element_count: 1,
+            window_is_foreground: true,
+            window_pid: Some(1234),
+            window_process_name: Some("chrome".into()),
+            error: None,
+        };
+
+        let prompt = semantic_perception_system_prompt(Some(&snapshot));
+
+        assert!(prompt.contains("Accessibility tree context"));
+        assert!(prompt.contains("a11y_1"));
+        assert!(prompt.contains("Prefer element_id references"));
+        assert!(!prompt.contains("automation_id"));
+        assert!(!prompt.contains("runtime_id"));
+        assert!(!prompt.contains("internal"));
     }
 
     #[test]

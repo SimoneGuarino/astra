@@ -1,4 +1,8 @@
 use crate::{
+    accessibility_layer::{
+        synthesize_ranked_uia_result_candidates, validate_accessibility_target_selection,
+        AccessibilitySnapshot, AccessibleElement,
+    },
     action_policy::DesktopAgentPolicy,
     audit_log::AuditLogStore,
     browser_agent::BrowserAgent,
@@ -9,12 +13,15 @@ use crate::{
     desktop_agent_types::{
         BrowserHandoffActivationStatus, BrowserHandoffFailureReason, BrowserHandoffStatus,
         BrowserHandoffVerificationDiagnostic, BrowserVisualHandoffRecord,
-        BrowserVisualHandoffResult, CapabilityManifest, DesktopActionRequest,
-        DesktopActionResponse, DesktopActionStatus, DesktopAuditEvent, GoalConstraints,
-        GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus, PendingApproval,
-        PlannerContractDecision, PlannerContractInput, PlannerStep, PlannerStepExecutionRecord,
-        PlannerStepExecutionStatus, PlannerStepKind, ScreenAnalysisRequest, ScreenAnalysisResult,
-        ScreenCaptureResult, ScreenObservationStatus, SemanticScreenFrame,
+        BrowserVisualHandoffResult, CapabilityManifest, ClickRegion, DesktopActionRequest,
+        DesktopActionResponse, DesktopActionStatus, DesktopAuditEvent, FrameUncertainty,
+        GoalConstraints, GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus,
+        PendingApproval, PlannerContractDecision, PlannerContractInput, PlannerContractSource,
+        PlannerDecisionStatus, PlannerRejectionReason, PlannerScrollIntent, PlannerStep,
+        PlannerStepExecutionRecord, PlannerStepExecutionStatus, PlannerStepKind,
+        PlannerVisibilityAssessment, PrimaryListItem, ScreenAnalysisRequest, ScreenAnalysisResult,
+        ScreenCaptureResult, ScreenObservationStatus, SemanticScreenFrame, VisibleResultItem,
+        VisibleResultKind,
     },
     filesystem_service::FilesystemService,
     model_assisted_planner::ModelAssistedPlanner,
@@ -37,7 +44,8 @@ use crate::{
         UIPrimitiveResult, UIPrimitiveStatus,
     },
     ui_target_grounding::{
-        TargetSelection, TargetSelectionDiagnostics, TargetSelectionPolicy, UITargetCandidate,
+        TargetGroundingSource, TargetSelection, TargetSelectionDiagnostics, TargetSelectionPolicy,
+        UITargetCandidate,
     },
     workflow_continuation::{
         build_context_from_action_response, build_context_from_screen_workflow_run,
@@ -88,6 +96,7 @@ struct ProductionGoalLoopDriver<'a> {
     capabilities: UIPrimitiveCapabilitySet,
     request_id: String,
     action_id: String,
+    last_accessibility_snapshot: Option<AccessibilitySnapshot>,
 }
 
 struct VerifiedBrowserPage {
@@ -102,6 +111,7 @@ struct BrowserPageVerificationFailure {
 
 const BROWSER_HANDOFF_VERIFICATION_ATTEMPTS: usize = 2;
 const BROWSER_HANDOFF_STABILIZATION_MS: u64 = 650;
+const MAX_ACCESSIBILITY_SNAPSHOT_AGE_MS: u64 = 5_000;
 
 impl<'a> ProductionGoalLoopDriver<'a> {
     fn new(
@@ -115,11 +125,12 @@ impl<'a> ProductionGoalLoopDriver<'a> {
             capabilities,
             request_id,
             action_id,
+            last_accessibility_snapshot: None,
         }
     }
 
     async fn verify_current_browser_page(
-        &self,
+        &mut self,
         goal: &GoalSpec,
         attempt_label: &str,
     ) -> Result<VerifiedBrowserPage, BrowserPageVerificationFailure> {
@@ -131,6 +142,7 @@ impl<'a> ProductionGoalLoopDriver<'a> {
                 reason,
                 verification: None,
             })?;
+        let accessibility_snapshot = self.capture_accessibility_snapshot_for_goal_loop();
         let mut frame = self
             .runtime
             .screen_vision
@@ -141,12 +153,16 @@ impl<'a> ProductionGoalLoopDriver<'a> {
                 Some(&goal.utterance),
                 None,
                 goal.constraints.provider.as_deref(),
+                accessibility_snapshot.as_ref(),
             )
             .await
             .map_err(|reason| BrowserPageVerificationFailure {
                 reason,
                 verification: None,
             })?;
+        if let Some(snapshot) = accessibility_snapshot.as_ref() {
+            enrich_frame_with_accessibility(&mut frame, snapshot);
+        }
         frame.page_evidence.observation_source = Some(attempt_label.into());
         let verification = verify_browser_handoff_page(goal, &frame).map_err(|verification| {
             BrowserPageVerificationFailure {
@@ -161,6 +177,109 @@ impl<'a> ProductionGoalLoopDriver<'a> {
             frame,
             verification,
         })
+    }
+
+    fn capture_accessibility_snapshot_for_goal_loop(&mut self) -> Option<AccessibilitySnapshot> {
+        if !self.runtime.policy.accessibility_snapshot_enabled() {
+            return None;
+        }
+        let snapshot = crate::accessibility_layer::capture_accessibility_snapshot(&[
+            "chrome", "msedge", "firefox", "brave", "opera",
+        ]);
+        if snapshot.elements.is_empty() {
+            return None;
+        }
+        self.last_accessibility_snapshot = Some(snapshot.clone());
+        Some(snapshot)
+    }
+
+    async fn plan_accessibility_target_selection(
+        &self,
+        input: &PlannerContractInput,
+    ) -> Option<PlannerContractDecision> {
+        if !matches!(
+            input.goal.goal_type,
+            GoalType::OpenListItem | GoalType::OpenMediaResult
+        ) {
+            return None;
+        }
+        let snapshot = self.last_accessibility_snapshot.as_ref()?;
+        let candidates = synthesize_ranked_uia_result_candidates(snapshot);
+        if candidates.is_empty() {
+            return None;
+        }
+        let selector_result = self
+            .runtime
+            .screen_vision
+            .select_accessibility_target_for_goal(
+                &input.goal,
+                None,
+                Some(snapshot),
+                Some(&input.current_frame),
+                &candidates,
+            )
+            .await;
+
+        match selector_result {
+            Ok(selection) => match validate_accessibility_target_selection(
+                &selection,
+                snapshot,
+                &candidates,
+                TargetSelectionPolicy::default().min_click_confidence,
+            ) {
+                Ok(candidate) => Some(accessibility_selector_click_decision(
+                    input,
+                    candidate,
+                    &selection,
+                    candidates.len(),
+                    true,
+                )),
+                Err(reason) => Some(accessibility_selector_suppression_decision(
+                    input,
+                    candidates.len(),
+                    true,
+                    selection.selected_element_id.clone(),
+                    Some(selection.confidence),
+                    format!("rust_element_validation_status=failed: {reason}"),
+                    PlannerRejectionReason::FabricatedTarget,
+                )),
+            },
+            Err(error) => {
+                if let Some(candidate) = deterministic_uia_candidate_if_unambiguous(&candidates) {
+                    return Some(accessibility_selector_click_decision(
+                        input,
+                        candidate,
+                        &crate::accessibility_layer::AccessibilityTargetSelection {
+                            selected_element_id: candidates
+                                .first()
+                                .and_then(|candidate| candidate.element_id.clone()),
+                            accessibility_snapshot_id: Some(snapshot.snapshot_id.clone()),
+                            selection_kind: Some("deterministic_unambiguous_uia".into()),
+                            rank: candidates.first().and_then(|candidate| candidate.rank),
+                            confidence: candidates
+                                .first()
+                                .map(|candidate| candidate.confidence)
+                                .unwrap_or(0.0),
+                            rationale: Some(
+                                "single current UIA candidate available; deterministic UIA fallback selected it after selector failure"
+                                    .into(),
+                            ),
+                        },
+                        candidates.len(),
+                        false,
+                    ));
+                }
+                Some(accessibility_selector_suppression_decision(
+                    input,
+                    candidates.len(),
+                    true,
+                    None,
+                    None,
+                    format!("llm_uia_selector_unavailable: {error}"),
+                    PlannerRejectionReason::ModelUnavailable,
+                ))
+            }
+        }
     }
 
     fn expected_browser_app(&self, goal: &GoalSpec) -> String {
@@ -440,6 +559,7 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
             let capture = self
                 .runtime
                 .capture_for_structured_grounding_with_policy(fresh_capture_required)?;
+            let accessibility_snapshot = self.capture_accessibility_snapshot_for_goal_loop();
             self.runtime
                 .screen_vision
                 .perceive_semantic_frame(
@@ -449,9 +569,13 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
                     Some(&goal.utterance),
                     None,
                     goal.constraints.provider.as_deref(),
+                    accessibility_snapshot.as_ref(),
                 )
                 .await
                 .map(|mut frame| {
+                    if let Some(snapshot) = accessibility_snapshot.as_ref() {
+                        enrich_frame_with_accessibility(&mut frame, snapshot);
+                    }
                     frame.page_evidence.observation_source = Some(if fresh_capture_required {
                         format!("goal_loop_perception_iteration_{}_fresh", iteration + 1)
                     } else {
@@ -481,6 +605,15 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
                 };
             };
             if let Some(target) = request.target.as_object_mut() {
+                if step
+                    .executable_candidate
+                    .as_ref()
+                    .is_some_and(candidate_is_accessibility_sourced)
+                {
+                    target.insert("accessibility_sourced".into(), json!(true));
+                    target.insert("observation_source".into(), json!("uia_snapshot"));
+                    target.insert("source".into(), json!("accessibility_layer"));
+                }
                 let browser_app = target
                     .get("browser_app_hint")
                     .and_then(Value::as_str)
@@ -513,10 +646,19 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
                 }),
             });
 
-            let result = self
+            let mut result = self
                 .runtime
                 .ui_control
                 .execute(&request, &self.capabilities);
+            if step
+                .executable_candidate
+                .as_ref()
+                .is_some_and(candidate_is_accessibility_sourced)
+            {
+                if let Some(geometry) = result.geometry.as_mut() {
+                    geometry.accessibility_sourced = true;
+                }
+            }
             let status = match result.status {
                 UIPrimitiveStatus::Executed => PlannerStepExecutionStatus::Executed,
                 UIPrimitiveStatus::Unsupported => PlannerStepExecutionStatus::Unsupported,
@@ -820,7 +962,12 @@ impl GoalLoopDriver for ProductionGoalLoopDriver<'_> {
         &'a mut self,
         input: &'a PlannerContractInput,
     ) -> GoalLoopDriverFuture<'a, Result<Option<PlannerContractDecision>, String>> {
-        Box::pin(async move { self.runtime.planner.plan(input).await })
+        Box::pin(async move {
+            if let Some(decision) = self.plan_accessibility_target_selection(input).await {
+                return Ok(Some(decision));
+            }
+            self.runtime.planner.plan(input).await
+        })
     }
 }
 
@@ -1174,7 +1321,7 @@ impl DesktopAgentRuntime {
         let now = now_ms();
         for candidate in &mut selected {
             candidate.observed_at_ms = Some(now);
-            candidate.reuse_eligible = true;
+            candidate.reuse_eligible = !candidate_is_accessibility_sourced(candidate);
         }
 
         let mut memory = self
@@ -1281,6 +1428,7 @@ impl DesktopAgentRuntime {
                 Some(&goal_loop.goal.utterance),
                 None,
                 goal_loop.goal.constraints.provider.as_deref(),
+                None,
             )
             .await
         {
@@ -1376,6 +1524,7 @@ impl DesktopAgentRuntime {
                         break;
                     }
                 };
+            let accessibility_snapshot = self.capture_accessibility_snapshot_for_grounding();
 
             let extraction = self
                 .extract_structured_candidates_for_workflow_capture(workflow, &capture)
@@ -1386,6 +1535,15 @@ impl DesktopAgentRuntime {
                         workflow.grounding.page_evidence.push(page_evidence);
                     }
                     if let Some(frame) = extraction.semantic_frame {
+                        let mut frame = frame;
+                        if let Some(snapshot) = accessibility_snapshot.as_ref() {
+                            enrich_frame_with_accessibility(&mut frame, snapshot);
+                            workflow.grounding.uncertainty.push(format!(
+                                "uia_snapshot_available:{} candidates={}",
+                                snapshot.snapshot_id,
+                                frame.legacy_target_candidates.len()
+                            ));
+                        }
                         if let Some(goal_loop) =
                             goal_loop_for_workflow_frame(workflow, frame.clone())
                         {
@@ -1411,6 +1569,25 @@ impl DesktopAgentRuntime {
                             .grounding
                             .uncertainty
                             .push("structured_vision_returned_no_candidates".into());
+                    }
+                    if let Some(snapshot) = accessibility_snapshot.as_ref() {
+                        let mut uia_candidates = synthesize_ranked_uia_result_candidates(snapshot);
+                        uia_candidates.retain(|candidate| {
+                            !workflow
+                                .grounding
+                                .visible_target_candidates
+                                .iter()
+                                .any(|existing| {
+                                    existing.element_id == candidate.element_id
+                                        || existing.candidate_id == candidate.candidate_id
+                                })
+                        });
+                        if !uia_candidates.is_empty() {
+                            workflow
+                                .grounding
+                                .visible_target_candidates
+                                .extend(uia_candidates);
+                        }
                     }
                 }
                 Err(error) => {
@@ -1550,6 +1727,16 @@ impl DesktopAgentRuntime {
             .await?;
 
         Ok(extraction)
+    }
+
+    fn capture_accessibility_snapshot_for_grounding(&self) -> Option<AccessibilitySnapshot> {
+        if !self.policy.accessibility_snapshot_enabled() {
+            return None;
+        }
+        let snapshot = crate::accessibility_layer::capture_accessibility_snapshot(&[
+            "chrome", "msedge", "firefox", "brave", "opera",
+        ]);
+        (!snapshot.elements.is_empty()).then_some(snapshot)
     }
 
     fn capture_for_structured_grounding(&self) -> Result<ScreenCaptureResult, String> {
@@ -2029,6 +2216,329 @@ fn planner_step_primitive_request(step: &PlannerStep) -> Option<UIPrimitiveReque
     })
 }
 
+fn deterministic_uia_candidate_if_unambiguous(
+    candidates: &[UITargetCandidate],
+) -> Option<UITargetCandidate> {
+    let [candidate] = candidates else {
+        return None;
+    };
+    if !candidate.supports_click
+        || candidate.confidence < TargetSelectionPolicy::default().min_click_confidence
+        || candidate.element_id.as_deref().is_none()
+        || candidate.accessibility_snapshot_id.as_deref().is_none()
+    {
+        return None;
+    }
+    Some(candidate.clone())
+}
+
+fn accessibility_selector_click_decision(
+    input: &PlannerContractInput,
+    candidate: UITargetCandidate,
+    selection: &crate::accessibility_layer::AccessibilityTargetSelection,
+    candidate_count: usize,
+    selector_used: bool,
+) -> PlannerContractDecision {
+    let element_id = candidate
+        .element_id
+        .clone()
+        .unwrap_or_else(|| candidate.candidate_id.clone());
+    let selection_confidence = selection.confidence;
+    PlannerContractDecision {
+        source: if selector_used {
+            PlannerContractSource::ModelAssisted
+        } else {
+            PlannerContractSource::RustDeterministic
+        },
+        proposed_step: PlannerStep {
+            step_id: Uuid::new_v4().to_string(),
+            kind: PlannerStepKind::ClickResultRegion,
+            confidence: candidate.confidence,
+            rationale: selection.rationale.clone().unwrap_or_else(|| {
+                "accessibility target selector selected a current-snapshot element_id".into()
+            }),
+            target_item_id: Some(element_id.clone()),
+            target_entity_id: None,
+            click_region_key: Some("primary".into()),
+            executable_candidate: Some(candidate.clone()),
+            expected_state: Some(input.goal.success_condition.clone()),
+        },
+        strategy_rationale: format!(
+            "uia_selector_required=true; uia_candidate_count={candidate_count}; llm_uia_selector_used={selector_used}; llm_selected_element_id={}; llm_selection_confidence={selection_confidence:.2}; rust_element_validation_status=passed; vision_only_candidate_suppressed=true; vision_only_fallback_used=false",
+            selection
+                .selected_element_id
+                .as_deref()
+                .unwrap_or(element_id.as_str())
+        ),
+        focused_perception_needed: false,
+        replan_needed: false,
+        expected_verification_target: Some(input.goal.success_condition.clone()),
+        planner_confidence: candidate.confidence,
+        accepted: true,
+        fallback_used: false,
+        rejection_reason: None,
+        decision_status: PlannerDecisionStatus::Accepted,
+        rejection_code: None,
+        visibility_assessment: PlannerVisibilityAssessment::VisibleGrounded,
+        scroll_intent: PlannerScrollIntent::NotNeeded,
+        visible_actionability: input.visible_actionability.clone(),
+        target_confidence: None,
+        normalized: false,
+        downgraded: false,
+    }
+}
+
+fn accessibility_selector_suppression_decision(
+    input: &PlannerContractInput,
+    candidate_count: usize,
+    selector_used: bool,
+    selected_element_id: Option<String>,
+    selection_confidence: Option<f32>,
+    reason: String,
+    rejection_code: PlannerRejectionReason,
+) -> PlannerContractDecision {
+    let planning_confidence = TargetSelectionPolicy::default().min_click_confidence;
+    PlannerContractDecision {
+        source: PlannerContractSource::ModelAssisted,
+        proposed_step: PlannerStep {
+            step_id: Uuid::new_v4().to_string(),
+            kind: PlannerStepKind::Refuse,
+            confidence: planning_confidence,
+            rationale: format!(
+                "current UIA candidates are available, but no validated UIA element_id was selected; suppressing vision-only click geometry: {reason}"
+            ),
+            target_item_id: None,
+            target_entity_id: None,
+            click_region_key: None,
+            executable_candidate: None,
+            expected_state: Some(input.goal.success_condition.clone()),
+        },
+        strategy_rationale: format!(
+            "uia_selector_required=true; uia_candidate_count={candidate_count}; llm_uia_selector_used={selector_used}; llm_selected_element_id={}; llm_selection_confidence={}; rust_element_validation_status=failed; vision_only_candidate_suppressed=true; vision_only_fallback_used=false; {reason}",
+            selected_element_id.as_deref().unwrap_or("none"),
+            selection_confidence
+                .map(|confidence| format!("{confidence:.2}"))
+                .unwrap_or_else(|| "none".into())
+        ),
+        focused_perception_needed: false,
+        replan_needed: false,
+        expected_verification_target: Some(input.goal.success_condition.clone()),
+        planner_confidence: planning_confidence,
+        accepted: true,
+        fallback_used: false,
+        rejection_reason: Some(reason),
+        decision_status: PlannerDecisionStatus::Accepted,
+        rejection_code: Some(rejection_code),
+        visibility_assessment: PlannerVisibilityAssessment::Unknown,
+        scroll_intent: PlannerScrollIntent::NotNeeded,
+        visible_actionability: input.visible_actionability.clone(),
+        target_confidence: None,
+        normalized: false,
+        downgraded: false,
+    }
+}
+
+fn enrich_frame_with_accessibility(
+    frame: &mut SemanticScreenFrame,
+    snapshot: &AccessibilitySnapshot,
+) {
+    if snapshot
+        .captured_at_ms
+        .saturating_add(MAX_ACCESSIBILITY_SNAPSHOT_AGE_MS)
+        < frame.captured_at
+    {
+        frame.uncertainty.push(FrameUncertainty {
+            code: "stale_accessibility_snapshot".into(),
+            message: format!(
+                "accessibility snapshot {} captured at {} was older than frame capture {}",
+                snapshot.snapshot_id, snapshot.captured_at_ms, frame.captured_at
+            ),
+            severity: "medium".into(),
+        });
+        return;
+    }
+
+    let mut matched_element_ids = Vec::new();
+    if let Some(primary_list) = frame.primary_list.as_mut() {
+        for item in &mut primary_list.items {
+            if let Some(element_id) = primary_list_item_element_id(item).map(ToOwned::to_owned) {
+                if let Some(element) = find_accessible_element(snapshot, &element_id) {
+                    if populate_accessibility_click_region(&mut item.click_regions, element) {
+                        item.element_id = Some(element_id.clone());
+                        item.attributes = accessibility_attributes(
+                            item.attributes.clone(),
+                            &element_id,
+                            &snapshot.snapshot_id,
+                        );
+                        matched_element_ids.push(element_id);
+                    }
+                }
+            }
+        }
+    }
+    for item in &mut frame.visible_result_items {
+        if let Some(element_id) = visible_result_item_element_id(item).map(ToOwned::to_owned) {
+            if let Some(element) = find_accessible_element(snapshot, &element_id) {
+                if populate_accessibility_click_region(&mut item.click_regions, element) {
+                    item.element_id = Some(element_id.clone());
+                    item.attributes = accessibility_attributes(
+                        item.attributes.clone(),
+                        &element_id,
+                        &snapshot.snapshot_id,
+                    );
+                    matched_element_ids.push(element_id);
+                }
+            }
+        }
+    }
+
+    let synthesized_candidates = synthesize_ranked_uia_result_candidates(snapshot);
+
+    for candidate in synthesized_candidates {
+        let element_id = candidate
+            .element_id
+            .as_deref()
+            .unwrap_or(candidate.candidate_id.as_str())
+            .to_string();
+        if !frame.visible_result_items.iter().any(|item| {
+            visible_result_item_element_id(item) == Some(element_id.as_str())
+                || item.item_id == element_id
+        }) {
+            if let Some(item) = visible_result_item_from_uia_candidate(&candidate) {
+                frame.visible_result_items.push(item);
+            }
+        }
+        if matched_element_ids
+            .iter()
+            .any(|existing| existing == &element_id)
+            || frame
+                .legacy_target_candidates
+                .iter()
+                .any(|existing| existing.element_id.as_deref() == Some(element_id.as_str()))
+        {
+            continue;
+        }
+        frame.legacy_target_candidates.push(candidate);
+    }
+}
+
+fn populate_accessibility_click_region(
+    click_regions: &mut HashMap<String, ClickRegion>,
+    element: &AccessibleElement,
+) -> bool {
+    let Some(region) = element.bounding_rect.clone() else {
+        return false;
+    };
+    if element.is_offscreen || !element.is_enabled {
+        return false;
+    }
+    click_regions.insert(
+        "primary".into(),
+        ClickRegion {
+            region,
+            raw_confidence: Some(0.97),
+            confidence: 0.97,
+        },
+    );
+    true
+}
+
+fn find_accessible_element<'a>(
+    snapshot: &'a AccessibilitySnapshot,
+    element_id: &str,
+) -> Option<&'a AccessibleElement> {
+    snapshot
+        .elements
+        .iter()
+        .find(|element| element.element_id == element_id)
+}
+
+fn primary_list_item_element_id(item: &PrimaryListItem) -> Option<&str> {
+    item.element_id
+        .as_deref()
+        .or_else(|| item.attributes.get("element_id").and_then(Value::as_str))
+        .or_else(|| {
+            item.item_id
+                .starts_with("a11y_")
+                .then_some(item.item_id.as_str())
+        })
+}
+
+fn visible_result_item_element_id(item: &VisibleResultItem) -> Option<&str> {
+    item.element_id
+        .as_deref()
+        .or_else(|| item.attributes.get("element_id").and_then(Value::as_str))
+        .or_else(|| {
+            item.item_id
+                .starts_with("a11y_")
+                .then_some(item.item_id.as_str())
+        })
+}
+
+fn accessibility_attributes(attributes: Value, element_id: &str, snapshot_id: &str) -> Value {
+    let mut object = attributes.as_object().cloned().unwrap_or_default();
+    object.insert("element_id".into(), json!(element_id));
+    object.insert("accessibility_snapshot_id".into(), json!(snapshot_id));
+    object.insert("accessibility_sourced".into(), json!(true));
+    Value::Object(object)
+}
+
+fn visible_result_item_from_uia_candidate(
+    candidate: &UITargetCandidate,
+) -> Option<VisibleResultItem> {
+    let region = candidate.region.clone()?;
+    let mut click_regions = HashMap::new();
+    click_regions.insert(
+        "primary".into(),
+        ClickRegion {
+            region,
+            raw_confidence: Some(candidate.confidence),
+            confidence: candidate.confidence,
+        },
+    );
+    Some(VisibleResultItem {
+        item_id: candidate
+            .element_id
+            .clone()
+            .unwrap_or_else(|| candidate.candidate_id.clone()),
+        element_id: candidate.element_id.clone(),
+        kind: VisibleResultKind::Generic,
+        title: candidate.label.clone(),
+        channel_name: None,
+        provider: candidate
+            .content_provider_hint
+            .clone()
+            .or(candidate.provider_hint.clone()),
+        rank_overall: candidate.rank,
+        rank_within_kind: candidate.rank,
+        click_regions,
+        raw_confidence: Some(candidate.confidence),
+        confidence: candidate.confidence,
+        rationale: Some("provider_agnostic_uia_candidate".into()),
+        attributes: accessibility_attributes(
+            Value::Null,
+            candidate
+                .element_id
+                .as_deref()
+                .unwrap_or(candidate.candidate_id.as_str()),
+            candidate
+                .accessibility_snapshot_id
+                .as_deref()
+                .unwrap_or_default(),
+        ),
+    })
+}
+
+fn candidate_is_accessibility_sourced(candidate: &UITargetCandidate) -> bool {
+    candidate.source == TargetGroundingSource::AccessibilityLayer
+        || candidate.observation_source.as_deref() == Some("uia_snapshot")
+        || candidate
+            .element_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("a11y_"))
+        || candidate.candidate_id.contains("a11y_")
+}
+
 fn requested_roles_for_workflow(workflow: &ScreenWorkflow) -> Vec<String> {
     let mut roles = Vec::new();
     for step in &workflow.steps {
@@ -2128,8 +2638,21 @@ fn looks_like_channel_goal(utterance: &str) -> bool {
 fn screen_workflow_run_from_goal_loop(
     mut workflow: ScreenWorkflow,
     primitive_capabilities: UIPrimitiveCapabilitySet,
-    goal_loop: GoalLoopRun,
+    mut goal_loop: GoalLoopRun,
 ) -> ScreenWorkflowRun {
+    if goal_loop_has_verified_success(&goal_loop) && goal_loop.status != GoalLoopStatus::GoalAchieved
+    {
+        goal_loop.status = GoalLoopStatus::GoalAchieved;
+        goal_loop.failure_reason = None;
+        goal_loop.verifier_status = Some("GoalAchieved".into());
+        goal_loop.completion_diagnostics.status_downgrade_prevented = true;
+        goal_loop.completion_diagnostics.goal_verifier_status =
+            Some(GoalVerificationStatus::GoalAchieved);
+        goal_loop
+            .completion_diagnostics
+            .goal_achieved_reason
+            .get_or_insert_with(|| "verified success preserved during final aggregation".into());
+    }
     if let Some(candidate) = goal_loop.selected_target_candidate.clone() {
         remember_goal_loop_candidate(&mut workflow, candidate);
     }
@@ -2147,12 +2670,22 @@ fn screen_workflow_run_from_goal_loop(
         .enumerate()
         .map(goal_loop_execution_to_step_run)
         .collect::<Vec<_>>();
-    let completed_steps = goal_loop
+    let planned_steps = workflow.steps.len().max(1);
+    let status = workflow_status_for_goal_loop(&goal_loop);
+    let executed_attempts = goal_loop
         .executed_steps
         .iter()
         .filter(|step| step.status == PlannerStepExecutionStatus::Executed)
         .count();
-    let status = workflow_status_for_goal_loop(&goal_loop);
+    let completed_steps = logical_completed_steps_for_goal_loop(
+        &goal_loop,
+        &status,
+        planned_steps,
+        executed_attempts,
+    );
+    goal_loop.completion_diagnostics.planned_steps = planned_steps;
+    goal_loop.completion_diagnostics.logical_steps_completed = completed_steps;
+    goal_loop.completion_diagnostics.executed_attempts = goal_loop.executed_steps.len();
     let stopped_reason = if status == WorkflowRunStatus::Completed {
         None
     } else {
@@ -2170,7 +2703,7 @@ fn screen_workflow_run_from_goal_loop(
             descriptor,
             &status,
             completed_steps,
-            workflow.steps.len(),
+            planned_steps,
             stopped_reason.as_deref(),
             workflow.grounding.goal_loop.as_ref(),
         )
@@ -2205,6 +2738,32 @@ fn goal_loop_has_executed_action(goal_loop: &GoalLoopRun) -> bool {
         .executed_steps
         .iter()
         .any(|step| step.status == PlannerStepExecutionStatus::Executed)
+}
+
+fn goal_loop_has_verified_success(goal_loop: &GoalLoopRun) -> bool {
+    goal_loop.status == GoalLoopStatus::GoalAchieved
+        || goal_loop
+            .verification_history
+            .iter()
+            .any(|verification| verification.status == GoalVerificationStatus::GoalAchieved)
+        || goal_loop.completion_diagnostics.goal_verifier_status
+            == Some(GoalVerificationStatus::GoalAchieved)
+}
+
+fn logical_completed_steps_for_goal_loop(
+    goal_loop: &GoalLoopRun,
+    status: &WorkflowRunStatus,
+    planned_steps: usize,
+    executed_attempts: usize,
+) -> usize {
+    let logical_completed = if matches!(status, WorkflowRunStatus::Completed) {
+        planned_steps
+    } else if executed_attempts > 0 || goal_loop_has_executed_action(goal_loop) {
+        planned_steps.min(1)
+    } else {
+        0
+    };
+    logical_completed.min(planned_steps)
 }
 
 fn goal_loop_has_ambiguous_final_verification(goal_loop: &GoalLoopRun) -> bool {
@@ -2374,18 +2933,26 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::DesktopAgentRuntime;
+    use super::{
+        accessibility_selector_click_decision, enrich_frame_with_accessibility, DesktopAgentRuntime,
+    };
     use crate::{
+        accessibility_layer::{
+            synthesize_ranked_uia_result_candidates, validate_accessibility_target_selection,
+            AccessibilitySnapshot, AccessibilityTargetSelection, AccessibleElement,
+        },
         action_resolution::{ActionOperation, ResolutionSource},
         desktop_agent_types::{
             DesktopActionRequest, DesktopActionStatus, GoalConstraints, GoalLoopRun,
             GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus, PendingApproval,
-            PlannerStepExecutionRecord, PlannerStepExecutionStatus, VisibleResultKind,
+            PlannerContractInput, PlannerStepExecutionRecord, PlannerStepExecutionStatus,
+            VisibleActionabilityDiagnostic, VisibleResultKind,
         },
         screen_workflow::{
             ScreenFreshness, ScreenGroundingState, ScreenWorkflow, ScreenWorkflowDomain,
             WorkflowSupportSummary,
         },
+        semantic_frame::{run_goal_loop_once, semantic_frame_from_vision_value},
         ui_control::UIPrimitiveCapabilitySet,
         ui_target_grounding::{
             TargetGroundingSource, TargetRegion, UITargetCandidate, UITargetRole,
@@ -2393,6 +2960,42 @@ mod tests {
     };
     use serde_json::json;
     use uuid::Uuid;
+
+    fn accessibility_snapshot(elements: Vec<AccessibleElement>) -> AccessibilitySnapshot {
+        AccessibilitySnapshot {
+            snapshot_id: "uia_test_snapshot".into(),
+            element_count: elements.len(),
+            elements,
+            browser_url: None,
+            browser_window_bounds: None,
+            captured_at_ms: 1_000,
+            capture_backend: "powershell_uia".into(),
+            window_is_foreground: true,
+            window_pid: Some(1234),
+            window_process_name: Some("chrome".into()),
+            error: None,
+        }
+    }
+
+    fn accessible_element(
+        element_id: &str,
+        bounding_rect: Option<TargetRegion>,
+    ) -> AccessibleElement {
+        AccessibleElement {
+            element_id: element_id.into(),
+            automation_id: None,
+            runtime_id: None,
+            role: "hyperlink".into(),
+            name: Some("Example result".into()),
+            value: None,
+            bounding_rect,
+            is_enabled: true,
+            is_offscreen: false,
+            depth: 3,
+            parent_id: None,
+            children: Vec::new(),
+        }
+    }
 
     #[test]
     fn filesystem_write_creates_persisted_pending_approval() {
@@ -2444,9 +3047,379 @@ mod tests {
     }
 
     #[test]
+    fn enrich_frame_with_accessibility_populates_click_regions_from_os_bounds() {
+        let mut frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "google",
+                    "page_kind_hint": "search_results",
+                    "confidence": 0.9
+                },
+                "primary_list": {
+                    "container_kind": "result_list",
+                    "items": [{
+                        "item_id": "a11y_7",
+                        "element_id": "a11y_7",
+                        "rank": 1,
+                        "title": "Example result",
+                        "item_kind": "site",
+                        "confidence": 0.9
+                    }]
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("semantic frame");
+        let snapshot = accessibility_snapshot(vec![accessible_element(
+            "a11y_7",
+            Some(TargetRegion {
+                x: 120.0,
+                y: 240.0,
+                width: 500.0,
+                height: 42.0,
+                coordinate_space: "screen".into(),
+            }),
+        )]);
+
+        enrich_frame_with_accessibility(&mut frame, &snapshot);
+
+        let item = &frame.primary_list.as_ref().expect("primary list").items[0];
+        let region = &item
+            .click_regions
+            .get("primary")
+            .expect("primary region")
+            .region;
+        assert_eq!(region.x, 120.0);
+        assert_eq!(region.coordinate_space, "screen");
+        assert_eq!(
+            item.attributes
+                .get("accessibility_sourced")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            item.attributes
+                .get("accessibility_snapshot_id")
+                .and_then(serde_json::Value::as_str),
+            Some("uia_test_snapshot")
+        );
+    }
+
+    #[test]
+    fn enrich_frame_with_accessibility_skips_elements_without_bounding_rect() {
+        let mut frame = semantic_frame_from_vision_value(
+            &json!({
+                "visible_result_items": [{
+                    "item_id": "a11y_3",
+                    "element_id": "a11y_3",
+                    "kind": "generic",
+                    "title": "No bounds",
+                    "rank_overall": 1,
+                    "confidence": 0.9
+                }]
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("semantic frame");
+        let snapshot = accessibility_snapshot(vec![accessible_element("a11y_3", None)]);
+
+        enrich_frame_with_accessibility(&mut frame, &snapshot);
+
+        assert!(frame.visible_result_items[0].click_regions.is_empty());
+    }
+
+    #[test]
+    fn perceive_continues_when_accessibility_snapshot_is_empty() {
+        let mut frame = semantic_frame_from_vision_value(
+            &json!({
+                "visible_result_items": [{
+                    "item_id": "result_1",
+                    "kind": "generic",
+                    "title": "Vision result",
+                    "rank_overall": 1,
+                    "confidence": 0.9
+                }]
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("semantic frame");
+        let snapshot = AccessibilitySnapshot {
+            snapshot_id: "uia_unavailable".into(),
+            elements: Vec::new(),
+            browser_url: None,
+            browser_window_bounds: None,
+            captured_at_ms: 1_000,
+            capture_backend: "unavailable".into(),
+            element_count: 0,
+            window_is_foreground: false,
+            window_pid: None,
+            window_process_name: None,
+            error: Some("uia unavailable".into()),
+        };
+
+        enrich_frame_with_accessibility(&mut frame, &snapshot);
+
+        assert_eq!(frame.visible_result_items.len(), 1);
+        assert!(frame.legacy_target_candidates.is_empty());
+    }
+
+    #[test]
+    fn open_list_item_uses_uia_candidates_when_semantic_candidates_empty() {
+        let mut frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "example",
+                    "page_kind_hint": "browser",
+                    "query_hint": "docs",
+                    "confidence": 0.88
+                },
+                "scene_summary": "A result list is visible",
+                "page_state": {
+                    "kind": "list",
+                    "dominant_content": "result_list",
+                    "list_visible": true
+                }
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("semantic frame");
+        let snapshot = accessibility_snapshot(vec![accessible_element(
+            "a11y_1",
+            Some(TargetRegion {
+                x: 100.0,
+                y: 160.0,
+                width: 480.0,
+                height: 44.0,
+                coordinate_space: "screen".into(),
+            }),
+        )]);
+
+        enrich_frame_with_accessibility(&mut frame, &snapshot);
+
+        assert_eq!(frame.visible_result_items.len(), 1);
+        assert_eq!(
+            frame.visible_result_items[0].element_id.as_deref(),
+            Some("a11y_1")
+        );
+        let goal = GoalSpec {
+            goal_id: "goal".into(),
+            goal_type: GoalType::OpenListItem,
+            constraints: GoalConstraints {
+                provider: Some("example".into()),
+                item_kind: Some("result".into()),
+                result_kind: Some(VisibleResultKind::Generic),
+                rank_within_kind: Some(1),
+                rank_overall: None,
+                entity_name: None,
+                attributes: serde_json::Value::Null,
+            },
+            success_condition: "list_item_detail_open".into(),
+            utterance: "open the first result".into(),
+            confidence: 0.9,
+        };
+
+        let run = run_goal_loop_once(goal, frame);
+        let candidate = run.planner_steps[0]
+            .executable_candidate
+            .as_ref()
+            .expect("uia candidate selected");
+
+        assert_eq!(run.status, GoalLoopStatus::NeedsExecution);
+        assert_eq!(candidate.element_id.as_deref(), Some("a11y_1"));
+        assert_eq!(
+            candidate.accessibility_snapshot_id.as_deref(),
+            Some("uia_test_snapshot")
+        );
+        assert!(!candidate.reuse_eligible);
+    }
+
+    #[test]
+    fn browser_open_list_item_prefers_llm_uia_selection_over_vision_candidate() {
+        let mut frame = semantic_frame_from_vision_value(
+            &json!({
+                "page_evidence": {
+                    "content_provider_hint": "example",
+                    "page_kind_hint": "browser",
+                    "result_list_visible": true,
+                    "confidence": 0.88
+                },
+                "scene_summary": "A result list is visible",
+                "visible_result_items": [{
+                    "item_id": "vision_1",
+                    "kind": "video",
+                    "title": "Misleading sidebar item",
+                    "rank_within_kind": 1,
+                    "click_regions": {
+                        "title": {"x": 1600, "y": 400, "width": 250, "height": 250, "coordinate_space": "screen"}
+                    },
+                    "confidence": 0.95
+                }]
+            }),
+            1_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("semantic frame");
+        let mut sidebar = accessible_element(
+            "a11y_1",
+            Some(TargetRegion {
+                x: 1500.0,
+                y: 240.0,
+                width: 280.0,
+                height: 80.0,
+                coordinate_space: "screen".into(),
+            }),
+        );
+        sidebar.name = Some("Sidebar channel".into());
+        let mut main_result = accessible_element(
+            "a11y_2",
+            Some(TargetRegion {
+                x: 300.0,
+                y: 320.0,
+                width: 620.0,
+                height: 92.0,
+                coordinate_space: "screen".into(),
+            }),
+        );
+        main_result.name = Some("First main result".into());
+        let snapshot = accessibility_snapshot(vec![sidebar, main_result]);
+        enrich_frame_with_accessibility(&mut frame, &snapshot);
+        let candidates = synthesize_ranked_uia_result_candidates(&snapshot);
+        let selection = AccessibilityTargetSelection {
+            selected_element_id: Some("a11y_2".into()),
+            accessibility_snapshot_id: Some(snapshot.snapshot_id.clone()),
+            selection_kind: Some("ranked_result".into()),
+            rank: Some(1),
+            confidence: 0.93,
+            rationale: Some("The selected element is the main content result.".into()),
+        };
+        let selected_candidate = validate_accessibility_target_selection(
+            &selection,
+            &snapshot,
+            &candidates,
+            crate::ui_target_grounding::TargetSelectionPolicy::default().min_click_confidence,
+        )
+        .expect("validated UIA selection");
+        let goal = GoalSpec {
+            goal_id: "goal".into(),
+            goal_type: GoalType::OpenListItem,
+            constraints: GoalConstraints {
+                provider: Some("example".into()),
+                item_kind: Some("video".into()),
+                result_kind: Some(VisibleResultKind::Video),
+                rank_within_kind: Some(1),
+                rank_overall: None,
+                entity_name: None,
+                attributes: serde_json::Value::Null,
+            },
+            success_condition: "list_item_detail_open".into(),
+            utterance: "open the first video".into(),
+            confidence: 0.9,
+        };
+        let input = PlannerContractInput {
+            goal,
+            current_frame: frame,
+            executed_steps: Vec::new(),
+            verification_history: Vec::new(),
+            perception_requests: Vec::new(),
+            retry_budget: 3,
+            retries_used: 0,
+            visible_refinement_attempts: 0,
+            max_visible_refinement_passes: 1,
+            provider_hint: Some("example".into()),
+            browser_app_hint: Some("browser".into()),
+            page_kind_hint: Some("browser".into()),
+            visible_actionability: VisibleActionabilityDiagnostic::default(),
+        };
+
+        let decision = accessibility_selector_click_decision(
+            &input,
+            selected_candidate,
+            &selection,
+            candidates.len(),
+            true,
+        );
+
+        assert_eq!(
+            decision.proposed_step.target_item_id.as_deref(),
+            Some("a11y_2")
+        );
+        let candidate = decision
+            .proposed_step
+            .executable_candidate
+            .as_ref()
+            .expect("UIA candidate");
+        assert_eq!(candidate.element_id.as_deref(), Some("a11y_2"));
+        assert_eq!(candidate.source, TargetGroundingSource::AccessibilityLayer);
+        assert!(decision
+            .strategy_rationale
+            .contains("vision_only_candidate_suppressed=true"));
+        assert!(decision
+            .strategy_rationale
+            .contains("llm_uia_selector_used=true"));
+    }
+
+    #[test]
+    fn stale_accessibility_snapshot_is_not_used_for_enrichment() {
+        let mut frame = semantic_frame_from_vision_value(
+            &json!({
+                "visible_result_items": [{
+                    "item_id": "a11y_9",
+                    "kind": "generic",
+                    "title": "Stale result",
+                    "rank_overall": 1,
+                    "confidence": 0.9
+                }]
+            }),
+            7_000,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("semantic frame");
+        let mut snapshot = accessibility_snapshot(vec![accessible_element(
+            "a11y_9",
+            Some(TargetRegion {
+                x: 120.0,
+                y: 240.0,
+                width: 500.0,
+                height: 42.0,
+                coordinate_space: "screen".into(),
+            }),
+        )]);
+        snapshot.captured_at_ms = 1_000;
+
+        enrich_frame_with_accessibility(&mut frame, &snapshot);
+
+        let item = &frame.visible_result_items[0];
+        assert!(item.click_regions.is_empty());
+        assert!(item.element_id.is_none());
+        assert!(item.attributes.get("accessibility_sourced").is_none());
+        assert!(frame
+            .uncertainty
+            .iter()
+            .any(|uncertainty| uncertainty.code == "stale_accessibility_snapshot"));
+    }
+
+    #[test]
     fn goal_loop_run_is_projected_back_into_screen_workflow_diagnostics() {
         let candidate = UITargetCandidate {
             candidate_id: "video_candidate".into(),
+            element_id: None,
+            accessibility_snapshot_id: None,
             role: UITargetRole::RankedResult,
             region: Some(TargetRegion {
                 x: 10.0,
