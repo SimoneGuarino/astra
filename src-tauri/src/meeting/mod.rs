@@ -29,6 +29,7 @@ pub mod call_detector;
 pub mod capture_controller;
 pub mod decision_log;
 pub mod follow_up_sender;
+pub mod intelligence_engine;
 pub mod live_summarizer;
 pub mod note_organizer;
 pub mod privacy_control;

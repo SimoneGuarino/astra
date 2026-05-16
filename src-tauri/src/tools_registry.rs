@@ -210,6 +210,41 @@ impl ToolsRegistry {
                     false,
                 ),
                 tool(
+                    "meeting.intelligence.generate",
+                    "meeting",
+                    "Generate governed transcript-backed meeting intelligence artifacts",
+                    vec![
+                        Permission::MeetingIntelligenceGenerate,
+                        Permission::MeetingTranscriptWrite,
+                    ],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.intelligence.read",
+                    "meeting",
+                    "Read generated transcript-backed meeting intelligence artifacts",
+                    vec![Permission::MeetingIntelligenceRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.intelligence.clear",
+                    "meeting",
+                    "Clear generated meeting intelligence artifacts without changing the raw transcript",
+                    vec![Permission::MeetingIntelligenceClear],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.followup.draft",
+                    "meeting",
+                    "Create a copy-only follow-up draft as a generated meeting intelligence artifact",
+                    vec![Permission::MeetingIntelligenceGenerate],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
                     "meeting.transcription.file",
                     "meeting",
                     "Transcribe a validated local audio file into the active meeting through the existing SttClient",
@@ -232,6 +267,14 @@ impl ToolsRegistry {
                     "meeting.decision.add",
                     "meeting",
                     "Add a decision to an active governed meeting session",
+                    vec![Permission::MeetingNotesWrite],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.speaker.rename",
+                    "meeting",
+                    "Rename a meeting speaker display label as governed metadata without changing transcript text",
                     vec![Permission::MeetingNotesWrite],
                     RiskLevel::Medium,
                     false,
@@ -440,6 +483,21 @@ mod tests {
         let diagnostics_read = registry
             .get("meeting.diagnostics.read")
             .expect("diagnostics read");
+        let speaker_rename = registry
+            .get("meeting.speaker.rename")
+            .expect("speaker rename");
+        let intelligence_generate = registry
+            .get("meeting.intelligence.generate")
+            .expect("intelligence generate");
+        let intelligence_read = registry
+            .get("meeting.intelligence.read")
+            .expect("intelligence read");
+        let intelligence_clear = registry
+            .get("meeting.intelligence.clear")
+            .expect("intelligence clear");
+        let followup_draft = registry
+            .get("meeting.followup.draft")
+            .expect("followup draft");
         let live_transcription = registry
             .get("meeting.transcription.live")
             .expect("live transcription");
@@ -458,6 +516,17 @@ mod tests {
         assert!(file_transcription.available);
         assert!(transcript_list.available);
         assert!(diagnostics_read.available);
+        assert!(speaker_rename.available);
+        assert_eq!(speaker_rename.default_risk, RiskLevel::Medium);
+        assert!(!speaker_rename.requires_confirmation);
+        assert!(intelligence_generate.available);
+        assert_eq!(intelligence_generate.default_risk, RiskLevel::Medium);
+        assert!(intelligence_read.available);
+        assert_eq!(intelligence_read.default_risk, RiskLevel::Low);
+        assert!(intelligence_clear.available);
+        assert_eq!(intelligence_clear.default_risk, RiskLevel::Medium);
+        assert!(followup_draft.available);
+        assert!(!followup_draft.requires_confirmation);
         assert_eq!(capture.available, cfg!(target_os = "windows"));
         assert_eq!(system_capture.available, cfg!(target_os = "windows"));
         assert_eq!(microphone_capture.available, cfg!(target_os = "windows"));

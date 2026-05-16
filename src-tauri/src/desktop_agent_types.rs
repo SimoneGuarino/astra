@@ -28,6 +28,9 @@ pub enum Permission {
     MeetingTranscriptionFile,
     MeetingTranscriptionSegment,
     MeetingTranscriptionLive,
+    MeetingIntelligenceGenerate,
+    MeetingIntelligenceRead,
+    MeetingIntelligenceClear,
     MeetingFollowUpSend,
 }
 

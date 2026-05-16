@@ -124,7 +124,7 @@ impl NoteOrganizer {
         for entry in &exported.transcript {
             md.push_str(&format!(
                 "{} [{}] ({}): {}\n",
-                entry.speaker,
+                entry.speaker_display_name(),
                 entry.source.as_str(),
                 entry.timestamp.format("%H:%M:%S"),
                 entry.text
@@ -187,6 +187,46 @@ impl NoteOrganizer {
             ));
         }
 
+        if let Some(intelligence) = &exported.intelligence {
+            md.push_str("\n## Meeting Intelligence\n");
+            md.push_str(&format!("Status: {:?}\n", intelligence.status));
+            if let Some(summary) = &intelligence.summary {
+                md.push_str("\n### Summary\n");
+                md.push_str(&summary.text);
+                md.push('\n');
+                if !summary.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "Evidence: {}\n",
+                        summary.evidence_segment_ids.join(", ")
+                    ));
+                }
+            }
+            if !intelligence.open_questions.is_empty() {
+                md.push_str("\n### Open Questions\n");
+                for question in &intelligence.open_questions {
+                    md.push_str(&format!("- {}\n", question.question));
+                }
+            }
+            if !intelligence.risks.is_empty() {
+                md.push_str("\n### Risks / Blockers\n");
+                for risk in &intelligence.risks {
+                    md.push_str(&format!("- {:?}: {}\n", risk.severity, risk.risk));
+                }
+            }
+            if let Some(recap) = &intelligence.technical_recap {
+                if !recap.bullets.is_empty() {
+                    md.push_str("\n### Technical Recap\n");
+                    for bullet in &recap.bullets {
+                        md.push_str(&format!("- {}\n", bullet));
+                    }
+                }
+            }
+            if let Some(draft) = &intelligence.follow_up_draft {
+                md.push_str("\n### Follow-up Draft\n");
+                md.push_str(&format!("Subject: {}\n\n{}\n", draft.subject, draft.body));
+            }
+        }
+
         Ok(md)
     }
 
@@ -198,7 +238,7 @@ impl NoteOrganizer {
             // Escape CSV fields
             csv.push_str(&format!(
                 "\"{}\",{},\"{}\",{},\"{}\"\n",
-                entry.speaker.replace('"', "\"\""),
+                entry.speaker_display_name().replace('"', "\"\""),
                 entry.source.as_str(),
                 entry.segment_id.replace('"', "\"\""),
                 entry.timestamp.format("%Y-%m-%dT%H:%M:%S"),

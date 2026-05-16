@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Button } from "../ui/buttons/Button";
 import { useMeeting } from "../hooks/useMeeting";
 import type { CapabilityManifest, CapabilityToolState } from "../types/desktopAgent";
@@ -10,10 +11,12 @@ import type {
     DecisionLogEntry,
     MeetingConfig,
     MeetingDataClearPreview,
+    MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
     MeetingSession,
     MeetingSessionState,
     MeetingStatus,
+    SpeakerLabel,
     TranscriptEntry,
 } from "../types/meeting";
 import { CLEAR_MEETING_DATA_CONFIRMATION_PHRASE } from "../types/meeting";
@@ -93,6 +96,38 @@ function transcriptSourceLabel(source?: string | null): string {
         default:
             return "UNKNOWN";
     }
+}
+
+function generatorLabel(intelligence?: MeetingIntelligenceResult | null): string {
+    const generator = intelligence?.diagnostics.generator;
+    if (!generator) return "not generated";
+    switch (generator.type) {
+        case "local_llm":
+            return `local model (${generator.model})`;
+        case "hybrid":
+            return "hybrid";
+        case "rule_based":
+        default:
+            return intelligence?.diagnostics.fallback_used ? "rule-based fallback" : "rule-based";
+    }
+}
+
+function evidenceLabel(ids?: string[] | null): string {
+    const count = ids?.length ?? 0;
+    return count === 1 ? "Evidence: 1 transcript segment" : `Evidence: ${count} transcript segments`;
+}
+
+function confidenceLabel(confidence?: number | null): string {
+    if (typeof confidence !== "number") return "confidence unknown";
+    return `${Math.round(confidence * 100)}% confidence`;
+}
+
+function formatTimelineTime(timestampMs?: number | null): string {
+    if (typeof timestampMs !== "number") return "time unknown";
+    const totalSeconds = Math.floor(timestampMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
+    const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+    return `${minutes}:${seconds}`;
 }
 
 function makeLocalId(): string {
@@ -301,6 +336,33 @@ function transcriptEmptyCopy(uiState: MeetingUiState, sessionMode?: string | nul
     return "Astra is not recording.";
 }
 
+function speakerFallbackForSource(source?: string | null): string {
+    switch (source) {
+        case "microphone":
+            return "You";
+        case "system_audio":
+            return "Speaker 1";
+        case "manual":
+            return "Manual";
+        case "imported_file":
+            return "Imported";
+        default:
+            return "Unknown";
+    }
+}
+
+function speakerDisplayName(entry: TranscriptEntry): string {
+    return entry.speaker_label?.trim() || entry.speaker?.trim() || speakerFallbackForSource(entry.source);
+}
+
+function transcriptOrderValue(entry: TranscriptEntry): number {
+    if (typeof entry.start_ms === "number") return entry.start_ms;
+    const timestamp = new Date(entry.timestamp).getTime();
+    if (Number.isFinite(timestamp)) return timestamp;
+    const createdAt = new Date(entry.created_at).getTime();
+    return Number.isFinite(createdAt) ? createdAt : 0;
+}
+
 export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const meeting = useMeeting();
     const transcriptRef = useRef<HTMLElement | null>(null);
@@ -330,9 +392,12 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const [decisionText, setDecisionText] = useState("");
     const [decisionRationale, setDecisionRationale] = useState("");
     const [decisionMadeBy, setDecisionMadeBy] = useState("");
+    const [speakerRenameId, setSpeakerRenameId] = useState("");
+    const [speakerRenameName, setSpeakerRenameName] = useState("");
     const [clearPreview, setClearPreview] = useState<MeetingDataClearPreview | null>(null);
     const [showClearConfirmation, setShowClearConfirmation] = useState(false);
     const [clearPhrase, setClearPhrase] = useState("");
+    const [isGeneratingIntelligence, setIsGeneratingIntelligence] = useState(false);
 
     const meetingTools = useMemo(
         () => capabilities?.tools.filter((tool) => tool.category === "meeting") ?? [],
@@ -351,10 +416,21 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const currentStatusKind = statusKind(currentStatus);
     const sessionMode = activeSession?.session_mode ?? displayedState?.session.session_mode ?? null;
     const transcriptEntries = displayedState?.transcript ?? [];
+    const displayedTranscriptEntries = useMemo(
+        () =>
+            [...transcriptEntries].sort((left, right) => {
+                const order = transcriptOrderValue(right) - transcriptOrderValue(left);
+                if (order !== 0) return order;
+                return right.created_at.localeCompare(left.created_at);
+            }),
+        [transcriptEntries]
+    );
+    const speakers = displayedState?.speakers ?? [];
     const notes = displayedState?.notes ?? [];
     const summaries = displayedState?.summary ?? [];
     const actionItems = displayedState?.action_items ?? [];
     const decisions = displayedState?.decisions ?? [];
+    const intelligence = displayedState?.intelligence ?? null;
     const diagnostics = displayedState?.diagnostics ?? [];
     const metrics = liveCapabilities?.capture_health.metrics;
     const systemHealth = liveCapabilities?.system_capture_health;
@@ -365,23 +441,38 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const segmentsTranscribed = metrics?.segments_transcribed ?? 0;
     const pendingSegments = Math.max(0, segmentsWritten - segmentsTranscribed);
     const lastTranscriptAt = transcriptEntries.length
-        ? transcriptEntries[transcriptEntries.length - 1]?.timestamp
+        ? displayedTranscriptEntries[0]?.timestamp
         : null;
     const lastSummaryTimestamp = displayedState?.summary.length
         ? displayedState.summary[displayedState.summary.length - 1]?.timestamp
         : null;
     const audioCaptureTool = toolByName("meeting.audio.capture");
+    const systemAudioCaptureTool = toolByName("meeting.audio.capture.system");
+    const microphoneCaptureTool = toolByName("meeting.audio.capture.microphone");
     const segmentTranscriptionTool = toolByName("meeting.transcription.segment");
     const googleMeetDetected = callLooksLikeGoogleMeet(callInfo);
 
     const realCaptureReadiness = useMemo<CaptureReadiness>(() => {
         const backendAvailable = liveCapabilities?.windows_wasapi_capture.available === true;
+        const selectedSourceCaptureTools = [
+            ...(captureMode === "system_audio" || captureMode === "both"
+                ? [{ label: "MeetingAudioCaptureSystem", tool: systemAudioCaptureTool }]
+                : []),
+            ...(captureMode === "microphone" || captureMode === "both"
+                ? [{ label: "MeetingAudioCaptureMicrophone", tool: microphoneCaptureTool }]
+                : []),
+        ];
         const audioToolAvailable = audioCaptureTool?.available === true;
+        const sourceToolsAvailable = selectedSourceCaptureTools.every(({ tool }) => tool?.available === true);
         const segmentToolAvailable = segmentTranscriptionTool?.available === true;
         const audioPermissionReady = toolReady(audioCaptureTool);
+        const sourcePermissionsReady = selectedSourceCaptureTools.every(({ tool }) => toolReady(tool));
         const segmentPermissionReady = toolReady(segmentTranscriptionTool);
         const approvalRequired =
             audioCaptureTool?.requires_approval === true ||
+            selectedSourceCaptureTools.some(
+                ({ tool }) => tool?.requires_approval === true || tool?.state === "approval_gated"
+            ) ||
             segmentTranscriptionTool?.requires_approval === true ||
             audioCaptureTool?.state === "approval_gated" ||
             segmentTranscriptionTool?.state === "approval_gated";
@@ -390,6 +481,11 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         if (audioCaptureTool && (!audioToolAvailable || !audioCaptureTool.enabled)) {
             blockedTools.push("MeetingAudioCapture");
         }
+        selectedSourceCaptureTools.forEach(({ label, tool }) => {
+            if (!tool || !tool.available || !tool.enabled) {
+                blockedTools.push(label);
+            }
+        });
         if (segmentTranscriptionTool && (!segmentToolAvailable || !segmentTranscriptionTool.enabled)) {
             blockedTools.push("MeetingTranscriptionSegment");
         }
@@ -401,9 +497,12 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             blockedReason = liveCapabilities.windows_wasapi_capture.reason ?? "WASAPI capture backend is unavailable.";
         } else if (!audioToolAvailable) {
             blockedReason = audioCaptureTool?.disabled_reason ?? "Meeting audio capture tool is unavailable.";
+        } else if (!sourceToolsAvailable) {
+            const blockedSource = selectedSourceCaptureTools.find(({ tool }) => tool?.available !== true);
+            blockedReason = blockedSource?.tool?.disabled_reason ?? "Selected source capture tool is unavailable.";
         } else if (!segmentToolAvailable) {
             blockedReason = segmentTranscriptionTool?.disabled_reason ?? "Meeting segment transcription tool is unavailable.";
-        } else if (!audioPermissionReady || !segmentPermissionReady) {
+        } else if (!audioPermissionReady || !sourcePermissionsReady || !segmentPermissionReady) {
             blockedReason = "Required meeting capture permissions are disabled.";
         }
 
@@ -417,7 +516,14 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             blockedReason,
             blockedTools,
         };
-    }, [audioCaptureTool, liveCapabilities, segmentTranscriptionTool]);
+    }, [
+        audioCaptureTool,
+        captureMode,
+        liveCapabilities,
+        microphoneCaptureTool,
+        segmentTranscriptionTool,
+        systemAudioCaptureTool,
+    ]);
 
     const consentReady =
         consent?.given === true &&
@@ -452,7 +558,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         const primaryHelpText = canRequestStart
             ? requiresApprovalOrConfirmation
                 ? "Ready for governed start. Confirmation/audit will occur when you click Start."
-                : "Ready to start WASAPI capture."
+                : "Ready to start capture."
             : "No pending approval exists because the request is blocked before approval creation.";
 
         return {
@@ -527,7 +633,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             return {
                 state: "recording",
                 title: "Recording",
-                description: `Astra is capturing Windows system audio through WASAPI. Segments: ${segmentsWritten} written / ${segmentsTranscribed} transcribed.`,
+                description: `Astra is capturing the selected audio sources. Segments: ${segmentsWritten} written / ${segmentsTranscribed} transcribed.`,
                 nextAction: "Keep the meeting audio playing, or stop when finished.",
                 blockingReasons: [],
                 isRecording,
@@ -547,7 +653,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     ? "Enable the blocked permissions, then start recording."
                     : startReadiness.requiresApprovalOrConfirmation
                       ? "Recording ready for governed start. Confirmation/audit will occur when you click Start."
-                      : "Use manual tools, transcribe a .wav file, or start WASAPI capture.",
+                      : "Use manual tools, transcribe a .wav file, or start capture.",
                 blockingReasons: startReadiness.hardBlockers,
                 isRecording: false,
                 isTranscribing: false,
@@ -599,7 +705,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             title: startReadiness.statusLabel,
             description: startReadiness.requiresApprovalOrConfirmation
                 ? "This action is high-risk and will be confirmed/audited when you click Start. No pending approval exists yet."
-                : "Consent is granted and the WASAPI capture path is available.",
+                : "Consent is granted and the selected capture path is available.",
             nextAction: startReadiness.requiresApprovalOrConfirmation
                 ? "Click Start recording to enter the governed confirmation path."
                 : "Start recording.",
@@ -678,6 +784,48 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     useEffect(() => {
         void refreshMeeting();
     }, [refreshMeeting]);
+
+    useEffect(() => {
+        let cancelled = false;
+        const unlisteners: Array<() => void> = [];
+        const eventNames = [
+            "meeting-session-updated",
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ];
+
+        const subscribe = async () => {
+            for (const eventName of eventNames) {
+                const unlisten = await listen(eventName, () => {
+                    if (!cancelled) void refreshMeeting();
+                });
+                unlisteners.push(unlisten);
+            }
+        };
+
+        void subscribe().catch((error) => {
+            if (!cancelled) {
+                setRefreshWarnings((current) => ({
+                    ...current,
+                    live_updates: errorText(error),
+                }));
+            }
+        });
+
+        return () => {
+            cancelled = true;
+            unlisteners.forEach((unlisten) => unlisten());
+        };
+    }, [refreshMeeting]);
+
+    useEffect(() => {
+        const intervalMs = hasActiveSession || uiSummary.isRecording || uiSummary.isTranscribing ? 1000 : 5000;
+        const timer = window.setInterval(() => {
+            void refreshMeeting();
+        }, intervalMs);
+        return () => window.clearInterval(timer);
+    }, [hasActiveSession, refreshMeeting, uiSummary.isRecording, uiSummary.isTranscribing]);
 
     const runOperation = useCallback(
         async (label: string, operation: () => Promise<unknown>, refreshAfter = true) => {
@@ -806,6 +954,26 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         }
     }, [decisionMadeBy, decisionRationale, decisionText, meeting, runOperation]);
 
+    const handleSelectSpeakerForRename = useCallback((speaker: SpeakerLabel) => {
+        setSpeakerRenameId(speaker.speaker_id);
+        setSpeakerRenameName(speaker.display_name);
+    }, []);
+
+    const handleRenameSpeaker = useCallback(async () => {
+        const speakerId = speakerRenameId.trim();
+        const displayName = speakerRenameName.trim();
+        if (!speakerId || !displayName) {
+            setLastError("rename speaker: speaker and display name are required");
+            return;
+        }
+        await runOperation("rename speaker", () =>
+            meeting.renameSpeaker({
+                speaker_id: speakerId,
+                display_name: displayName,
+            })
+        );
+    }, [meeting, runOperation, speakerRenameId, speakerRenameName]);
+
     const handlePreviewClearData = useCallback(
         () =>
             runOperation(
@@ -836,6 +1004,38 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         }
     }, [clearPhrase, meeting, runOperation]);
 
+    const handleGenerateIntelligence = useCallback(async () => {
+        try {
+            setIsGeneratingIntelligence(true);
+            await runOperation("generate intelligence", () =>
+                meeting.generateIntelligence({
+                    use_local_llm: true,
+                    max_transcript_segments: 120,
+                })
+            );
+        } finally {
+            setIsGeneratingIntelligence(false);
+        }
+    }, [meeting, runOperation]);
+
+    const handleClearIntelligence = useCallback(
+        () => runOperation("clear intelligence", () => meeting.clearIntelligence()),
+        [meeting, runOperation]
+    );
+
+    const handleCopyFollowUpDraft = useCallback(async () => {
+        const draft = intelligence?.follow_up_draft;
+        if (!draft) return;
+        const text = `Subject: ${draft.subject}\n\n${draft.body}`;
+        try {
+            await navigator.clipboard.writeText(text);
+            setLastResult("copy follow-up draft: copied to clipboard");
+            setLastError(null);
+        } catch (error) {
+            setLastError(`copy follow-up draft: ${errorText(error)}`);
+        }
+    }, [intelligence]);
+
     const scrollToTranscript = useCallback(() => {
         transcriptRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, []);
@@ -859,7 +1059,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <p className="meeting-status-description">{uiSummary.description}</p>
                         {googleMeetDetected && !uiSummary.isRecording ? (
                             <p className="meeting-call-warning">
-                                Google Meet may be open, but Astra is not recording. Start WASAPI capture to listen to Windows system audio.
+                                Google Meet may be open, but Astra is not recording. Start capture to listen to the selected audio sources.
                             </p>
                         ) : null}
                         {uiSummary.nextAction ? (
@@ -903,6 +1103,16 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <span>Summary / notes</span>
                         <strong>{liveCapabilities?.live_summarization.state ?? "unknown"}</strong>
                         <small>{summaries.length} summaries / {notes.length} notes</small>
+                    </article>
+                    <article>
+                        <span>Live UI updates</span>
+                        <strong>{hasActiveSession || uiSummary.isRecording ? "1s active polling" : "5s idle polling"}</strong>
+                        <small>Subscribed to meeting update events; polling catches background STT completions.</small>
+                    </article>
+                    <article>
+                        <span>Speaker attribution</span>
+                        <strong>source default</strong>
+                        <small>{displayedState?.speaker_rename_count ?? 0} renames / diarization unsupported</small>
                     </article>
                 </div>
 
@@ -1065,7 +1275,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                             )
                         }
                     >
-                        Start WASAPI capture
+                        Start capture
                     </Button>
                     <Button variant="text" radius="full" size="xs" disabled title={liveCapabilities?.live_transcription.reason ?? "Live STT unsupported"}>
                         Streaming STT unsupported
@@ -1078,6 +1288,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <div>
                         <p className="meeting-section-kicker">Transcript</p>
                         <h3>Live Transcript</h3>
+                        <p>Newest entries are shown first; export and artifact evidence keep chronological storage.</p>
                     </div>
                     <span className="meeting-count-pill">{transcriptEntries.length} entries</span>
                 </div>
@@ -1088,17 +1299,299 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     </div>
                 ) : (
                     <div className="meeting-transcript-list">
-                        {transcriptEntries.map((entry, index) => (
+                        {displayedTranscriptEntries.map((entry, index) => (
                             <article key={`${entry.timestamp}-${index}`} className="meeting-transcript-entry">
                                 <span>[{formatEntryTime(entry.timestamp)}]</span>
                                 <span className={`meeting-source-badge meeting-source-badge--${entry.source ?? "unknown"}`}>
                                     {transcriptSourceLabel(entry.source)}
                                 </span>
-                                <strong>{entry.speaker || "unknown"}:</strong>
+                                <strong>{speakerDisplayName(entry)}:</strong>
                                 <p>{entry.text}</p>
+                                {entry.speaker_id ? (
+                                    <button
+                                        type="button"
+                                        className="meeting-speaker-rename-button"
+                                        onClick={() =>
+                                            handleSelectSpeakerForRename({
+                                                speaker_id: entry.speaker_id ?? "",
+                                                display_name: speakerDisplayName(entry),
+                                                source: entry.source ?? "unknown",
+                                                confidence: entry.speaker_confidence ?? 0,
+                                                attribution_method: entry.speaker_attribution_method ?? "unknown",
+                                            })
+                                        }
+                                    >
+                                        Rename
+                                    </button>
+                                ) : null}
                             </article>
                         ))}
                     </div>
+                )}
+                <div className="meeting-speaker-panel">
+                    <div className="meeting-section-heading">
+                        <div>
+                            <p className="meeting-section-kicker">Speakers</p>
+                            <h3>Speaker Labels</h3>
+                            <p>Source-default labels are metadata. Rename labels when you know who they represent.</p>
+                        </div>
+                        <span className="meeting-count-pill">{speakers.length}</span>
+                    </div>
+                    {speakers.length ? (
+                        <div className="meeting-speaker-list">
+                            {speakers.map((speaker) => (
+                                <button
+                                    key={speaker.speaker_id}
+                                    type="button"
+                                    className="meeting-speaker-chip"
+                                    onClick={() => handleSelectSpeakerForRename(speaker)}
+                                >
+                                    <strong>{speaker.display_name}</strong>
+                                    <span>{transcriptSourceLabel(speaker.source)}</span>
+                                </button>
+                            ))}
+                        </div>
+                    ) : (
+                        <p className="desktop-agent-muted">Speaker labels appear after a session starts.</p>
+                    )}
+                    <div className="meeting-speaker-rename-form">
+                        <input
+                            className="desktop-agent-input"
+                            value={speakerRenameId}
+                            onChange={(event) => setSpeakerRenameId(event.target.value)}
+                            aria-label="Speaker id"
+                            placeholder="speaker_id"
+                        />
+                        <input
+                            className="desktop-agent-input"
+                            value={speakerRenameName}
+                            onChange={(event) => setSpeakerRenameName(event.target.value)}
+                            aria-label="Speaker display name"
+                            placeholder="Display name"
+                        />
+                        <Button
+                            variant="secondary"
+                            radius="full"
+                            size="xs"
+                            disabled={isBusy || !speakerRenameId.trim() || !speakerRenameName.trim()}
+                            onClick={() => void handleRenameSpeaker()}
+                        >
+                            Rename speaker
+                        </Button>
+                    </div>
+                    <p className="desktop-agent-muted">Diarization is not active: microphone defaults to You and system audio defaults to Speaker 1 until renamed.</p>
+                </div>
+            </section>
+
+            <section className="desktop-agent-card meeting-section-card meeting-generated-intelligence">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Derived artifacts</p>
+                        <h3>Meeting Intelligence</h3>
+                        <p>Generated from transcript evidence. Raw transcript remains the source of truth.</p>
+                    </div>
+                    <span className={`meeting-intelligence-status meeting-intelligence-status--${intelligence?.status ?? "idle"}`}>
+                        {intelligence?.status ?? "idle"}
+                    </span>
+                </div>
+                <div className="desktop-agent-inline-actions">
+                    <Button
+                        variant="secondary"
+                        radius="full"
+                        size="xs"
+                        disabled={isBusy || isGeneratingIntelligence || transcriptEntries.length === 0}
+                        onClick={() => void handleGenerateIntelligence()}
+                    >
+                        {intelligence ? "Regenerate intelligence" : "Generate intelligence"}
+                    </Button>
+                    <Button
+                        variant="text"
+                        radius="full"
+                        size="xs"
+                        disabled={isBusy || !intelligence}
+                        onClick={() => void handleClearIntelligence()}
+                    >
+                        Clear generated intelligence
+                    </Button>
+                    {intelligence?.follow_up_draft ? (
+                        <Button
+                            variant="text"
+                            radius="full"
+                            size="xs"
+                            disabled={isBusy}
+                            onClick={() => void handleCopyFollowUpDraft()}
+                        >
+                            Copy follow-up draft
+                        </Button>
+                    ) : null}
+                </div>
+                {transcriptEntries.length === 0 ? (
+                    <div className="desktop-agent-empty">
+                        Add or capture transcript entries before generating meeting intelligence.
+                    </div>
+                ) : null}
+                {intelligence ? (
+                    <>
+                        <div className="meeting-intelligence-meta">
+                            <span>Generator: <strong>{generatorLabel(intelligence)}</strong></span>
+                            <span>Segments: <strong>{intelligence.source_transcript_segment_count}</strong></span>
+                            <span>Audit: <strong>{intelligence.diagnostics.audit_redacted ? "redacted" : "not redacted"}</strong></span>
+                            <span>Transcript logged: <strong>{intelligence.diagnostics.transcript_text_logged ? "yes" : "no"}</strong></span>
+                        </div>
+                        {intelligence.diagnostics.model_unavailable_reason ? (
+                            <p className="meeting-intelligence-warning">
+                                Local model degraded: {intelligence.diagnostics.model_unavailable_reason}. Rule-based fallback is displayed.
+                            </p>
+                        ) : null}
+                        {intelligence.diagnostics.warnings.length ? (
+                            <div className="meeting-intelligence-warning-list">
+                                {intelligence.diagnostics.warnings.map((warning) => (
+                                    <p key={warning}>{warning}</p>
+                                ))}
+                            </div>
+                        ) : null}
+
+                        {intelligence.summary ? (
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Summary</h4>
+                                    <span>{confidenceLabel(intelligence.summary.confidence)}</span>
+                                </div>
+                                <p>{intelligence.summary.text}</p>
+                                {intelligence.summary.bullets.length ? (
+                                    <ul>
+                                        {intelligence.summary.bullets.map((bullet) => (
+                                            <li key={bullet}>{bullet}</li>
+                                        ))}
+                                    </ul>
+                                ) : null}
+                                <span>{evidenceLabel(intelligence.summary.evidence_segment_ids)}</span>
+                            </article>
+                        ) : null}
+
+                        <div className="meeting-generated-columns">
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Decisions</h4>
+                                    <span>{intelligence.decisions.length}</span>
+                                </div>
+                                {intelligence.decisions.length ? intelligence.decisions.map((decision) => (
+                                    <div key={decision.id} className="meeting-generated-item">
+                                        <p>{decision.decision}</p>
+                                        {decision.made_by_display_name ? <span>By: {decision.made_by_display_name}</span> : null}
+                                        <span>{evidenceLabel(decision.evidence_segment_ids)}</span>
+                                    </div>
+                                )) : <p className="desktop-agent-muted">No evidence-backed decisions detected.</p>}
+                            </article>
+
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Action Items</h4>
+                                    <span>{intelligence.action_items.length}</span>
+                                </div>
+                                {intelligence.action_items.length ? intelligence.action_items.map((item) => (
+                                    <div key={item.id} className="meeting-generated-item">
+                                        <p>{item.task}</p>
+                                        <span>{item.assignee_display_name ? `Assignee: ${item.assignee_display_name}` : "Assignee: not detected"}</span>
+                                        {item.due_date ? <span>Due: {item.due_date}</span> : null}
+                                        <span>{evidenceLabel(item.evidence_segment_ids)}</span>
+                                    </div>
+                                )) : <p className="desktop-agent-muted">No evidence-backed action items detected.</p>}
+                            </article>
+                        </div>
+
+                        <div className="meeting-generated-columns">
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Open Questions</h4>
+                                    <span>{intelligence.open_questions.length}</span>
+                                </div>
+                                {intelligence.open_questions.length ? intelligence.open_questions.map((question) => (
+                                    <div key={question.id} className="meeting-generated-item">
+                                        <p>{question.question}</p>
+                                        {question.asked_by_display_name ? <span>Asked by: {question.asked_by_display_name}</span> : null}
+                                        <span>{evidenceLabel(question.evidence_segment_ids)}</span>
+                                    </div>
+                                )) : <p className="desktop-agent-muted">No unresolved questions detected.</p>}
+                            </article>
+
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Risks / Blockers</h4>
+                                    <span>{intelligence.risks.length}</span>
+                                </div>
+                                {intelligence.risks.length ? intelligence.risks.map((risk) => (
+                                    <div key={risk.id} className="meeting-generated-item">
+                                        <p>{risk.risk}</p>
+                                        <span>Severity: {risk.severity}</span>
+                                        <span>{evidenceLabel(risk.evidence_segment_ids)}</span>
+                                    </div>
+                                )) : <p className="desktop-agent-muted">No grounded risks detected.</p>}
+                            </article>
+                        </div>
+
+                        <div className="meeting-generated-columns">
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Technical Recap</h4>
+                                    <span>{intelligence.technical_recap?.evidence_segment_ids.length ?? 0}</span>
+                                </div>
+                                {intelligence.technical_recap?.bullets.length ? (
+                                    <>
+                                        <ul>
+                                            {intelligence.technical_recap.bullets.map((bullet) => (
+                                                <li key={bullet}>{bullet}</li>
+                                            ))}
+                                        </ul>
+                                        {intelligence.technical_recap.mentioned_files.length ? (
+                                            <span>Files: {intelligence.technical_recap.mentioned_files.join(", ")}</span>
+                                        ) : null}
+                                        {intelligence.technical_recap.mentioned_commands.length ? (
+                                            <span>Commands: {intelligence.technical_recap.mentioned_commands.join(", ")}</span>
+                                        ) : null}
+                                    </>
+                                ) : <p className="desktop-agent-muted">No grounded technical details detected.</p>}
+                            </article>
+
+                            <article className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Follow-up Draft</h4>
+                                    <span>{intelligence.follow_up_draft ? "draft only" : "none"}</span>
+                                </div>
+                                {intelligence.follow_up_draft ? (
+                                    <div className="meeting-followup-draft">
+                                        <strong>{intelligence.follow_up_draft.subject}</strong>
+                                        <pre>{intelligence.follow_up_draft.body}</pre>
+                                        <span>{evidenceLabel(intelligence.follow_up_draft.evidence_segment_ids)}</span>
+                                    </div>
+                                ) : <p className="desktop-agent-muted">No follow-up draft generated.</p>}
+                            </article>
+                        </div>
+
+                        <article className="meeting-generated-block">
+                            <div className="meeting-generated-block__header">
+                                <h4>Timeline</h4>
+                                <span>{intelligence.timeline.length}</span>
+                            </div>
+                            {intelligence.timeline.length ? (
+                                <div className="meeting-timeline-list">
+                                    {intelligence.timeline.map((item) => (
+                                        <div key={item.id} className="meeting-timeline-item">
+                                            <span>{formatTimelineTime(item.timestamp_ms)}</span>
+                                            <strong>{item.speaker_display_name ?? "Unknown"}</strong>
+                                            <p>{item.detail || item.title}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : <p className="desktop-agent-muted">Timeline appears after generation.</p>}
+                        </article>
+                    </>
+                ) : (
+                    transcriptEntries.length ? (
+                        <div className="desktop-agent-empty">
+                            Generate meeting intelligence to create evidence-linked summary, decisions, action items, questions, risks, technical recap, follow-up draft, and timeline.
+                        </div>
+                    ) : null
                 )}
             </section>
 
@@ -1155,16 +1648,19 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 </article>
             </section>
 
-            <section className="meeting-card-stack">
-                <div className="meeting-section-heading">
+            <details className="meeting-manual-tools">
+                <summary className="desktop-agent-card meeting-manual-tools-summary">
                     <div>
-                        <p className="meeting-section-kicker">Manual tools</p>
-                        <h3>Manual notes and file transcription</h3>
+                        <p className="meeting-section-kicker">Advanced</p>
+                        <h3>Manual fallback tools</h3>
+                        <p>Use these only when audio/STT missed something or you need to import an existing .wav file.</p>
                     </div>
-                </div>
+                    <span className="meeting-count-pill">closed by default</span>
+                </summary>
                 <div className="desktop-agent-card-grid">
                     <article className="desktop-agent-card meeting-form-card">
-                        <h3>Add manual transcript</h3>
+                        <h3>Manual transcript entry</h3>
+                        <p className="desktop-agent-muted">Adds explicit text to the current session and keeps it tagged as manual.</p>
                         <input className="desktop-agent-input" value={transcriptSpeaker} onChange={(event) => setTranscriptSpeaker(event.target.value)} aria-label="Transcript speaker" placeholder="unknown" />
                         <textarea className="desktop-agent-textarea" value={transcriptText} onChange={(event) => setTranscriptText(event.target.value)} rows={3} aria-label="Transcript text" placeholder="Transcript text" />
                         <input className="desktop-agent-input" type="number" min="0" max="1" step="0.01" value={transcriptConfidence} onChange={(event) => setTranscriptConfidence(event.target.value)} aria-label="Transcript confidence" />
@@ -1176,7 +1672,8 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     </article>
 
                     <article className="desktop-agent-card meeting-form-card">
-                        <h3>Transcribe .wav file</h3>
+                        <h3>Transcribe existing .wav file</h3>
+                        <p className="desktop-agent-muted">Imports a local audio file into the current session through the governed file STT bridge.</p>
                         <input className="desktop-agent-input" value={audioPath} onChange={(event) => setAudioPath(event.target.value)} aria-label="Audio file path" placeholder=".wav file path" />
                         <input className="desktop-agent-input" value={audioSpeaker} onChange={(event) => setAudioSpeaker(event.target.value)} aria-label="File transcription speaker" placeholder="unknown" />
                         <label className="desktop-agent-toggle-row">
@@ -1214,7 +1711,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         </div>
                     </article>
                 </div>
-            </section>
+            </details>
 
             <section className="desktop-agent-card meeting-section-card">
                 <div className="meeting-section-heading">
@@ -1321,6 +1818,9 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <p>Status: <strong>{formatStatus(currentStatus)}</strong></p>
                         <p>Mode: <strong>{sessionMode ?? "none"}</strong></p>
                         <p>Capture active: <strong>{activeSession?.capture_active ? "yes" : "no"}</strong></p>
+                        <p>UI live updates: <strong>events + bounded polling</strong></p>
+                        <p>Transcript view: <strong>newest first</strong></p>
+                        <p>Speaker renames: <strong>{displayedState?.speaker_rename_count ?? 0}</strong></p>
                         <p className="desktop-agent-muted">{activeSession?.capture_backend_status ?? "No active session."}</p>
                     </article>
 
@@ -1398,6 +1898,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <p>Live streaming STT: <strong>{liveCapabilities?.live_streaming_stt.state ?? "unknown"}</strong></p>
                         <p>Chunk streaming: <strong>{liveCapabilities?.chunk_streaming.state ?? "unknown"}</strong></p>
                         <p>Diarization: <strong>{liveCapabilities?.diarization.state ?? "unknown"}</strong></p>
+                        <p>Speaker attribution: <strong>source default</strong></p>
                         <p>Live summary: <strong>{liveCapabilities?.live_summarization.state ?? "unknown"}</strong></p>
                         <p>Last summary update: <strong>{lastSummaryTimestamp ?? "none"}</strong></p>
                         <p>Follow-up sending: <strong>{toolState(toolByName("meeting.followup.send"))}</strong></p>
@@ -1429,7 +1930,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <h3>Hardware validation</h3>
                         <p>1. Enable MeetingAudioCapture and MeetingTranscriptionSegment.</p>
                         <p>2. Grant consent for the meeting platform.</p>
-                        <p>3. Start WASAPI capture and play system audio.</p>
+                        <p>3. Start capture and play system audio or speak into the microphone.</p>
                         <p>4. Wait one effective segment duration.</p>
                         <p>5. Confirm segments written and transcribed increase.</p>
                         <p>6. Confirm VAD does not drop speech.</p>

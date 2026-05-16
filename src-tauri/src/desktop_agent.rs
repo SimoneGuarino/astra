@@ -2594,9 +2594,16 @@ fn meeting_audit_data_category(tool_name: &str) -> &'static str {
         "meeting.transcript.add" => "meeting_transcript",
         "meeting.transcription.file" => "meeting_transcription_file_metadata",
         "meeting.action_item.add" | "meeting.decision.add" => "meeting_notes",
+        "meeting.intelligence.generate"
+        | "meeting.intelligence.read"
+        | "meeting.intelligence.clear"
+        | "meeting.followup.draft" => "meeting_intelligence_metadata",
+        "meeting.speaker.rename" => "meeting_speaker_metadata",
         "meeting.audio.devices"
         | "meeting.audio.backend"
         | "meeting.audio.capture"
+        | "meeting.audio.capture.system"
+        | "meeting.audio.capture.microphone"
         | "meeting.transcription.segment"
         | "meeting.transcription.live"
         | "meeting.detect" => "meeting_detection_metadata",
@@ -3613,6 +3620,92 @@ mod tests {
             "meeting_session_metadata"
         );
         assert_eq!(completed.details["result"]["redacted"], true);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_speaker_rename_audit_is_metadata_only() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_speaker_redact_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_governed_direct_action(
+                "meeting-speaker-redacted".into(),
+                "meeting.speaker.rename",
+                json!({
+                    "speaker_id": "remote_speaker_1",
+                    "display_name_length": 5,
+                    "metadata_only": true,
+                    "transcript_text_included": false,
+                }),
+                false,
+                || {
+                    Ok(json!({
+                        "speaker": {
+                            "speaker_id": "remote_speaker_1",
+                            "display_name": "Marco",
+                        },
+                        "renamed_entries": 1,
+                        "transcript_text": "sensitive transcript content",
+                    }))
+                },
+            )
+            .expect("speaker rename action");
+
+        let events = runtime.recent_audit_events(10);
+        let serialized = serde_json::to_string(&events).expect("audit events json");
+        assert!(serialized.contains("meeting_speaker_metadata"));
+        assert!(!serialized.contains("sensitive transcript content"));
+        assert!(!serialized.contains("Marco"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_intelligence_generation_audit_is_metadata_only() {
+        let root = std::env::temp_dir().join(format!(
+            "astra_meeting_intelligence_redact_{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_governed_direct_action(
+                "meeting-intelligence-redacted".into(),
+                "meeting.intelligence.generate",
+                json!({
+                    "session_id": "session",
+                    "transcript_segment_count": 3,
+                    "artifact_types_requested": ["summary", "follow_up_draft"],
+                    "metadata_only": true,
+                    "transcript_text_included": false,
+                    "generated_text_included": false,
+                }),
+                false,
+                || {
+                    Ok(json!({
+                        "session_id": "session",
+                        "summary": {
+                            "text": "sensitive generated summary",
+                            "evidence_segment_ids": ["seg-1"]
+                        },
+                        "follow_up_draft": {
+                            "body": "sensitive draft body"
+                        }
+                    }))
+                },
+            )
+            .expect("intelligence action");
+
+        let events = runtime.recent_audit_events(10);
+        let serialized = serde_json::to_string(&events).expect("audit events json");
+        assert!(serialized.contains("meeting_intelligence_metadata"));
+        assert!(!serialized.contains("sensitive generated summary"));
+        assert!(!serialized.contains("sensitive draft body"));
 
         let _ = std::fs::remove_dir_all(root);
     }

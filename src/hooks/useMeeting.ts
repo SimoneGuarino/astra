@@ -14,10 +14,14 @@ import type {
     MeetingDataClearPreview,
     MeetingDataClearResult,
     MeetingDiagnostic,
+    MeetingIntelligenceGenerationOptions,
+    MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
     MeetingSession,
     MeetingSessionState,
     NoteEntry,
+    RenameSpeakerRequest,
+    RenameSpeakerResult,
     SummaryEntry,
     TranscriptEntry,
 } from "../types/meeting";
@@ -96,6 +100,22 @@ export function useMeeting() {
         []
     );
 
+    const generateIntelligence = useCallback(
+        (options: MeetingIntelligenceGenerationOptions) =>
+            invoke<MeetingIntelligenceResult>("generate_meeting_intelligence", { options }),
+        []
+    );
+
+    const readIntelligence = useCallback(
+        () => invoke<MeetingIntelligenceResult | null>("read_meeting_intelligence"),
+        []
+    );
+
+    const clearIntelligence = useCallback(
+        () => invoke<void>("clear_meeting_intelligence"),
+        []
+    );
+
     const pauseSession = useCallback(
         () => invoke<void>("pause_meeting_session"),
         []
@@ -114,6 +134,12 @@ export function useMeeting() {
     const addTranscript = useCallback(
         (entry: TranscriptEntry) =>
             invoke<void>("add_meeting_transcript", { entry }),
+        []
+    );
+
+    const renameSpeaker = useCallback(
+        (request: RenameSpeakerRequest) =>
+            invoke<RenameSpeakerResult>("rename_meeting_speaker", { request }),
         []
     );
 
@@ -172,12 +198,14 @@ export function useMeeting() {
             addTranscript,
             autoDetectAudioBackend,
             clearData,
+            clearIntelligence,
             clearSession,
             detectActiveCall,
             getActiveSession,
             getActiveState,
             getAvailableAudioDevices,
             getConsentState,
+            generateIntelligence,
             getLastCompletedState,
             getLiveCapabilities,
             grantConsent,
@@ -187,8 +215,10 @@ export function useMeeting() {
             readActionItems,
             readDecisions,
             readDiagnostics,
+            readIntelligence,
             readNotes,
             readSummary,
+            renameSpeaker,
             resumeSession,
             revokeConsent,
             startSession,
@@ -201,12 +231,14 @@ export function useMeeting() {
             addTranscript,
             autoDetectAudioBackend,
             clearData,
+            clearIntelligence,
             clearSession,
             detectActiveCall,
             getActiveSession,
             getActiveState,
             getAvailableAudioDevices,
             getConsentState,
+            generateIntelligence,
             getLastCompletedState,
             getLiveCapabilities,
             grantConsent,
@@ -216,8 +248,10 @@ export function useMeeting() {
             readActionItems,
             readDecisions,
             readDiagnostics,
+            readIntelligence,
             readNotes,
             readSummary,
+            renameSpeaker,
             resumeSession,
             revokeConsent,
             startSession,

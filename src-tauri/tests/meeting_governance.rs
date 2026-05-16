@@ -26,10 +26,11 @@ use personal_ai_lib::meeting::{
         CapturePipelineConfig, ClearMeetingDataRequest, ExportedMeeting, MeetingAudioChunk,
         MeetingAudioFileTranscriptionRequest, MeetingAudioSegment, MeetingCapabilityReadiness,
         MeetingCapabilityState, MeetingClearScope, MeetingConfig, MeetingSessionMode,
-        MeetingStatus, MeetingSttAdapterStatus, TranscriptEntry, TranscriptSource,
-        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingStatus, MeetingSttAdapterStatus, SpeakerAttributionMethod, TranscriptEntry,
+        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
         DEFAULT_CAPTURE_MAX_CONSECUTIVE_TRANSCRIPTION_FAILURES,
         DEFAULT_CAPTURE_MAX_SEGMENTS_PER_SESSION, DEFAULT_CAPTURE_SEGMENT_DURATION_MS,
+        REMOTE_SPEAKER_1_ID,
     },
     wasapi_loopback::wait_for_startup_result,
 };
@@ -1917,12 +1918,15 @@ async fn captured_segment_uses_non_diarization_speaker_label() {
         .expect("captured segment transcription");
 
     let state = runtime.get_active_state().expect("state");
-    assert_eq!(state.transcript[0].speaker, "unknown");
+    assert_eq!(state.transcript[0].speaker, "Speaker 1");
     assert_eq!(
         state.transcript[0].speaker_id.as_deref(),
-        Some("capture_segment_1")
+        Some(REMOTE_SPEAKER_1_ID)
     );
-    assert_ne!(state.transcript[0].speaker, "Speaker 1");
+    assert_eq!(
+        state.transcript[0].speaker_attribution_method,
+        SpeakerAttributionMethod::SourceDefault
+    );
     assert_ne!(state.transcript[0].speaker, "speaker_1");
 }
 
@@ -2480,6 +2484,7 @@ fn follow_up_sender_is_not_supported() {
         action_items: Vec::new(),
         decisions: Vec::new(),
         notes: Vec::new(),
+        intelligence: None,
         metadata: serde_json::json!({}),
     };
 

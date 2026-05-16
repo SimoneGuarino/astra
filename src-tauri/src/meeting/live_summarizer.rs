@@ -55,7 +55,7 @@ impl LiveSummarizer {
             // MVP: aggregate speaker names + simple topic extraction
             let speakers: Vec<&str> = recent
                 .iter()
-                .map(|e| e.speaker.as_str())
+                .map(TranscriptEntry::speaker_display_name)
                 .collect::<std::collections::HashSet<_>>()
                 .iter()
                 .copied()

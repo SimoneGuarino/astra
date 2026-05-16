@@ -18,9 +18,10 @@ use super::{
         CaptureHealth, ClearMeetingDataRequest, ConsentState, DecisionLogEntry, ExportedMeeting,
         MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
         MeetingCapabilityReadiness, MeetingCapabilityState, MeetingConfig, MeetingDataClearPreview,
-        MeetingDataClearResult, MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode,
-        MeetingSessionState, MeetingStatus, TranscriptEntry, TranscriptSource,
-        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingDataClearResult, MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
+        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode, MeetingSessionState,
+        MeetingStatus, RenameSpeakerRequest, RenameSpeakerResult, SpeakerAttributionMethod,
+        TranscriptEntry, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
 };
 use crate::stt_client::SttClient;
@@ -559,6 +560,9 @@ impl MeetingRuntime {
                         created_at: now,
                         speaker,
                         speaker_id,
+                        speaker_label: None,
+                        speaker_confidence: None,
+                        speaker_attribution_method: SpeakerAttributionMethod::Unknown,
                         text: transcript_text,
                         confidence: 0.0,
                         start_ms: input.start_ms,
@@ -671,6 +675,26 @@ impl MeetingRuntime {
         Ok(registry.get_active_state().diagnostics.clone())
     }
 
+    pub fn generate_intelligence(
+        &self,
+        options: MeetingIntelligenceGenerationOptions,
+    ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        registry.generate_intelligence(options)
+    }
+
+    pub fn read_intelligence(
+        &self,
+    ) -> Result<Option<MeetingIntelligenceResult>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_intelligence().cloned())
+    }
+
+    pub fn clear_intelligence(&self) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        registry.clear_intelligence()
+    }
+
     pub fn pause_session(&self) -> Result<(), MeetingRuntimeError> {
         {
             let mut registry = self.lock_registry()?;
@@ -740,6 +764,14 @@ impl MeetingRuntime {
         entry.stt_model = None;
         entry.audio_backend = None;
         registry.add_transcript(entry)
+    }
+
+    pub fn rename_speaker(
+        &self,
+        request: RenameSpeakerRequest,
+    ) -> Result<RenameSpeakerResult, MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        registry.rename_speaker(&request.speaker_id, &request.display_name)
     }
 
     pub fn add_action_item(&self, item: ActionItem) -> Result<(), MeetingRuntimeError> {
@@ -876,7 +908,7 @@ impl MeetingRuntime {
                 },
             ),
             system_audio_capture: readiness(
-                "meeting.audio.capture.system_audio",
+                "meeting.audio.capture.system",
                 wasapi_available,
                 if wasapi_available {
                     MeetingCapabilityState::Ready
@@ -1768,8 +1800,10 @@ fn capture_status_message(
 mod tests {
     use super::*;
     use crate::meeting::types::{
-        ActionItemStatus, ClearMeetingDataRequest, MeetingClearScope, MeetingStatus,
-        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        ActionItemStatus, ClearMeetingDataRequest, MeetingClearScope,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus, MeetingStatus,
+        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE, LOCAL_USER_SPEAKER_ID,
+        REMOTE_SPEAKER_1_ID,
     };
     use crate::meeting::{
         segment_writer::{SegmentWriter, SegmentWriterConfig},
@@ -1919,6 +1953,12 @@ mod tests {
         let transcript = state.transcript.first().expect("transcript entry");
 
         assert_eq!(transcript.source, TranscriptSource::Manual);
+        assert_eq!(transcript.speaker_id.as_deref(), Some("manual_simone"));
+        assert_eq!(transcript.speaker_label.as_deref(), Some("Simone"));
+        assert_eq!(
+            transcript.speaker_attribution_method,
+            SpeakerAttributionMethod::UserAssigned
+        );
         assert!(transcript.stt_model.is_none());
         assert!(transcript.audio_backend.is_none());
         assert!(state
@@ -1998,8 +2038,21 @@ mod tests {
         assert_eq!(state.transcript.len(), 2);
         assert_eq!(state.transcript[0].source, TranscriptSource::SystemAudio);
         assert_eq!(state.transcript[0].start_ms, Some(0));
+        assert_eq!(
+            state.transcript[0].speaker_id.as_deref(),
+            Some(REMOTE_SPEAKER_1_ID)
+        );
+        assert_eq!(
+            state.transcript[0].speaker_label.as_deref(),
+            Some("Speaker 1")
+        );
         assert_eq!(state.transcript[1].source, TranscriptSource::Microphone);
         assert_eq!(state.transcript[1].start_ms, Some(2_000));
+        assert_eq!(
+            state.transcript[1].speaker_id.as_deref(),
+            Some(LOCAL_USER_SPEAKER_ID)
+        );
+        assert_eq!(state.transcript[1].speaker_label.as_deref(), Some("You"));
         assert!(state.notes.iter().any(|note| {
             note.evidence_segment_ids
                 .contains(&state.transcript[0].segment_id)
@@ -2008,6 +2061,262 @@ mod tests {
             note.evidence_segment_ids
                 .contains(&state.transcript[1].segment_id)
         }));
+    }
+
+    #[tokio::test]
+    async fn speaker_rename_updates_metadata_without_mutating_transcript_text() {
+        let root = temp_root();
+        let runtime =
+            MeetingRuntime::with_file_transcriber(root.clone(), Arc::new(FixedTranscriber));
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+
+        let storage_dir = root.join(".astra").join("meetings");
+        let samples = vec![100_i16; 16_000];
+        let writer = SegmentWriter::new(
+            storage_dir,
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let segment = writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("system segment");
+        runtime
+            .transcribe_captured_segment(segment, None, false)
+            .await
+            .expect("system transcription");
+
+        let before = runtime.get_active_state().expect("active state");
+        let original_text = before.transcript[0].text.clone();
+        let original_segment_id = before.transcript[0].segment_id.clone();
+        assert_eq!(
+            before.transcript[0].speaker_id.as_deref(),
+            Some(REMOTE_SPEAKER_1_ID)
+        );
+
+        let result = runtime
+            .rename_speaker(RenameSpeakerRequest {
+                speaker_id: REMOTE_SPEAKER_1_ID.to_string(),
+                display_name: "Marco".to_string(),
+            })
+            .expect("rename speaker");
+        assert_eq!(result.renamed_entries, 1);
+
+        let after = runtime.get_active_state().expect("active state");
+        let entry = after.transcript.first().expect("transcript");
+        assert_eq!(entry.text, original_text);
+        assert_eq!(entry.segment_id, original_segment_id);
+        assert_eq!(entry.speaker_label.as_deref(), Some("Marco"));
+        assert_eq!(
+            entry.speaker_attribution_method,
+            SpeakerAttributionMethod::UserAssigned
+        );
+        assert_eq!(after.speaker_rename_count, 1);
+        assert!(after.notes.iter().any(|note| {
+            note.content.contains("[Marco]")
+                && note.evidence_segment_ids.contains(&original_segment_id)
+        }));
+        assert!(after
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "speaker_label_renamed"));
+    }
+
+    #[test]
+    fn generated_intelligence_is_evidence_linked_and_does_not_mutate_transcript() {
+        let runtime = MeetingRuntime::new(temp_root());
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        runtime
+            .add_transcript(TranscriptEntry::sourced(
+                "",
+                TranscriptSource::Manual,
+                "Simone",
+                "We decided to generate transcript-backed intelligence. Please update src/types/meeting.ts by tomorrow. What blocker remains if cargo test fails?",
+                0.9,
+            ))
+            .expect("add transcript");
+
+        let before = runtime.get_active_state().expect("before");
+        let before_text = before.transcript[0].text.clone();
+        let before_segment_id = before.transcript[0].segment_id.clone();
+        let result = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .expect("generate intelligence");
+
+        assert_eq!(result.status, MeetingIntelligenceStatus::Generated);
+        assert!(result
+            .summary
+            .as_ref()
+            .is_some_and(|summary| { summary.evidence_segment_ids.contains(&before_segment_id) }));
+        assert!(result
+            .action_items
+            .iter()
+            .all(|item| !item.evidence_segment_ids.is_empty()));
+        assert!(result.follow_up_draft.is_some());
+        assert!(result.technical_recap.as_ref().is_some_and(|recap| recap
+            .mentioned_files
+            .iter()
+            .any(|file| file.ends_with(".ts"))));
+
+        let after = runtime.get_active_state().expect("after");
+        assert_eq!(after.transcript[0].text, before_text);
+        assert_eq!(after.transcript[0].segment_id, before_segment_id);
+        assert!(after.intelligence.is_some());
+    }
+
+    #[test]
+    fn clear_intelligence_removes_derived_intelligence_only() {
+        let runtime = MeetingRuntime::new(temp_root());
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        runtime
+            .add_transcript(TranscriptEntry::sourced(
+                "",
+                TranscriptSource::Manual,
+                "Simone",
+                "Please follow up on the meeting intelligence export.",
+                0.9,
+            ))
+            .expect("add transcript");
+        runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .expect("generate intelligence");
+        runtime.clear_intelligence().expect("clear intelligence");
+
+        let state = runtime.get_active_state().expect("state");
+        assert!(!state.transcript.is_empty());
+        assert!(state.intelligence.is_none());
+        assert!(state
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "meeting_intelligence_cleared"));
+    }
+
+    #[tokio::test]
+    async fn speaker_rename_refreshes_intelligence_labels_without_changing_evidence() {
+        let root = temp_root();
+        let runtime =
+            MeetingRuntime::with_file_transcriber(root.clone(), Arc::new(FixedTranscriber));
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let storage_dir = root.join(".astra").join("meetings");
+        let samples = vec![100_i16; 16_000];
+        let writer = SegmentWriter::new(
+            storage_dir,
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let segment = writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("system segment");
+        runtime
+            .transcribe_captured_segment(segment, None, false)
+            .await
+            .expect("system transcription");
+
+        let generated = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .expect("generate intelligence");
+        let evidence_before = generated
+            .timeline
+            .first()
+            .expect("timeline")
+            .evidence_segment_ids
+            .clone();
+        runtime
+            .rename_speaker(RenameSpeakerRequest {
+                speaker_id: REMOTE_SPEAKER_1_ID.to_string(),
+                display_name: "Marco".to_string(),
+            })
+            .expect("rename");
+
+        let after = runtime
+            .read_intelligence()
+            .expect("read")
+            .expect("intelligence");
+        assert_eq!(
+            after
+                .timeline
+                .first()
+                .and_then(|item| item.speaker_display_name.as_deref()),
+            Some("Marco")
+        );
+        assert_eq!(
+            after
+                .timeline
+                .first()
+                .expect("timeline")
+                .evidence_segment_ids,
+            evidence_before
+        );
+    }
+
+    #[test]
+    fn initial_diagnostics_report_truthful_speaker_attribution_limits() {
+        let root = temp_root();
+        let mut registry = SessionRegistry::new(root);
+        registry
+            .start(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+                MeetingStatus::Ready,
+                false,
+                Some("manual session".to_string()),
+            )
+            .expect("registry start");
+        let state = registry.get_active_state();
+        assert!(state
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "diarization_unsupported"));
+        assert!(state
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "speaker_attribution_source_default"));
     }
 
     #[test]

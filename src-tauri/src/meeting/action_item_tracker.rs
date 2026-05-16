@@ -55,8 +55,11 @@ impl ActionItemTracker {
                 || entry.text.contains("let's");
 
             if is_action || has_verb {
-                let assignee =
-                    ActionItemTracker::extract_assignee(&entry.text, entry.speaker.clone());
+                let assignee = ActionItemTracker::extract_assignee(
+                    &entry.text,
+                    entry.speaker_display_name().to_string(),
+                    entry.speaker_id.clone(),
+                );
                 let deadline = ActionItemTracker::extract_deadline(&entry.text);
                 let status = ActionItemStatus::Open;
                 let now = Utc::now();
@@ -100,7 +103,11 @@ impl ActionItemTracker {
     }
 
     /// Extract assignee from text and current speaker as fallback
-    fn extract_assignee(text: &str, default_speaker: String) -> Option<ParticipantInfo> {
+    fn extract_assignee(
+        text: &str,
+        default_speaker: String,
+        default_speaker_id: Option<String>,
+    ) -> Option<ParticipantInfo> {
         // Try to find @mention or name pattern
         if text.contains('@') {
             let parts: Vec<&str> = text.split('@').collect();
@@ -119,7 +126,7 @@ impl ActionItemTracker {
         }
         Some(ParticipantInfo {
             name: default_speaker,
-            speaker_id: None,
+            speaker_id: default_speaker_id,
         })
     }
 

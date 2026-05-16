@@ -63,8 +63,10 @@ use meeting::{
         ActionItem, CallInfo, CaptureBackend, ClearMeetingDataRequest, ConsentState,
         DecisionLogEntry, ExportedMeeting, MeetingAudioFileTranscriptionRequest,
         MeetingAudioFileTranscriptionResult, MeetingConfig, MeetingDataClearPreview,
-        MeetingDataClearResult, MeetingDiagnostic, MeetingLiveCapabilitySnapshot, MeetingSession,
-        MeetingSessionMode, MeetingSessionState, NoteEntry, SummaryEntry, TranscriptEntry,
+        MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
+        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode, MeetingSessionState,
+        NoteEntry, RenameSpeakerRequest, RenameSpeakerResult, SummaryEntry, TranscriptEntry,
     },
 };
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
@@ -1746,7 +1748,7 @@ fn meeting_capture_start_confirmation_details(
     serde_json::json!({
         "method": "meeting_control_center_explicit_start",
         "user_initiated": true,
-        "operation": "start_wasapi_capture",
+        "operation": "start_capture",
         "tool_name": tool_name,
         "platform": platform,
         "capture_backend": config.capture_backend,
@@ -1779,6 +1781,51 @@ fn confirmed_meeting_capability_permission_check(
             },
         )
         .map(|_| ())
+}
+
+fn meeting_capture_preflight_tool_names(config: &MeetingConfig) -> Vec<&'static str> {
+    let mut tool_names = vec!["meeting.audio.capture"];
+    if config.capture_options.system_audio {
+        tool_names.push("meeting.audio.capture.system");
+    }
+    if config.capture_options.microphone {
+        tool_names.push("meeting.audio.capture.microphone");
+    }
+    tool_names
+}
+
+fn meeting_segment_transcription_requested(config: &MeetingConfig) -> bool {
+    config.live_transcription_enabled || config.capture_options.segment_transcription
+}
+
+fn confirmed_meeting_start_preflight_checks(
+    desktop_agent: &DesktopAgentRuntime,
+    platform: &str,
+    config: &MeetingConfig,
+) -> Result<(), String> {
+    for tool_name in meeting_capture_preflight_tool_names(config) {
+        confirmed_meeting_capability_permission_check(
+            desktop_agent,
+            tool_name,
+            meeting_capture_preflight_params(platform, config),
+            meeting_capture_start_confirmation_details(platform, config, tool_name),
+        )?;
+    }
+
+    if meeting_segment_transcription_requested(config) {
+        confirmed_meeting_capability_permission_check(
+            desktop_agent,
+            "meeting.transcription.segment",
+            meeting_segment_transcription_preflight_params(platform, config),
+            meeting_capture_start_confirmation_details(
+                platform,
+                config,
+                "meeting.transcription.segment",
+            ),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn confirmed_governed_meeting_command<F>(
@@ -1856,6 +1903,22 @@ fn meeting_from_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T
         .map_err(|error| format!("meeting result deserialization failed: {error}"))
 }
 
+fn emit_meeting_update_events(window: &WebviewWindow, events: &[&str]) {
+    let payload = serde_json::json!({
+        "source": "meeting_runtime",
+        "metadata_only": true,
+    });
+    if let Some(main_window) = window.app_handle().get_webview_window("main") {
+        for event in events {
+            let _ = main_window.emit(event, payload.clone());
+        }
+    } else {
+        for event in events {
+            let _ = window.emit(event, payload.clone());
+        }
+    }
+}
+
 #[tauri::command]
 fn get_meeting_consent_state(state: State<'_, AssistantRuntime>) -> Result<ConsentState, String> {
     let meeting = state.meeting_runtime.clone();
@@ -1870,6 +1933,7 @@ fn get_meeting_consent_state(state: State<'_, AssistantRuntime>) -> Result<Conse
 
 #[tauri::command]
 fn grant_meeting_consent(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     app_name: String,
 ) -> Result<ConsentState, String> {
@@ -1886,11 +1950,17 @@ fn grant_meeting_consent(
             )
         },
     )?;
-    meeting_from_value(value)
+    let consent = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-session-updated", "meeting-diagnostics-updated"],
+    );
+    Ok(consent)
 }
 
 #[tauri::command]
 fn revoke_meeting_consent(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     app_name: String,
 ) -> Result<ConsentState, String> {
@@ -1907,11 +1977,17 @@ fn revoke_meeting_consent(
             )
         },
     )?;
-    meeting_from_value(value)
+    let consent = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-session-updated", "meeting-diagnostics-updated"],
+    );
+    Ok(consent)
 }
 
 #[tauri::command]
 fn start_meeting_session(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     platform: String,
     config: MeetingConfig,
@@ -1930,28 +2006,7 @@ fn start_meeting_session(
     let value =
         governed_meeting_command(state.inner(), "meeting.session.start", params, move || {
             if config.session_mode == MeetingSessionMode::RealCapture {
-                confirmed_meeting_capability_permission_check(
-                    &desktop_agent,
-                    "meeting.audio.capture",
-                    meeting_capture_preflight_params(&platform, &config),
-                    meeting_capture_start_confirmation_details(
-                        &platform,
-                        &config,
-                        "meeting.audio.capture",
-                    ),
-                )?;
-                if config.live_transcription_enabled {
-                    confirmed_meeting_capability_permission_check(
-                        &desktop_agent,
-                        "meeting.transcription.segment",
-                        meeting_segment_transcription_preflight_params(&platform, &config),
-                        meeting_capture_start_confirmation_details(
-                            &platform,
-                            &config,
-                            "meeting.transcription.segment",
-                        ),
-                    )?;
-                }
+                confirmed_meeting_start_preflight_checks(&desktop_agent, &platform, &config)?;
             }
             meeting_value(
                 meeting
@@ -1959,7 +2014,16 @@ fn start_meeting_session(
                     .map_err(|error| error.to_string())?,
             )
         })?;
-    meeting_from_value(value)
+    let session = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-session-updated",
+            "meeting-diagnostics-updated",
+            "meeting-artifacts-updated",
+        ],
+    );
+    Ok(session)
 }
 
 #[tauri::command]
@@ -2127,6 +2191,152 @@ fn read_meeting_diagnostics(
 }
 
 #[tauri::command]
+fn generate_meeting_intelligence(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+    options: MeetingIntelligenceGenerationOptions,
+) -> Result<MeetingIntelligenceResult, String> {
+    let meeting = state.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "artifact_types_requested": [
+            "summary",
+            "decisions",
+            "action_items",
+            "open_questions",
+            "risks",
+            "technical_recap",
+            "follow_up_draft",
+            "timeline"
+        ],
+        "use_local_llm_requested": options.use_local_llm,
+        "max_transcript_segments": options.max_transcript_segments,
+        "metadata_only": true,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+        "audit_redacted": true,
+    });
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.intelligence.generate",
+        params,
+        move || {
+            meeting_value(
+                meeting
+                    .generate_intelligence(options)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    let result = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(result)
+}
+
+#[tauri::command]
+fn read_meeting_intelligence(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Option<MeetingIntelligenceResult>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.intelligence.read",
+        serde_json::json!({
+            "read": "meeting_intelligence",
+            "data_category": "meeting_intelligence",
+            "metadata_only": true,
+            "transcript_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_intelligence()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn clear_meeting_intelligence(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.intelligence.clear",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+        }),
+        move || {
+            meeting
+                .clear_intelligence()
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true, "metadata_only": true }))
+        },
+    )?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn draft_meeting_followup(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<Option<MeetingFollowUpDraft>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.followup.draft",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+            "send_email": false,
+        }),
+        move || {
+            let existing = meeting
+                .read_intelligence()
+                .map_err(|error| error.to_string())?;
+            let intelligence = match existing {
+                Some(result) if result.follow_up_draft.is_some() => result,
+                _ => meeting
+                    .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+                    .map_err(|error| error.to_string())?,
+            };
+            meeting_value(intelligence.follow_up_draft)
+        },
+    )?;
+    let draft = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(draft)
+}
+
+#[tauri::command]
 fn get_meeting_live_capabilities(
     state: State<'_, AssistantRuntime>,
 ) -> Result<MeetingLiveCapabilitySnapshot, String> {
@@ -2147,7 +2357,10 @@ fn get_meeting_live_capabilities(
 }
 
 #[tauri::command]
-fn pause_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), String> {
+fn pause_meeting_session(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<(), String> {
     let meeting = state.meeting_runtime.clone();
     governed_meeting_command(
         state.inner(),
@@ -2158,11 +2371,18 @@ fn pause_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), Strin
             Ok(serde_json::json!({ "ok": true }))
         },
     )?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-session-updated", "meeting-diagnostics-updated"],
+    );
     Ok(())
 }
 
 #[tauri::command]
-fn resume_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), String> {
+fn resume_meeting_session(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<(), String> {
     let meeting = state.meeting_runtime.clone();
     governed_meeting_command(
         state.inner(),
@@ -2175,11 +2395,18 @@ fn resume_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), Stri
             Ok(serde_json::json!({ "ok": true }))
         },
     )?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-session-updated", "meeting-diagnostics-updated"],
+    );
     Ok(())
 }
 
 #[tauri::command]
-fn stop_meeting_session(state: State<'_, AssistantRuntime>) -> Result<ExportedMeeting, String> {
+fn stop_meeting_session(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<ExportedMeeting, String> {
     let meeting = state.meeting_runtime.clone();
     let value = governed_meeting_command(
         state.inner(),
@@ -2187,11 +2414,22 @@ fn stop_meeting_session(state: State<'_, AssistantRuntime>) -> Result<ExportedMe
         serde_json::json!({}),
         move || meeting_value(meeting.stop_session().map_err(|error| error.to_string())?),
     )?;
-    meeting_from_value(value)
+    let exported = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-session-updated",
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(exported)
 }
 
 #[tauri::command]
 fn add_meeting_transcript(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     entry: TranscriptEntry,
 ) -> Result<(), String> {
@@ -2207,11 +2445,54 @@ fn add_meeting_transcript(
             Ok(serde_json::json!({ "ok": true }))
         },
     )?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-session-updated",
+        ],
+    );
     Ok(())
 }
 
 #[tauri::command]
+fn rename_meeting_speaker(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+    request: RenameSpeakerRequest,
+) -> Result<RenameSpeakerResult, String> {
+    let meeting = state.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "speaker_id": request.speaker_id.clone(),
+        "display_name_length": request.display_name.trim().chars().count(),
+        "metadata_only": true,
+        "transcript_text_included": false,
+    });
+    let value =
+        governed_meeting_command(state.inner(), "meeting.speaker.rename", params, move || {
+            meeting_value(
+                meeting
+                    .rename_speaker(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        })?;
+    let result = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(result)
+}
+
+#[tauri::command]
 async fn transcribe_meeting_audio_file(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     request: MeetingAudioFileTranscriptionRequest,
 ) -> Result<MeetingAudioFileTranscriptionResult, String> {
@@ -2237,11 +2518,21 @@ async fn transcribe_meeting_audio_file(
             },
         )
         .await?;
-    meeting_from_value(value)
+    let result = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(result)
 }
 
 #[tauri::command]
 fn add_meeting_action_item(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     item: ActionItem,
 ) -> Result<(), String> {
@@ -2262,11 +2553,16 @@ fn add_meeting_action_item(
             Ok(serde_json::json!({ "ok": true }))
         },
     )?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-artifacts-updated", "meeting-session-updated"],
+    );
     Ok(())
 }
 
 #[tauri::command]
 fn add_meeting_decision(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     entry: DecisionLogEntry,
 ) -> Result<(), String> {
@@ -2286,11 +2582,18 @@ fn add_meeting_decision(
             Ok(serde_json::json!({ "ok": true }))
         },
     )?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-artifacts-updated", "meeting-session-updated"],
+    );
     Ok(())
 }
 
 #[tauri::command]
-fn clear_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), String> {
+fn clear_meeting_session(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<(), String> {
     let meeting = state.meeting_runtime.clone();
     governed_meeting_command(
         state.inner(),
@@ -2303,6 +2606,15 @@ fn clear_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), Strin
             Ok(serde_json::json!({ "ok": true }))
         },
     )?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-session-updated",
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
     Ok(())
 }
 
@@ -2381,6 +2693,7 @@ fn preview_clear_meeting_data(
 
 #[tauri::command]
 fn clear_meeting_data(
+    window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     request: ClearMeetingDataRequest,
 ) -> Result<MeetingDataClearResult, String> {
@@ -2405,7 +2718,17 @@ fn clear_meeting_data(
             )
         },
     )?;
-    meeting_from_value(value)
+    let result = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-session-updated",
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -2478,6 +2801,52 @@ mod tests {
     }
 
     #[test]
+    fn meeting_capture_preflight_tools_follow_selected_sources() {
+        let mut config = test_real_capture_config();
+
+        config.capture_options.system_audio = true;
+        config.capture_options.microphone = false;
+        assert_eq!(
+            meeting_capture_preflight_tool_names(&config),
+            vec!["meeting.audio.capture", "meeting.audio.capture.system"]
+        );
+
+        config.capture_options.system_audio = false;
+        config.capture_options.microphone = true;
+        assert_eq!(
+            meeting_capture_preflight_tool_names(&config),
+            vec!["meeting.audio.capture", "meeting.audio.capture.microphone"]
+        );
+
+        config.capture_options.system_audio = true;
+        config.capture_options.microphone = true;
+        assert_eq!(
+            meeting_capture_preflight_tool_names(&config),
+            vec![
+                "meeting.audio.capture",
+                "meeting.audio.capture.system",
+                "meeting.audio.capture.microphone"
+            ]
+        );
+    }
+
+    #[test]
+    fn meeting_segment_transcription_request_matches_live_or_capture_option() {
+        let mut config = test_real_capture_config();
+
+        config.live_transcription_enabled = false;
+        config.capture_options.segment_transcription = false;
+        assert!(!meeting_segment_transcription_requested(&config));
+
+        config.capture_options.segment_transcription = true;
+        assert!(meeting_segment_transcription_requested(&config));
+
+        config.capture_options.segment_transcription = false;
+        config.live_transcription_enabled = true;
+        assert!(meeting_segment_transcription_requested(&config));
+    }
+
+    #[test]
     #[cfg(target_os = "windows")]
     fn real_capture_preflight_accepts_direct_confirmation_for_audio_capture() {
         let (runtime, root) = test_desktop_agent_runtime("astra_audio_capture_confirmed");
@@ -2496,6 +2865,69 @@ mod tests {
             event.tool_name == "meeting.audio.capture"
                 && event.status == "direct_confirmation_accepted"
         }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn meeting_start_preflight_checks_segment_when_capture_option_enabled_without_live_flag() {
+        let (runtime, root) = test_desktop_agent_runtime("astra_segment_option_preflight");
+        let mut config = test_real_capture_config();
+        config.live_transcription_enabled = false;
+        config.capture_options.system_audio = true;
+        config.capture_options.microphone = false;
+        config.capture_options.segment_transcription = true;
+
+        confirmed_meeting_start_preflight_checks(&runtime, "teams", &config)
+            .expect("start preflight checks");
+
+        let events = runtime.recent_audit_events(30);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.audio.capture"
+                && event.status == "direct_confirmation_accepted"
+        }));
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.audio.capture.system"
+                && event.status == "direct_confirmation_accepted"
+        }));
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.transcription.segment"
+                && event.status == "direct_confirmation_accepted"
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.tool_name == "meeting.audio.capture.microphone"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn meeting_start_preflight_checks_both_source_specific_capture_tools_for_dual_capture() {
+        let (runtime, root) = test_desktop_agent_runtime("astra_dual_source_preflight");
+        let mut config = test_real_capture_config();
+        config.live_transcription_enabled = false;
+        config.capture_options.system_audio = true;
+        config.capture_options.microphone = true;
+        config.capture_options.segment_transcription = false;
+
+        confirmed_meeting_start_preflight_checks(&runtime, "teams", &config)
+            .expect("start preflight checks");
+
+        let events = runtime.recent_audit_events(30);
+        for tool_name in [
+            "meeting.audio.capture",
+            "meeting.audio.capture.system",
+            "meeting.audio.capture.microphone",
+        ] {
+            assert!(events.iter().any(|event| {
+                event.tool_name == tool_name && event.status == "direct_confirmation_accepted"
+            }));
+        }
+        assert!(!events
+            .iter()
+            .any(|event| event.tool_name == "meeting.transcription.segment"));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2648,11 +3080,16 @@ pub fn run() {
             read_meeting_action_items,
             read_meeting_decisions,
             read_meeting_diagnostics,
+            generate_meeting_intelligence,
+            read_meeting_intelligence,
+            clear_meeting_intelligence,
+            draft_meeting_followup,
             get_meeting_live_capabilities,
             pause_meeting_session,
             resume_meeting_session,
             stop_meeting_session,
             add_meeting_transcript,
+            rename_meeting_speaker,
             transcribe_meeting_audio_file,
             add_meeting_action_item,
             add_meeting_decision,

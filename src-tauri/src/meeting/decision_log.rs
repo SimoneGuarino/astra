@@ -63,7 +63,7 @@ impl DecisionLog {
                     decision: entry.text.clone(),
                     rationale: Self::extract_rationale(&entry.text),
                     made_by: Some(ParticipantInfo {
-                        name: entry.speaker.clone(),
+                        name: entry.speaker_display_name().to_string(),
                         speaker_id: entry.speaker_id.clone(),
                     }),
                     evidence_segment_ids: vec![entry.segment_id.clone()],

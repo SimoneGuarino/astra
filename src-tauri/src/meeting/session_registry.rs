@@ -2,7 +2,9 @@
 
 use super::types::*;
 use super::{
-    action_item_tracker::ActionItemTracker, decision_log::DecisionLog,
+    action_item_tracker::ActionItemTracker,
+    decision_log::DecisionLog,
+    intelligence_engine::{MeetingIntelligenceEngine, MeetingIntelligenceInput},
     live_summarizer::LiveSummarizer,
 };
 use chrono::Utc;
@@ -57,6 +59,7 @@ fn save_partial_state(
         "summary_count": state.summary.len(),
         "action_items_count": state.action_items.len(),
         "decisions_count": state.decisions.len(),
+        "intelligence_present": state.intelligence.is_some(),
     }))
     .map_err(|error| MeetingRuntimeError::SerializationError {
         message: format!("serialize meeting partial state failed: {error}"),
@@ -121,6 +124,9 @@ impl SessionRegistry {
             action_items: Vec::new(),
             decisions: Vec::new(),
             notes: Vec::new(),
+            intelligence: None,
+            speakers: default_session_speakers(),
+            speaker_rename_count: 0,
             status: initial_status,
             paused_from: None,
             diagnostics: initial_session_diagnostics(&session),
@@ -253,6 +259,7 @@ impl SessionRegistry {
             action_items: completed_state.action_items.clone(),
             decisions: completed_state.decisions.clone(),
             notes: completed_state.notes.clone(),
+            intelligence: completed_state.intelligence.clone(),
             metadata: json!({
                 "capture_backend": completed_state.session.config.capture_backend,
                 "transcription_model": completed_state.session.config.transcription_model,
@@ -260,6 +267,8 @@ impl SessionRegistry {
                 "session_mode": completed_state.session.session_mode,
                 "capture_active": false,
                 "capture_backend_status": completed_state.session.capture_backend_status,
+                "speakers": completed_state.speakers,
+                "speaker_rename_count": completed_state.speaker_rename_count,
             }),
         })
     }
@@ -281,6 +290,8 @@ impl SessionRegistry {
         if entry.created_at.timestamp_millis() == 0 {
             entry.created_at = entry.timestamp;
         }
+        apply_source_default_speaker(&mut self.active_state.speakers, &mut entry);
+        self.active_state.intelligence = None;
         self.active_state.transcript.push(entry.clone());
         self.active_state.transcript.sort_by(transcript_order);
         self.derive_artifacts_from_transcript(&entry);
@@ -357,6 +368,129 @@ impl SessionRegistry {
 
     pub fn get_notes(&self) -> &[NoteEntry] {
         &self.active_state.notes
+    }
+
+    pub fn get_intelligence(&self) -> Option<&MeetingIntelligenceResult> {
+        if self.active_session.is_some() {
+            self.active_state.intelligence.as_ref()
+        } else {
+            self.last_completed_state
+                .as_ref()
+                .and_then(|state| state.intelligence.as_ref())
+        }
+    }
+
+    pub fn generate_intelligence(
+        &mut self,
+        options: MeetingIntelligenceGenerationOptions,
+    ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let storage_dir = self.storage_dir.clone();
+        let target = self.current_or_completed_state_mut()?;
+        if target.transcript.is_empty() {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "meeting intelligence requires transcript evidence".to_string(),
+            });
+        }
+
+        target.diagnostics.push(MeetingDiagnostic {
+            code: "meeting_intelligence_generation_started".to_string(),
+            severity: MeetingDiagnosticSeverity::Info,
+            message: "Meeting intelligence generation started; transcript text is not written to audit logs".to_string(),
+            created_at: Utc::now(),
+        });
+
+        let input = MeetingIntelligenceInput {
+            session_id: target.session.session_id.clone(),
+            transcript_entries: target.transcript.clone(),
+            speakers: target.speakers.clone(),
+            generation_options: options.clone(),
+        };
+        let result = MeetingIntelligenceEngine::generate_with_llm_json_or_rule_based(
+            input,
+            None,
+            Some(&target.session.config.transcription_model),
+        )?;
+
+        target.intelligence = Some(result.clone());
+        target.last_updated_at = Utc::now();
+        target.diagnostics.push(MeetingDiagnostic {
+            code: match result.status {
+                MeetingIntelligenceStatus::Generated => "meeting_intelligence_generated",
+                MeetingIntelligenceStatus::Degraded => "meeting_intelligence_degraded",
+                MeetingIntelligenceStatus::Failed => "meeting_intelligence_failed",
+                MeetingIntelligenceStatus::Idle | MeetingIntelligenceStatus::Generating => {
+                    "meeting_intelligence_status"
+                }
+            }
+            .to_string(),
+            severity: if result.status == MeetingIntelligenceStatus::Generated {
+                MeetingDiagnosticSeverity::Info
+            } else {
+                MeetingDiagnosticSeverity::Warning
+            },
+            message: format!(
+                "Meeting intelligence generated from {} transcript segment(s); fallback_used={}; audit_redacted=true; transcript_text_logged=false",
+                result.source_transcript_segment_count,
+                result.diagnostics.fallback_used
+            ),
+            created_at: Utc::now(),
+        });
+        save_partial_state(&storage_dir, target)?;
+        Ok(result)
+    }
+
+    pub fn clear_intelligence(&mut self) -> Result<(), MeetingRuntimeError> {
+        let storage_dir = self.storage_dir.clone();
+        let target = self.current_or_completed_state_mut()?;
+        target.intelligence = None;
+        target.last_updated_at = Utc::now();
+        target.diagnostics.push(MeetingDiagnostic {
+            code: "meeting_intelligence_cleared".to_string(),
+            severity: MeetingDiagnosticSeverity::Info,
+            message: "Generated meeting intelligence artifacts were cleared; transcript text was not changed".to_string(),
+            created_at: Utc::now(),
+        });
+        save_partial_state(&storage_dir, target)
+    }
+
+    pub fn rename_speaker(
+        &mut self,
+        speaker_id: &str,
+        display_name: &str,
+    ) -> Result<RenameSpeakerResult, MeetingRuntimeError> {
+        let speaker_id = speaker_id.trim();
+        let display_name = normalize_speaker_display_name(display_name)?;
+        if speaker_id.is_empty() {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "speaker_id is required".to_string(),
+            });
+        }
+
+        let result = if self.active_session.is_some() {
+            let result =
+                rename_speaker_in_state(&mut self.active_state, speaker_id, &display_name)?;
+            save_partial_state(&self.storage_dir, &self.active_state)?;
+            result
+        } else if let Some(state) = self.last_completed_state.as_mut() {
+            let result = rename_speaker_in_state(state, speaker_id, &display_name)?;
+            save_partial_state(&self.storage_dir, state)?;
+            result
+        } else {
+            return Err(MeetingRuntimeError::NoActiveSession);
+        };
+
+        Ok(result)
+    }
+
+    fn current_or_completed_state_mut(
+        &mut self,
+    ) -> Result<&mut MeetingSessionState, MeetingRuntimeError> {
+        if self.active_session.is_some() {
+            return Ok(&mut self.active_state);
+        }
+        self.last_completed_state
+            .as_mut()
+            .ok_or(MeetingRuntimeError::NoActiveSession)
     }
 
     pub fn clear(&mut self) {
@@ -533,8 +667,8 @@ impl SessionRegistry {
                 timestamp: now,
                 created_at: now,
                 content: format!(
-                    "{}: {}",
-                    entry.speaker,
+                    "[{}] {}",
+                    entry.speaker_display_name(),
                     entry.text.chars().take(220).collect::<String>()
                 ),
                 evidence_segment_ids: vec![entry.segment_id.clone()],
@@ -581,6 +715,9 @@ fn idle_state() -> MeetingSessionState {
         action_items: Vec::new(),
         decisions: Vec::new(),
         notes: Vec::new(),
+        intelligence: None,
+        speakers: default_session_speakers(),
+        speaker_rename_count: 0,
         status: MeetingStatus::Idle,
         paused_from: None,
         diagnostics: Vec::new(),
@@ -614,8 +751,264 @@ fn transcript_source_rank(source: TranscriptSource) -> u8 {
     }
 }
 
+fn default_session_speakers() -> Vec<SpeakerLabel> {
+    [
+        TranscriptSource::Microphone,
+        TranscriptSource::SystemAudio,
+        TranscriptSource::Manual,
+        TranscriptSource::ImportedFile,
+        TranscriptSource::Unknown,
+    ]
+    .into_iter()
+    .map(SpeakerLabel::source_default)
+    .collect()
+}
+
+fn normalize_speaker_display_name(display_name: &str) -> Result<String, MeetingRuntimeError> {
+    let normalized = display_name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "speaker display_name is required".to_string(),
+        });
+    }
+    if normalized.chars().count() > 80 {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "speaker display_name must be 80 characters or fewer".to_string(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn speaker_label_for_entry(
+    speakers: &mut Vec<SpeakerLabel>,
+    entry: &TranscriptEntry,
+) -> SpeakerLabel {
+    let requested_name = entry.speaker.trim();
+    let requested_is_explicit = !requested_name.is_empty()
+        && !matches!(
+            requested_name.to_ascii_lowercase().as_str(),
+            "unknown" | "stt" | "manual" | "imported"
+        );
+
+    let mut default_label = SpeakerLabel::source_default(entry.source);
+    if matches!(
+        entry.source,
+        TranscriptSource::Manual | TranscriptSource::ImportedFile
+    ) && requested_is_explicit
+    {
+        default_label.speaker_id = stable_user_assigned_speaker_id(entry.source, requested_name);
+        default_label.display_name = requested_name.to_string();
+        default_label.confidence = 1.0;
+        default_label.attribution_method = SpeakerAttributionMethod::UserAssigned;
+    }
+
+    if let Some(existing) = speakers
+        .iter()
+        .find(|speaker| speaker.speaker_id == default_label.speaker_id)
+        .cloned()
+    {
+        return existing;
+    }
+
+    speakers.push(default_label.clone());
+    default_label
+}
+
+fn apply_source_default_speaker(speakers: &mut Vec<SpeakerLabel>, entry: &mut TranscriptEntry) {
+    let speaker = speaker_label_for_entry(speakers, entry);
+    entry.speaker_id = Some(speaker.speaker_id.clone());
+    entry.speaker = speaker.display_name.clone();
+    entry.speaker_label = Some(speaker.display_name.clone());
+    entry.speaker_confidence = Some(speaker.confidence);
+    entry.speaker_attribution_method = speaker.attribution_method;
+}
+
+fn stable_user_assigned_speaker_id(source: TranscriptSource, display_name: &str) -> String {
+    let source_prefix = match source {
+        TranscriptSource::Manual => "manual",
+        TranscriptSource::ImportedFile => "imported",
+        TranscriptSource::Microphone => "microphone",
+        TranscriptSource::SystemAudio => "system",
+        TranscriptSource::Unknown => "unknown",
+    };
+    let normalized = display_name
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    format!(
+        "{source_prefix}_{}",
+        normalized.chars().take(48).collect::<String>()
+    )
+}
+
+fn rename_speaker_in_state(
+    state: &mut MeetingSessionState,
+    speaker_id: &str,
+    display_name: &str,
+) -> Result<RenameSpeakerResult, MeetingRuntimeError> {
+    let Some(speaker_index) = state
+        .speakers
+        .iter()
+        .position(|speaker| speaker.speaker_id == speaker_id)
+    else {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: format!("unknown speaker_id: {speaker_id}"),
+        });
+    };
+
+    state.speakers[speaker_index].display_name = display_name.to_string();
+    state.speakers[speaker_index].confidence = 1.0;
+    state.speakers[speaker_index].attribution_method = SpeakerAttributionMethod::UserAssigned;
+    let speaker = state.speakers[speaker_index].clone();
+
+    let mut renamed_entries = 0;
+    for entry in &mut state.transcript {
+        if entry.speaker_id.as_deref() == Some(speaker_id) {
+            entry.speaker = speaker.display_name.clone();
+            entry.speaker_label = Some(speaker.display_name.clone());
+            entry.speaker_confidence = Some(speaker.confidence);
+            entry.speaker_attribution_method = SpeakerAttributionMethod::UserAssigned;
+            renamed_entries += 1;
+        }
+    }
+
+    for item in &mut state.action_items {
+        if let Some(assignee) = item.assignee.as_mut() {
+            if assignee.speaker_id.as_deref() == Some(speaker_id) {
+                assignee.name = speaker.display_name.clone();
+            }
+        }
+    }
+
+    for decision in &mut state.decisions {
+        if let Some(made_by) = decision.made_by.as_mut() {
+            if made_by.speaker_id.as_deref() == Some(speaker_id) {
+                made_by.name = speaker.display_name.clone();
+            }
+        }
+    }
+
+    if let Some(intelligence) = state.intelligence.as_mut() {
+        rename_speaker_in_intelligence(intelligence, speaker_id, &speaker.display_name);
+    }
+
+    for note in &mut state.notes {
+        if note.evidence_segment_ids.len() == 1 {
+            if let Some(source_entry) = state
+                .transcript
+                .iter()
+                .find(|entry| entry.segment_id == note.evidence_segment_ids[0])
+            {
+                note.content = format!(
+                    "[{}] {}",
+                    source_entry.speaker_display_name(),
+                    source_entry.text.chars().take(220).collect::<String>()
+                );
+            }
+        }
+    }
+
+    state.speaker_rename_count = state.speaker_rename_count.saturating_add(1);
+    state.last_updated_at = Utc::now();
+    state.diagnostics.push(MeetingDiagnostic {
+        code: "speaker_label_renamed".to_string(),
+        severity: MeetingDiagnosticSeverity::Info,
+        message: format!(
+            "Speaker label metadata was renamed for speaker_id {}; transcript text was not changed; display_name_length={}",
+            speaker_id,
+            display_name.chars().count()
+        ),
+        created_at: Utc::now(),
+    });
+
+    Ok(RenameSpeakerResult {
+        speaker,
+        renamed_entries,
+    })
+}
+
+fn rename_speaker_in_intelligence(
+    intelligence: &mut MeetingIntelligenceResult,
+    speaker_id: &str,
+    display_name: &str,
+) {
+    for decision in &mut intelligence.decisions {
+        if decision.made_by_speaker_id.as_deref() == Some(speaker_id) {
+            decision.made_by_display_name = Some(display_name.to_string());
+        }
+    }
+    for item in &mut intelligence.action_items {
+        if item.assignee_speaker_id.as_deref() == Some(speaker_id) {
+            item.assignee_display_name = Some(display_name.to_string());
+        }
+    }
+    for question in &mut intelligence.open_questions {
+        if question.asked_by_speaker_id.as_deref() == Some(speaker_id) {
+            question.asked_by_display_name = Some(display_name.to_string());
+        }
+    }
+    for item in &mut intelligence.timeline {
+        if item.speaker_id.as_deref() == Some(speaker_id) {
+            item.speaker_display_name = Some(display_name.to_string());
+        }
+    }
+    intelligence.diagnostics.warnings.push(format!(
+        "Speaker display labels were refreshed after metadata rename for speaker_id {speaker_id}; evidence IDs were unchanged"
+    ));
+}
+
 fn initial_session_diagnostics(session: &MeetingSession) -> Vec<MeetingDiagnostic> {
     let mut diagnostics = Vec::new();
+    diagnostics.push(MeetingDiagnostic {
+        code: "ui_live_updates_event_subscription_supported".to_string(),
+        severity: MeetingDiagnosticSeverity::Info,
+        message: "Meeting UI subscribes to meeting update events and uses bounded polling while the panel is open".to_string(),
+        created_at: Utc::now(),
+    });
+    diagnostics.push(MeetingDiagnostic {
+        code: "transcript_ordering_chronological_storage_newest_first_ui".to_string(),
+        severity: MeetingDiagnosticSeverity::Info,
+        message:
+            "Meeting transcript is stored chronologically and presented newest-first in the UI"
+                .to_string(),
+        created_at: Utc::now(),
+    });
+    diagnostics.push(MeetingDiagnostic {
+        code: "speaker_attribution_source_default".to_string(),
+        severity: MeetingDiagnosticSeverity::Info,
+        message: "Speaker attribution uses source defaults: microphone is You, system audio is Speaker 1; real diarization is not claimed".to_string(),
+        created_at: Utc::now(),
+    });
+    diagnostics.push(MeetingDiagnostic {
+        code: "diarization_unsupported".to_string(),
+        severity: MeetingDiagnosticSeverity::Info,
+        message: "True speaker diarization is unsupported in this milestone; user speaker renames are metadata only".to_string(),
+        created_at: Utc::now(),
+    });
     if session.session_mode == MeetingSessionMode::Manual {
         diagnostics.push(MeetingDiagnostic {
             code: "manual_fallback_active".to_string(),

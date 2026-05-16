@@ -174,6 +174,77 @@ impl TranscriptSource {
     }
 }
 
+pub const LOCAL_USER_SPEAKER_ID: &str = "local_user";
+pub const REMOTE_SPEAKER_1_ID: &str = "remote_speaker_1";
+pub const MANUAL_SPEAKER_ID: &str = "manual_entry";
+pub const IMPORTED_SPEAKER_ID: &str = "imported_file";
+pub const UNKNOWN_SPEAKER_ID: &str = "unknown_speaker";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeakerAttributionMethod {
+    SourceDefault,
+    UserAssigned,
+    HeuristicTurnSplit,
+    DiarizationModel,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeakerLabel {
+    pub speaker_id: String,
+    pub display_name: String,
+    pub source: TranscriptSource,
+    pub confidence: f32,
+    pub attribution_method: SpeakerAttributionMethod,
+}
+
+impl SpeakerLabel {
+    pub fn source_default(source: TranscriptSource) -> Self {
+        let (speaker_id, display_name, confidence, method) = match source {
+            TranscriptSource::Microphone => (
+                LOCAL_USER_SPEAKER_ID,
+                "You",
+                1.0,
+                SpeakerAttributionMethod::SourceDefault,
+            ),
+            TranscriptSource::SystemAudio => (
+                REMOTE_SPEAKER_1_ID,
+                "Speaker 1",
+                0.65,
+                SpeakerAttributionMethod::SourceDefault,
+            ),
+            TranscriptSource::Manual => (
+                MANUAL_SPEAKER_ID,
+                "Manual",
+                0.9,
+                SpeakerAttributionMethod::SourceDefault,
+            ),
+            TranscriptSource::ImportedFile => (
+                IMPORTED_SPEAKER_ID,
+                "Imported",
+                0.8,
+                SpeakerAttributionMethod::SourceDefault,
+            ),
+            TranscriptSource::Unknown => (
+                UNKNOWN_SPEAKER_ID,
+                "Unknown",
+                0.0,
+                SpeakerAttributionMethod::Unknown,
+            ),
+        };
+
+        Self {
+            speaker_id: speaker_id.to_string(),
+            display_name: display_name.to_string(),
+            source,
+            confidence,
+            attribution_method: method,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureBackend {
@@ -545,6 +616,12 @@ pub struct MeetingSessionState {
     pub action_items: Vec<ActionItem>,
     pub decisions: Vec<DecisionLogEntry>,
     pub notes: Vec<NoteEntry>,
+    #[serde(default)]
+    pub intelligence: Option<MeetingIntelligenceResult>,
+    #[serde(default)]
+    pub speakers: Vec<SpeakerLabel>,
+    #[serde(default)]
+    pub speaker_rename_count: u64,
     pub status: MeetingStatus,
     #[serde(default)]
     pub paused_from: Option<MeetingStatus>,
@@ -552,6 +629,260 @@ pub struct MeetingSessionState {
     pub diagnostics: Vec<MeetingDiagnostic>,
     pub started_at: DateTime<Utc>,
     pub last_updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum ArtifactGenerator {
+    RuleBased,
+    LocalLlm { provider: String, model: String },
+    Hybrid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingIntelligenceStatus {
+    #[default]
+    Idle,
+    Generating,
+    Generated,
+    Degraded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskSeverity {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FollowUpTone {
+    #[default]
+    Professional,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingIntelligenceGenerationOptions {
+    #[serde(default)]
+    pub use_local_llm: bool,
+    #[serde(default = "default_intelligence_max_segments")]
+    pub max_transcript_segments: usize,
+}
+
+impl Default for MeetingIntelligenceGenerationOptions {
+    fn default() -> Self {
+        Self {
+            use_local_llm: false,
+            max_transcript_segments: default_intelligence_max_segments(),
+        }
+    }
+}
+
+fn default_intelligence_max_segments() -> usize {
+    120
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSummary {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub text: String,
+    #[serde(default)]
+    pub bullets: Vec<String>,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingDecision {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub decision: String,
+    #[serde(default)]
+    pub rationale: Option<String>,
+    #[serde(default)]
+    pub made_by_speaker_id: Option<String>,
+    #[serde(default)]
+    pub made_by_display_name: Option<String>,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    pub confidence: f32,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingActionItem {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub task: String,
+    #[serde(default)]
+    pub assignee_speaker_id: Option<String>,
+    #[serde(default)]
+    pub assignee_display_name: Option<String>,
+    #[serde(default)]
+    pub due_date: Option<String>,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    pub confidence: f32,
+    pub status: ActionItemStatus,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingOpenQuestion {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub question: String,
+    #[serde(default)]
+    pub asked_by_speaker_id: Option<String>,
+    #[serde(default)]
+    pub asked_by_display_name: Option<String>,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    pub confidence: f32,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingRisk {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub risk: String,
+    pub severity: RiskSeverity,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    pub confidence: f32,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTechnicalRecap {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub bullets: Vec<String>,
+    #[serde(default)]
+    pub mentioned_files: Vec<String>,
+    #[serde(default)]
+    pub mentioned_commands: Vec<String>,
+    #[serde(default)]
+    pub mentioned_errors: Vec<String>,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    pub confidence: f32,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingFollowUpDraft {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    #[serde(default)]
+    pub session_id: String,
+    pub subject: String,
+    pub body: String,
+    pub tone: FollowUpTone,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    pub confidence: f32,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+    pub generator: ArtifactGenerator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingTimelineItem {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub id: String,
+    pub timestamp_ms: Option<u64>,
+    #[serde(default)]
+    pub speaker_id: Option<String>,
+    #[serde(default)]
+    pub speaker_display_name: Option<String>,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingIntelligenceDiagnostics {
+    pub status: MeetingIntelligenceStatus,
+    pub generator: ArtifactGenerator,
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub model_unavailable_reason: Option<String>,
+    pub json_parse_failed: bool,
+    pub invalid_evidence_ids: usize,
+    pub rejected_artifact_count: usize,
+    pub fallback_used: bool,
+    pub transcript_text_logged: bool,
+    pub audit_redacted: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingIntelligenceResult {
+    pub session_id: String,
+    pub status: MeetingIntelligenceStatus,
+    #[serde(default)]
+    pub summary: Option<MeetingSummary>,
+    #[serde(default)]
+    pub decisions: Vec<MeetingDecision>,
+    #[serde(default)]
+    pub action_items: Vec<MeetingActionItem>,
+    #[serde(default)]
+    pub open_questions: Vec<MeetingOpenQuestion>,
+    #[serde(default)]
+    pub risks: Vec<MeetingRisk>,
+    #[serde(default)]
+    pub technical_recap: Option<MeetingTechnicalRecap>,
+    #[serde(default)]
+    pub follow_up_draft: Option<MeetingFollowUpDraft>,
+    #[serde(default)]
+    pub timeline: Vec<MeetingTimelineItem>,
+    pub diagnostics: MeetingIntelligenceDiagnostics,
+    #[serde(default)]
+    pub source_transcript_segment_count: usize,
+    #[serde(default = "utc_now")]
+    pub generated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -568,6 +899,12 @@ pub struct TranscriptEntry {
     pub speaker: String,
     #[serde(default)]
     pub speaker_id: Option<String>,
+    #[serde(default)]
+    pub speaker_label: Option<String>,
+    #[serde(default)]
+    pub speaker_confidence: Option<f32>,
+    #[serde(default)]
+    pub speaker_attribution_method: SpeakerAttributionMethod,
     pub text: String,
     pub confidence: f32,
     #[serde(default)]
@@ -683,6 +1020,8 @@ pub struct ExportedMeeting {
     pub action_items: Vec<ActionItem>,
     pub decisions: Vec<DecisionLogEntry>,
     pub notes: Vec<NoteEntry>,
+    #[serde(default)]
+    pub intelligence: Option<MeetingIntelligenceResult>,
     pub metadata: serde_json::Value,
 }
 
@@ -1036,6 +1375,18 @@ pub struct MeetingAudioFileTranscriptionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameSpeakerRequest {
+    pub speaker_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameSpeakerResult {
+    pub speaker: SpeakerLabel,
+    pub renamed_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingAudioFileTranscriptionResult {
     pub transcript_added: bool,
     pub transcript_index: usize,
@@ -1127,6 +1478,9 @@ impl TranscriptEntry {
             created_at: now,
             speaker: speaker.into(),
             speaker_id: None,
+            speaker_label: None,
+            speaker_confidence: None,
+            speaker_attribution_method: SpeakerAttributionMethod::Unknown,
             text: text.into(),
             confidence,
             start_ms: None,
@@ -1134,6 +1488,14 @@ impl TranscriptEntry {
             stt_model: None,
             audio_backend: None,
         }
+    }
+
+    pub fn speaker_display_name(&self) -> &str {
+        self.speaker_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| self.speaker.trim())
     }
 }
 

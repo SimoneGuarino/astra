@@ -18,6 +18,12 @@ export type MeetingStatus =
 
 export type MeetingSessionMode = "manual" | "real_capture";
 export type TranscriptSource = "microphone" | "system_audio" | "manual" | "imported_file" | "unknown";
+export type SpeakerAttributionMethod =
+    | "source_default"
+    | "user_assigned"
+    | "heuristic_turn_split"
+    | "diarization_model"
+    | "unknown";
 
 export type MeetingCaptureOptions = {
     system_audio: boolean;
@@ -28,6 +34,14 @@ export type MeetingCaptureOptions = {
 export type ParticipantInfo = {
     name: string;
     speaker_id?: string | null;
+};
+
+export type SpeakerLabel = {
+    speaker_id: string;
+    display_name: string;
+    source: TranscriptSource;
+    confidence: number;
+    attribution_method: SpeakerAttributionMethod;
 };
 
 export type MeetingConfig = {
@@ -62,12 +76,25 @@ export type TranscriptEntry = {
     created_at: string;
     speaker: string;
     speaker_id?: string | null;
+    speaker_label?: string | null;
+    speaker_confidence?: number | null;
+    speaker_attribution_method?: SpeakerAttributionMethod;
     text: string;
     confidence: number;
     start_ms?: number | null;
     end_ms?: number | null;
     stt_model?: string | null;
     audio_backend?: string | null;
+};
+
+export type RenameSpeakerRequest = {
+    speaker_id: string;
+    display_name: string;
+};
+
+export type RenameSpeakerResult = {
+    speaker: SpeakerLabel;
+    renamed_entries: number;
 };
 
 export type MeetingAudioFileTranscriptionRequest = {
@@ -155,11 +182,162 @@ export type MeetingSessionState = {
     action_items: ActionItem[];
     decisions: DecisionLogEntry[];
     notes: NoteEntry[];
+    intelligence?: MeetingIntelligenceResult | null;
+    speakers: SpeakerLabel[];
+    speaker_rename_count: number;
     status: MeetingStatus;
     paused_from?: MeetingStatus | null;
     diagnostics: MeetingDiagnostic[];
     started_at: string;
     last_updated_at: string;
+};
+
+export type ArtifactGenerator =
+    | { type: "rule_based" }
+    | { type: "local_llm"; provider: string; model: string }
+    | { type: "hybrid" };
+
+export type MeetingIntelligenceStatus =
+    | "idle"
+    | "generating"
+    | "generated"
+    | "degraded"
+    | "failed";
+
+export type RiskSeverity = "low" | "medium" | "high";
+export type FollowUpTone = "professional";
+
+export type MeetingIntelligenceGenerationOptions = {
+    use_local_llm: boolean;
+    max_transcript_segments: number;
+};
+
+export type MeetingSummary = {
+    id: string;
+    session_id: string;
+    text: string;
+    bullets: string[];
+    evidence_segment_ids: string[];
+    generated_at: string;
+    generator: ArtifactGenerator;
+    confidence: number;
+};
+
+export type MeetingDecision = {
+    id: string;
+    session_id: string;
+    decision: string;
+    rationale?: string | null;
+    made_by_speaker_id?: string | null;
+    made_by_display_name?: string | null;
+    evidence_segment_ids: string[];
+    confidence: number;
+    generated_at: string;
+    generator: ArtifactGenerator;
+};
+
+export type MeetingActionItem = {
+    id: string;
+    session_id: string;
+    task: string;
+    assignee_speaker_id?: string | null;
+    assignee_display_name?: string | null;
+    due_date?: string | null;
+    evidence_segment_ids: string[];
+    confidence: number;
+    status: ActionItemStatus;
+    generated_at: string;
+    generator: ArtifactGenerator;
+};
+
+export type MeetingOpenQuestion = {
+    id: string;
+    session_id: string;
+    question: string;
+    asked_by_speaker_id?: string | null;
+    asked_by_display_name?: string | null;
+    evidence_segment_ids: string[];
+    confidence: number;
+    generated_at: string;
+    generator: ArtifactGenerator;
+};
+
+export type MeetingRisk = {
+    id: string;
+    session_id: string;
+    risk: string;
+    severity: RiskSeverity;
+    evidence_segment_ids: string[];
+    confidence: number;
+    generated_at: string;
+    generator: ArtifactGenerator;
+};
+
+export type MeetingTechnicalRecap = {
+    id: string;
+    session_id: string;
+    bullets: string[];
+    mentioned_files: string[];
+    mentioned_commands: string[];
+    mentioned_errors: string[];
+    evidence_segment_ids: string[];
+    confidence: number;
+    generated_at: string;
+    generator: ArtifactGenerator;
+};
+
+export type MeetingFollowUpDraft = {
+    id: string;
+    session_id: string;
+    subject: string;
+    body: string;
+    tone: FollowUpTone;
+    evidence_segment_ids: string[];
+    confidence: number;
+    generated_at: string;
+    generator: ArtifactGenerator;
+};
+
+export type MeetingTimelineItem = {
+    id: string;
+    timestamp_ms?: number | null;
+    speaker_id?: string | null;
+    speaker_display_name?: string | null;
+    title: string;
+    detail: string;
+    evidence_segment_ids: string[];
+};
+
+export type MeetingIntelligenceDiagnostics = {
+    status: MeetingIntelligenceStatus;
+    generator: ArtifactGenerator;
+    model_provider?: string | null;
+    model_name?: string | null;
+    model_unavailable_reason?: string | null;
+    json_parse_failed: boolean;
+    invalid_evidence_ids: number;
+    rejected_artifact_count: number;
+    fallback_used: boolean;
+    transcript_text_logged: boolean;
+    audit_redacted: boolean;
+    warnings: string[];
+    generated_at: string;
+};
+
+export type MeetingIntelligenceResult = {
+    session_id: string;
+    status: MeetingIntelligenceStatus;
+    summary?: MeetingSummary | null;
+    decisions: MeetingDecision[];
+    action_items: MeetingActionItem[];
+    open_questions: MeetingOpenQuestion[];
+    risks: MeetingRisk[];
+    technical_recap?: MeetingTechnicalRecap | null;
+    follow_up_draft?: MeetingFollowUpDraft | null;
+    timeline: MeetingTimelineItem[];
+    diagnostics: MeetingIntelligenceDiagnostics;
+    source_transcript_segment_count: number;
+    generated_at: string;
 };
 
 export type ExportedMeeting = {
@@ -173,6 +351,7 @@ export type ExportedMeeting = {
     action_items: ActionItem[];
     decisions: DecisionLogEntry[];
     notes: NoteEntry[];
+    intelligence?: MeetingIntelligenceResult | null;
     metadata: unknown;
 };
 

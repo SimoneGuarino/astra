@@ -31,6 +31,9 @@ impl PermissionProfile {
                 // DEV-ONLY hardware validation
                 Permission::MeetingAudioCapture,
                 Permission::MeetingTranscriptionSegment,
+                Permission::MeetingIntelligenceGenerate,
+                Permission::MeetingIntelligenceRead,
+                Permission::MeetingIntelligenceClear,
             ],
         }
     }
@@ -61,6 +64,9 @@ mod tests {
 
         assert!(profile.allows(&Permission::MeetingAudioCapture));
         assert!(profile.allows(&Permission::MeetingTranscriptionSegment));
+        assert!(profile.allows(&Permission::MeetingIntelligenceGenerate));
+        assert!(profile.allows(&Permission::MeetingIntelligenceRead));
+        assert!(profile.allows(&Permission::MeetingIntelligenceClear));
         assert!(!profile.allows(&Permission::MeetingTranscriptionLive));
         assert!(!profile.allows(&Permission::MeetingFollowUpSend));
     }

@@ -195,6 +195,9 @@ fn permission_name(permission: &Permission) -> &'static str {
         Permission::MeetingTranscriptionFile => "meeting_transcription_file",
         Permission::MeetingTranscriptionSegment => "meeting_transcription_segment",
         Permission::MeetingTranscriptionLive => "meeting_transcription_live",
+        Permission::MeetingIntelligenceGenerate => "meeting_intelligence_generate",
+        Permission::MeetingIntelligenceRead => "meeting_intelligence_read",
+        Permission::MeetingIntelligenceClear => "meeting_intelligence_clear",
         Permission::MeetingFollowUpSend => "meeting_followup_send",
     }
 }
