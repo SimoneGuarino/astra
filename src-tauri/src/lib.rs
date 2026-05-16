@@ -14,6 +14,7 @@ mod conversation_router;
 mod desktop_agent;
 mod desktop_agent_types;
 mod filesystem_service;
+pub mod meeting;
 mod metrics;
 mod model_assisted_planner;
 mod model_routing;
@@ -56,10 +57,20 @@ use desktop_agent_types::{
     ToolDescriptor,
 };
 use futures_util::StreamExt;
+use meeting::{
+    runtime::MeetingRuntime,
+    types::{
+        ActionItem, CallInfo, CaptureBackend, ClearMeetingDataRequest, ConsentState,
+        DecisionLogEntry, ExportedMeeting, MeetingAudioFileTranscriptionRequest,
+        MeetingAudioFileTranscriptionResult, MeetingConfig, MeetingDataClearPreview,
+        MeetingDataClearResult, MeetingDiagnostic, MeetingLiveCapabilitySnapshot, MeetingSession,
+        MeetingSessionMode, MeetingSessionState, NoteEntry, SummaryEntry, TranscriptEntry,
+    },
+};
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
 use model_routing::resolve_ollama_request;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use speech_events::{
     AssistantErrorEvent, AssistantInterruptedEvent, AssistantRequestFinishedEvent,
     AssistantRequestSettledEvent, AssistantRequestStartedEvent, AudioPlaybackEvent,
@@ -111,6 +122,7 @@ struct AssistantRuntime {
     desktop_agent: DesktopAgentRuntime,
     recent_artifacts: RecentArtifactMemory,
     tts_segment_fingerprints: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    meeting_runtime: MeetingRuntime,
 }
 
 impl AssistantRuntime {
@@ -127,20 +139,22 @@ impl AssistantRuntime {
             );
         }
         audio_files.cleanup_stale_files();
+        let stt_client = SttClient::new(project_root.clone());
 
         Self {
             active_request_id: Arc::new(Mutex::new(None)),
             active_voice_request_id: Arc::new(Mutex::new(None)),
             audio_files,
             metrics: MetricsTracker::new(),
-            stt_client: SttClient::new(project_root.clone()),
+            stt_client: stt_client.clone(),
             tts_client: TtsClient::new(project_root.clone()),
             voice_metrics: VoiceMetricsTracker::new(),
             voice_session: VoiceSessionManager::new(project_root.clone()),
             conversation_history: ConversationHistoryManager::new(),
-            desktop_agent: DesktopAgentRuntime::new(project_root),
+            desktop_agent: DesktopAgentRuntime::new(project_root.clone()),
             recent_artifacts: RecentArtifactMemory::default(),
             tts_segment_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            meeting_runtime: MeetingRuntime::with_stt_client(project_root, stt_client),
         }
     }
 
@@ -1674,6 +1688,909 @@ fn set_expanded_mode(window: WebviewWindow) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+// ========================
+// Meeting Engine Commands
+// ========================
+
+fn governed_meeting_command<F>(
+    runtime: &AssistantRuntime,
+    tool_name: &str,
+    params: serde_json::Value,
+    operation: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce() -> Result<serde_json::Value, String>,
+{
+    runtime.desktop_agent.execute_governed_direct_action(
+        Uuid::new_v4().to_string(),
+        tool_name,
+        params,
+        false,
+        operation,
+    )
+}
+
+fn meeting_capture_preflight_params(platform: &str, config: &MeetingConfig) -> serde_json::Value {
+    serde_json::json!({
+        "platform": platform,
+        "session_mode": config.session_mode,
+        "capture_backend": config.capture_backend,
+        "capture_options": config.capture_options,
+        "metadata_only": true,
+        "raw_audio_included": false,
+        "transcript_text_included": false,
+    })
+}
+
+fn meeting_segment_transcription_preflight_params(
+    platform: &str,
+    config: &MeetingConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "platform": platform,
+        "session_mode": config.session_mode,
+        "capture_backend": config.capture_backend,
+        "capture_options": config.capture_options,
+        "transcription_model": config.transcription_model.clone(),
+        "metadata_only": true,
+        "raw_audio_included": false,
+        "transcript_text_included": false,
+    })
+}
+
+fn meeting_capture_start_confirmation_details(
+    platform: &str,
+    config: &MeetingConfig,
+    tool_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "method": "meeting_control_center_explicit_start",
+        "user_initiated": true,
+        "operation": "start_wasapi_capture",
+        "tool_name": tool_name,
+        "platform": platform,
+        "capture_backend": config.capture_backend,
+        "capture_options": config.capture_options,
+        "raw_audio": "not_included",
+        "transcript_text": "not_included",
+        "metadata_only": true,
+    })
+}
+
+fn confirmed_meeting_capability_permission_check(
+    desktop_agent: &DesktopAgentRuntime,
+    tool_name: &str,
+    params: serde_json::Value,
+    confirmation_details: serde_json::Value,
+) -> Result<(), String> {
+    desktop_agent
+        .execute_confirmed_governed_direct_action(
+            Uuid::new_v4().to_string(),
+            tool_name,
+            params,
+            confirmation_details,
+            || {
+                Ok(serde_json::json!({
+                    "permission_checked": true,
+                    "capability_available": true,
+                    "direct_confirmation": true,
+                    "metadata_only": true,
+                }))
+            },
+        )
+        .map(|_| ())
+}
+
+fn confirmed_governed_meeting_command<F>(
+    runtime: &AssistantRuntime,
+    tool_name: &str,
+    params: serde_json::Value,
+    confirmation_details: serde_json::Value,
+    operation: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce() -> Result<serde_json::Value, String>,
+{
+    runtime
+        .desktop_agent
+        .execute_confirmed_governed_direct_action(
+            Uuid::new_v4().to_string(),
+            tool_name,
+            params,
+            confirmation_details,
+            operation,
+        )
+}
+
+fn safe_audio_extension_hint(audio_path: &str) -> String {
+    let segment = audio_path
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let Some((_, extension)) = segment.rsplit_once('.') else {
+        return "unknown".to_string();
+    };
+    let extension = extension.trim().to_ascii_lowercase();
+    if extension.is_empty()
+        || extension.len() > 16
+        || !extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+    {
+        return "unknown".to_string();
+    }
+    extension
+}
+
+fn meeting_file_transcription_preflight_params(
+    request: &MeetingAudioFileTranscriptionRequest,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id_provided": request
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        "path_provided": !request.audio_path.trim().is_empty(),
+        "extension_hint": safe_audio_extension_hint(&request.audio_path),
+        "audio_path_redacted": true,
+        "speaker_provided": request
+            .speaker
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        "cleanup_after_transcription": request.cleanup_after_transcription,
+        "metadata_only": true,
+    })
+}
+
+fn meeting_value<T: Serialize>(value: T) -> Result<serde_json::Value, String> {
+    serde_json::to_value(value)
+        .map_err(|error| format!("meeting result serialization failed: {error}"))
+}
+
+fn meeting_from_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, String> {
+    serde_json::from_value(value)
+        .map_err(|error| format!("meeting result deserialization failed: {error}"))
+}
+
+#[tauri::command]
+fn get_meeting_consent_state(state: State<'_, AssistantRuntime>) -> Result<ConsentState, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.consent.read",
+        serde_json::json!({}),
+        move || meeting_value(meeting.consent_state().map_err(|error| error.to_string())?),
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn grant_meeting_consent(
+    state: State<'_, AssistantRuntime>,
+    app_name: String,
+) -> Result<ConsentState, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.consent.grant",
+        serde_json::json!({ "app_name": app_name.clone() }),
+        move || {
+            meeting_value(
+                meeting
+                    .grant_consent(&app_name)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn revoke_meeting_consent(
+    state: State<'_, AssistantRuntime>,
+    app_name: String,
+) -> Result<ConsentState, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.consent.revoke",
+        serde_json::json!({ "app_name": app_name.clone() }),
+        move || {
+            meeting_value(
+                meeting
+                    .revoke_consent(&app_name)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn start_meeting_session(
+    state: State<'_, AssistantRuntime>,
+    platform: String,
+    config: MeetingConfig,
+) -> Result<MeetingSession, String> {
+    let meeting = state.meeting_runtime.clone();
+    let desktop_agent = state.desktop_agent.clone();
+    let params = serde_json::json!({
+        "platform": platform.clone(),
+        "capture_backend": config.capture_backend,
+        "transcription_model": config.transcription_model.clone(),
+        "session_mode": config.session_mode,
+        "segment_transcription_enabled": config.capture_options.segment_transcription || config.live_transcription_enabled,
+        "streaming_stt": "unsupported",
+        "capture_options": config.capture_options,
+    });
+    let value =
+        governed_meeting_command(state.inner(), "meeting.session.start", params, move || {
+            if config.session_mode == MeetingSessionMode::RealCapture {
+                confirmed_meeting_capability_permission_check(
+                    &desktop_agent,
+                    "meeting.audio.capture",
+                    meeting_capture_preflight_params(&platform, &config),
+                    meeting_capture_start_confirmation_details(
+                        &platform,
+                        &config,
+                        "meeting.audio.capture",
+                    ),
+                )?;
+                if config.live_transcription_enabled {
+                    confirmed_meeting_capability_permission_check(
+                        &desktop_agent,
+                        "meeting.transcription.segment",
+                        meeting_segment_transcription_preflight_params(&platform, &config),
+                        meeting_capture_start_confirmation_details(
+                            &platform,
+                            &config,
+                            "meeting.transcription.segment",
+                        ),
+                    )?;
+                }
+            }
+            meeting_value(
+                meeting
+                    .start_session(platform, config)
+                    .map_err(|error| error.to_string())?,
+            )
+        })?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn get_active_meeting_session(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Option<MeetingSession>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.read",
+        serde_json::json!({ "read": "active_session" }),
+        move || {
+            meeting_value(
+                meeting
+                    .get_active_session()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn get_active_meeting_state(
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingSessionState, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.read",
+        serde_json::json!({ "read": "active_state", "data_category": "meeting_state" }),
+        move || {
+            meeting_value(
+                meeting
+                    .get_active_state()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn get_last_completed_meeting_state(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Option<MeetingSessionState>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.read",
+        serde_json::json!({ "read": "last_completed_state", "data_category": "meeting_state" }),
+        move || {
+            meeting_value(
+                meeting
+                    .get_last_completed_state()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn list_meeting_transcript(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Vec<TranscriptEntry>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.transcript.list",
+        serde_json::json!({ "read": "transcript", "data_category": "meeting_transcript" }),
+        move || {
+            meeting_value(
+                meeting
+                    .list_transcript()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn read_meeting_notes(state: State<'_, AssistantRuntime>) -> Result<Vec<NoteEntry>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.notes.read",
+        serde_json::json!({ "read": "notes", "data_category": "meeting_notes" }),
+        move || meeting_value(meeting.read_notes().map_err(|error| error.to_string())?),
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn read_meeting_summary(state: State<'_, AssistantRuntime>) -> Result<Vec<SummaryEntry>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.notes.read",
+        serde_json::json!({ "read": "summary", "data_category": "meeting_summary" }),
+        move || meeting_value(meeting.read_summary().map_err(|error| error.to_string())?),
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn read_meeting_action_items(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Vec<ActionItem>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.action_items.read",
+        serde_json::json!({ "read": "action_items", "data_category": "meeting_action_items" }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_action_items()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn read_meeting_decisions(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Vec<DecisionLogEntry>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.decisions.read",
+        serde_json::json!({ "read": "decisions", "data_category": "meeting_decisions" }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_decisions()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn read_meeting_diagnostics(
+    state: State<'_, AssistantRuntime>,
+) -> Result<Vec<MeetingDiagnostic>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.diagnostics.read",
+        serde_json::json!({ "read": "diagnostics", "data_category": "meeting_diagnostics" }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_diagnostics()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn get_meeting_live_capabilities(
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingLiveCapabilitySnapshot, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.read",
+        serde_json::json!({ "read": "live_capabilities", "data_category": "meeting_capability_metadata" }),
+        move || {
+            meeting_value(
+                meeting
+                    .live_capabilities()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn pause_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.session.pause",
+        serde_json::json!({}),
+        move || {
+            meeting.pause_session().map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.session.resume",
+        serde_json::json!({}),
+        move || {
+            meeting
+                .resume_session()
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_meeting_session(state: State<'_, AssistantRuntime>) -> Result<ExportedMeeting, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.stop",
+        serde_json::json!({}),
+        move || meeting_value(meeting.stop_session().map_err(|error| error.to_string())?),
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn add_meeting_transcript(
+    state: State<'_, AssistantRuntime>,
+    entry: TranscriptEntry,
+) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.transcript.add",
+        serde_json::json!({ "speaker": entry.speaker.clone(), "confidence": entry.confidence }),
+        move || {
+            meeting
+                .add_transcript(entry)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn transcribe_meeting_audio_file(
+    state: State<'_, AssistantRuntime>,
+    request: MeetingAudioFileTranscriptionRequest,
+) -> Result<MeetingAudioFileTranscriptionResult, String> {
+    let meeting = state.meeting_runtime.clone();
+    let desktop_agent = state.desktop_agent.clone();
+    let params = meeting_file_transcription_preflight_params(&request);
+    let value = desktop_agent
+        .execute_confirmed_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.transcription.file",
+            params,
+            serde_json::json!({
+                "method": "direct_debug_user_action",
+                "audio_path_redacted": true,
+            }),
+            move || async move {
+                meeting_value(
+                    meeting
+                        .transcribe_audio_file(request)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn add_meeting_action_item(
+    state: State<'_, AssistantRuntime>,
+    item: ActionItem,
+) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.action_item.add",
+        serde_json::json!({
+            "description_length": item.description.chars().count(),
+            "has_assignee": item.assignee.is_some(),
+            "has_deadline": item.deadline.is_some(),
+            "status": item.status,
+        }),
+        move || {
+            meeting
+                .add_action_item(item)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn add_meeting_decision(
+    state: State<'_, AssistantRuntime>,
+    entry: DecisionLogEntry,
+) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.decision.add",
+        serde_json::json!({
+            "decision_length": entry.decision.chars().count(),
+            "rationale_length": entry.rationale.chars().count(),
+            "has_made_by": entry.made_by.is_some(),
+        }),
+        move || {
+            meeting
+                .add_decision(entry)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_meeting_session(state: State<'_, AssistantRuntime>) -> Result<(), String> {
+    let meeting = state.meeting_runtime.clone();
+    governed_meeting_command(
+        state.inner(),
+        "meeting.session.clear",
+        serde_json::json!({ "scope": "runtime_session" }),
+        move || {
+            meeting
+                .clear_runtime_session()
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "ok": true }))
+        },
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+fn detect_active_call(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<Option<CallInfo>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.detect",
+        serde_json::json!({}),
+        move || meeting_value(meeting.detect_active_call()),
+    )?;
+    let call: Option<CallInfo> = meeting_from_value(value)?;
+    if let Some(ref ci) = call {
+        if let Some(w) = window.app_handle().get_webview_window("main") {
+            if ci.is_active_call {
+                let _ = w.emit("meeting-call-detected", ci);
+            }
+        }
+    }
+    Ok(call)
+}
+
+#[tauri::command]
+fn get_available_audio_devices(state: State<'_, AssistantRuntime>) -> Result<Vec<String>, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.audio.devices",
+        serde_json::json!({}),
+        move || {
+            meeting_value(
+                meeting
+                    .available_audio_devices()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn auto_detect_audio_backend(state: State<'_, AssistantRuntime>) -> Result<CaptureBackend, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.audio.backend",
+        serde_json::json!({}),
+        move || meeting_value(meeting.auto_detect_audio_backend()),
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn preview_clear_meeting_data(
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingDataClearPreview, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.clear_data.preview",
+        serde_json::json!({ "scope": "all" }),
+        move || {
+            meeting_value(
+                meeting
+                    .preview_clear_all_data()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn clear_meeting_data(
+    state: State<'_, AssistantRuntime>,
+    request: ClearMeetingDataRequest,
+) -> Result<MeetingDataClearResult, String> {
+    let meeting = state.meeting_runtime.clone();
+    let scope = request.scope.clone();
+    let value = confirmed_governed_meeting_command(
+        state.inner(),
+        "meeting.clear_data",
+        serde_json::json!({
+            "scope": scope,
+            "confirmation": "typed_phrase_required",
+        }),
+        serde_json::json!({
+            "method": "typed_phrase",
+            "phrase_redacted": true,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .clear_all_data(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_real_capture_config() -> MeetingConfig {
+        MeetingConfig {
+            platform: "teams".to_string(),
+            capture_backend: CaptureBackend::Wasapi,
+            transcription_model: "local".to_string(),
+            sample_rate: 16_000,
+            diarization_enabled: false,
+            privacy_mode: "default".to_string(),
+            session_mode: MeetingSessionMode::RealCapture,
+            live_transcription_enabled: true,
+            capture_options: meeting::types::MeetingCaptureOptions {
+                system_audio: true,
+                microphone: false,
+                segment_transcription: true,
+            },
+        }
+    }
+
+    fn test_desktop_agent_runtime(name: &str) -> (DesktopAgentRuntime, PathBuf) {
+        let root = std::env::temp_dir().join(format!("{name}_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        (DesktopAgentRuntime::new(root.clone()), root)
+    }
+
+    #[test]
+    fn file_transcription_preflight_does_not_touch_filesystem_before_governance() {
+        let request = MeetingAudioFileTranscriptionRequest {
+            session_id: Some("session-with-sensitive-id".to_string()),
+            audio_path: r"C:\Users\Simone\layoff_call.wav".to_string(),
+            speaker: Some("speaker".to_string()),
+            cleanup_after_transcription: true,
+        };
+
+        let params = meeting_file_transcription_preflight_params(&request);
+        let serialized = params.to_string();
+
+        assert_eq!(params["session_id_provided"], true);
+        assert_eq!(params["path_provided"], true);
+        assert_eq!(params["extension_hint"], "wav");
+        assert_eq!(params["audio_path_redacted"], true);
+        assert_eq!(params["speaker_provided"], true);
+        assert_eq!(params["cleanup_after_transcription"], true);
+        assert!(!serialized.contains("session-with-sensitive-id"));
+        assert!(!serialized.contains("layoff_call"));
+        assert!(!serialized.contains("Simone"));
+        assert!(!params
+            .as_object()
+            .expect("params object")
+            .contains_key("file_size_bytes"));
+    }
+
+    #[test]
+    fn file_transcription_preflight_rejects_sensitive_extension_shapes() {
+        assert_eq!(safe_audio_extension_hint("meeting.wav"), "wav");
+        assert_eq!(safe_audio_extension_hint("meeting."), "unknown");
+        assert_eq!(
+            safe_audio_extension_hint("meeting.wav?token=secret"),
+            "unknown"
+        );
+        assert_eq!(
+            safe_audio_extension_hint("meeting.verylongextensionname"),
+            "unknown"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn real_capture_preflight_accepts_direct_confirmation_for_audio_capture() {
+        let (runtime, root) = test_desktop_agent_runtime("astra_audio_capture_confirmed");
+        let config = test_real_capture_config();
+
+        confirmed_meeting_capability_permission_check(
+            &runtime,
+            "meeting.audio.capture",
+            meeting_capture_preflight_params("teams", &config),
+            meeting_capture_start_confirmation_details("teams", &config, "meeting.audio.capture"),
+        )
+        .expect("confirmed audio capture preflight");
+
+        let events = runtime.recent_audit_events(20);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.audio.capture"
+                && event.status == "direct_confirmation_accepted"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn real_capture_preflight_accepts_direct_confirmation_for_segment_transcription() {
+        let (runtime, root) = test_desktop_agent_runtime("astra_segment_confirmed");
+        let config = test_real_capture_config();
+
+        confirmed_meeting_capability_permission_check(
+            &runtime,
+            "meeting.transcription.segment",
+            meeting_segment_transcription_preflight_params("teams", &config),
+            meeting_capture_start_confirmation_details(
+                "teams",
+                &config,
+                "meeting.transcription.segment",
+            ),
+        )
+        .expect("confirmed segment transcription preflight");
+
+        let events = runtime.recent_audit_events(20);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.transcription.segment"
+                && event.status == "direct_confirmation_accepted"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn approval_required_capture_preflight_does_not_fail_as_unconfirmed() {
+        let (runtime, root) =
+            test_desktop_agent_runtime("astra_segment_unconfirmed_then_confirmed");
+        let config = test_real_capture_config();
+        let params = meeting_segment_transcription_preflight_params("teams", &config);
+
+        let unconfirmed = runtime.execute_governed_direct_action(
+            "meeting-segment-unconfirmed".into(),
+            "meeting.transcription.segment",
+            params.clone(),
+            false,
+            || Ok(serde_json::json!({"permission_checked": true})),
+        );
+        assert!(unconfirmed
+            .expect_err("unconfirmed segment preflight should require approval")
+            .contains("Approval required"));
+
+        confirmed_meeting_capability_permission_check(
+            &runtime,
+            "meeting.transcription.segment",
+            params,
+            meeting_capture_start_confirmation_details(
+                "teams",
+                &config,
+                "meeting.transcription.segment",
+            ),
+        )
+        .expect("confirmed segment preflight");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_capture_confirmation_audit_is_redacted() {
+        let (runtime, root) = test_desktop_agent_runtime("astra_capture_confirmation_redacted");
+        let config = test_real_capture_config();
+
+        confirmed_meeting_capability_permission_check(
+            &runtime,
+            "meeting.transcription.segment",
+            meeting_segment_transcription_preflight_params("teams", &config),
+            meeting_capture_start_confirmation_details(
+                "teams",
+                &config,
+                "meeting.transcription.segment",
+            ),
+        )
+        .expect("confirmed segment preflight");
+
+        let serialized =
+            serde_json::to_string(&runtime.recent_audit_events(20)).expect("audit json");
+        assert!(serialized.contains("direct_confirmation_accepted"));
+        assert!(serialized.contains("metadata_only"));
+        assert!(serialized.contains("not_included"));
+        assert!(!serialized.contains("sensitive transcript"));
+        assert!(!serialized.contains("raw_audio_samples"));
+        assert!(!serialized.contains(".wav"));
+        assert!(!serialized.contains("C:/"));
+        assert!(!serialized.contains("\\Users\\"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1716,7 +2633,35 @@ pub fn run() {
             close_window,
             start_window_drag,
             set_compact_mode,
-            set_expanded_mode
+            set_expanded_mode,
+            // Meeting engine commands
+            get_meeting_consent_state,
+            grant_meeting_consent,
+            revoke_meeting_consent,
+            start_meeting_session,
+            get_active_meeting_session,
+            get_active_meeting_state,
+            get_last_completed_meeting_state,
+            list_meeting_transcript,
+            read_meeting_notes,
+            read_meeting_summary,
+            read_meeting_action_items,
+            read_meeting_decisions,
+            read_meeting_diagnostics,
+            get_meeting_live_capabilities,
+            pause_meeting_session,
+            resume_meeting_session,
+            stop_meeting_session,
+            add_meeting_transcript,
+            transcribe_meeting_audio_file,
+            add_meeting_action_item,
+            add_meeting_decision,
+            clear_meeting_session,
+            detect_active_call,
+            get_available_audio_devices,
+            auto_detect_audio_backend,
+            preview_clear_meeting_data,
+            clear_meeting_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

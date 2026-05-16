@@ -9,70 +9,299 @@ impl ToolsRegistry {
     pub fn new() -> Self {
         Self {
             tools: vec![
-                ToolDescriptor {
-                    tool_name: "filesystem.read_text".into(),
-                    category: "filesystem".into(),
-                    description: "Read a UTF-8 text file from an allowed root".into(),
-                    required_permissions: vec![Permission::FilesystemRead],
-                    default_risk: RiskLevel::Low,
-                    requires_confirmation: false,
-                },
-                ToolDescriptor {
-                    tool_name: "filesystem.write_text".into(),
-                    category: "filesystem".into(),
-                    description: "Create, overwrite, or append UTF-8 text files inside allowed roots".into(),
-                    required_permissions: vec![Permission::FilesystemWrite],
-                    default_risk: RiskLevel::High,
-                    requires_confirmation: true,
-                },
-                ToolDescriptor {
-                    tool_name: "filesystem.search".into(),
-                    category: "filesystem".into(),
-                    description: "Search files inside an allowed root by filename pattern".into(),
-                    required_permissions: vec![Permission::FilesystemSearch],
-                    default_risk: RiskLevel::Low,
-                    requires_confirmation: false,
-                },
-                ToolDescriptor {
-                    tool_name: "terminal.run".into(),
-                    category: "terminal".into(),
-                    description: "Execute an allowlisted terminal command inside an allowed working directory".into(),
-                    required_permissions: vec![Permission::TerminalSafe],
-                    default_risk: RiskLevel::Medium,
-                    requires_confirmation: false,
-                },
-                ToolDescriptor {
-                    tool_name: "browser.open".into(),
-                    category: "browser".into(),
-                    description: "Open a URL in the system browser".into(),
-                    required_permissions: vec![Permission::BrowserAction],
-                    default_risk: RiskLevel::Medium,
-                    requires_confirmation: false,
-                },
-                ToolDescriptor {
-                    tool_name: "browser.search".into(),
-                    category: "browser".into(),
-                    description: "Run a web search in the default browser".into(),
-                    required_permissions: vec![Permission::BrowserRead],
-                    default_risk: RiskLevel::Low,
-                    requires_confirmation: false,
-                },
-                ToolDescriptor {
-                    tool_name: "screen.analyze".into(),
-                    category: "screen".into(),
-                    description: "Capture or inspect the current screen and ask Astra Vision what is visible".into(),
-                    required_permissions: vec![Permission::DesktopObserve],
-                    default_risk: RiskLevel::Low,
-                    requires_confirmation: false,
-                },
-                ToolDescriptor {
-                    tool_name: "desktop.launch_app".into(),
-                    category: "desktop".into(),
-                    description: "Launch a desktop application or file through the operating system".into(),
-                    required_permissions: vec![Permission::DesktopControl],
-                    default_risk: RiskLevel::Medium,
-                    requires_confirmation: false,
-                },
+                tool(
+                    "filesystem.read_text",
+                    "filesystem",
+                    "Read a UTF-8 text file from an allowed root",
+                    vec![Permission::FilesystemRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "filesystem.write_text",
+                    "filesystem",
+                    "Create, overwrite, or append UTF-8 text files inside allowed roots",
+                    vec![Permission::FilesystemWrite],
+                    RiskLevel::High,
+                    true,
+                ),
+                tool(
+                    "filesystem.search",
+                    "filesystem",
+                    "Search files inside an allowed root by filename pattern",
+                    vec![Permission::FilesystemSearch],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "terminal.run",
+                    "terminal",
+                    "Execute an allowlisted terminal command inside an allowed working directory",
+                    vec![Permission::TerminalSafe],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "browser.open",
+                    "browser",
+                    "Open a URL in the system browser",
+                    vec![Permission::BrowserAction],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "browser.search",
+                    "browser",
+                    "Run a web search in the default browser",
+                    vec![Permission::BrowserRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "screen.analyze",
+                    "screen",
+                    "Capture or inspect the current screen and ask Astra Vision what is visible",
+                    vec![Permission::DesktopObserve],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "desktop.launch_app",
+                    "desktop",
+                    "Launch a desktop application or file through the operating system",
+                    vec![Permission::DesktopControl],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.detect",
+                    "meeting",
+                    "Detect meeting software with explicit confidence, without confirming recording",
+                    vec![Permission::MeetingDetect],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.consent.read",
+                    "meeting",
+                    "Read scoped meeting consent state",
+                    vec![Permission::MeetingConsentRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.consent.grant",
+                    "meeting",
+                    "Grant scoped consent for governed meeting capture/transcription",
+                    vec![Permission::MeetingConsentWrite],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.consent.revoke",
+                    "meeting",
+                    "Revoke scoped consent for governed meeting capture/transcription",
+                    vec![Permission::MeetingConsentWrite],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.read",
+                    "meeting",
+                    "Read active meeting session metadata and state",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.session.start",
+                    "meeting",
+                    "Start a governed meeting session; manual mode is supported, real capture is gated separately",
+                    vec![Permission::MeetingSessionManage],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.manual",
+                    "meeting",
+                    "Start a governed manual meeting session without audio capture",
+                    vec![Permission::MeetingSessionManage],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.pause",
+                    "meeting",
+                    "Pause the active governed meeting session",
+                    vec![Permission::MeetingSessionManage],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.resume",
+                    "meeting",
+                    "Resume the active governed meeting session",
+                    vec![Permission::MeetingSessionManage],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.stop",
+                    "meeting",
+                    "Stop the active governed meeting session and export notes",
+                    vec![Permission::MeetingSessionManage, Permission::MeetingExport],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.clear",
+                    "meeting",
+                    "Clear only the active in-memory meeting session state",
+                    vec![Permission::MeetingSessionManage],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.transcript.add",
+                    "meeting",
+                    "Add a manual transcript entry to an active governed meeting session",
+                    vec![Permission::MeetingTranscriptWrite],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.transcript.list",
+                    "meeting",
+                    "Read active meeting transcript entries with source-channel metadata",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.notes.read",
+                    "meeting",
+                    "Read transcript-derived meeting notes and summaries",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.action_items.read",
+                    "meeting",
+                    "Read transcript-derived meeting action items",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.decisions.read",
+                    "meeting",
+                    "Read transcript-derived meeting decisions",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.diagnostics.read",
+                    "meeting",
+                    "Read truthful meeting capture/transcription diagnostics",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.transcription.file",
+                    "meeting",
+                    "Transcribe a validated local audio file into the active meeting through the existing SttClient",
+                    vec![
+                        Permission::MeetingTranscriptionFile,
+                        Permission::MeetingTranscriptWrite,
+                    ],
+                    RiskLevel::High,
+                    true,
+                ),
+                tool(
+                    "meeting.action_item.add",
+                    "meeting",
+                    "Add an action item to an active governed meeting session",
+                    vec![Permission::MeetingNotesWrite],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.decision.add",
+                    "meeting",
+                    "Add a decision to an active governed meeting session",
+                    vec![Permission::MeetingNotesWrite],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.audio.devices",
+                    "meeting",
+                    "Read available audio device names without starting capture",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.audio.backend",
+                    "meeting",
+                    "Read the platform-preferred audio backend without starting capture",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.clear_data.preview",
+                    "meeting",
+                    "Preview governed meeting runtime state and persisted files that would be cleared",
+                    vec![Permission::MeetingClearData],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.clear_data",
+                    "meeting",
+                    "Clear governed meeting runtime state and persisted meeting files after explicit typed confirmation",
+                    vec![Permission::MeetingClearData],
+                    RiskLevel::High,
+                    true,
+                ),
+                meeting_audio_capture_tool(),
+                meeting_audio_capture_source_tool(
+                    "meeting.audio.capture.system",
+                    "Start governed Windows WASAPI render loopback capture into managed meeting WAV segments",
+                ),
+                meeting_audio_capture_source_tool(
+                    "meeting.audio.capture.microphone",
+                    "Start governed Windows WASAPI microphone capture into managed meeting WAV segments",
+                ),
+                tool(
+                    "meeting.transcription.segment",
+                    "meeting",
+                    "Transcribe governed managed meeting capture segments through the existing SttClient file bridge",
+                    vec![
+                        Permission::MeetingTranscriptionSegment,
+                        Permission::MeetingTranscriptWrite,
+                    ],
+                    RiskLevel::High,
+                    true,
+                ),
+                unavailable_tool(
+                    "meeting.transcription.live",
+                    "Live meeting transcription is not connected to SttClient yet",
+                    vec![Permission::MeetingTranscriptionLive],
+                    RiskLevel::High,
+                    true,
+                ),
+                unavailable_tool(
+                    "meeting.followup.send",
+                    "Follow-up sending is disabled until draft-first outbound integrations are governed",
+                    vec![Permission::MeetingFollowUpSend],
+                    RiskLevel::High,
+                    true,
+                ),
             ],
         }
     }
@@ -86,5 +315,174 @@ impl ToolsRegistry {
             .iter()
             .find(|tool| tool.tool_name == tool_name)
             .cloned()
+    }
+}
+
+fn tool(
+    tool_name: &str,
+    category: &str,
+    description: &str,
+    required_permissions: Vec<Permission>,
+    default_risk: RiskLevel,
+    requires_confirmation: bool,
+) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_name: tool_name.into(),
+        category: category.into(),
+        description: description.into(),
+        required_permissions,
+        default_risk,
+        requires_confirmation,
+        available: true,
+        unavailable_reason: None,
+    }
+}
+
+fn unavailable_tool(
+    tool_name: &str,
+    reason: &str,
+    required_permissions: Vec<Permission>,
+    default_risk: RiskLevel,
+    requires_confirmation: bool,
+) -> ToolDescriptor {
+    ToolDescriptor {
+        tool_name: tool_name.into(),
+        category: "meeting".into(),
+        description: reason.into(),
+        required_permissions,
+        default_risk,
+        requires_confirmation,
+        available: false,
+        unavailable_reason: Some(reason.into()),
+    }
+}
+
+fn meeting_audio_capture_tool() -> ToolDescriptor {
+    #[cfg(target_os = "windows")]
+    {
+        tool(
+            "meeting.audio.capture",
+            "meeting",
+            "Start governed Windows WASAPI loopback capture into managed meeting WAV segments",
+            vec![Permission::MeetingAudioCapture],
+            RiskLevel::High,
+            true,
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        unavailable_tool(
+            "meeting.audio.capture",
+            "Windows WASAPI loopback capture is unavailable on this platform",
+            vec![Permission::MeetingAudioCapture],
+            RiskLevel::High,
+            true,
+        )
+    }
+}
+
+fn meeting_audio_capture_source_tool(tool_name: &str, description: &str) -> ToolDescriptor {
+    #[cfg(target_os = "windows")]
+    {
+        tool(
+            tool_name,
+            "meeting",
+            description,
+            vec![Permission::MeetingAudioCapture],
+            RiskLevel::High,
+            true,
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        unavailable_tool(
+            tool_name,
+            "Windows WASAPI capture is unavailable on this platform",
+            vec![Permission::MeetingAudioCapture],
+            RiskLevel::High,
+            true,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meeting_capabilities_are_granular_and_truthful() {
+        let registry = ToolsRegistry::new();
+
+        let consent_read = registry.get("meeting.consent.read").expect("consent read");
+        let session_start = registry
+            .get("meeting.session.start")
+            .expect("session start");
+        let manual_session = registry
+            .get("meeting.session.manual")
+            .expect("manual session");
+        let capture = registry
+            .get("meeting.audio.capture")
+            .expect("audio capture");
+        let system_capture = registry
+            .get("meeting.audio.capture.system")
+            .expect("system audio capture");
+        let microphone_capture = registry
+            .get("meeting.audio.capture.microphone")
+            .expect("microphone capture");
+        let file_transcription = registry
+            .get("meeting.transcription.file")
+            .expect("file transcription");
+        let transcript_list = registry
+            .get("meeting.transcript.list")
+            .expect("transcript list");
+        let diagnostics_read = registry
+            .get("meeting.diagnostics.read")
+            .expect("diagnostics read");
+        let live_transcription = registry
+            .get("meeting.transcription.live")
+            .expect("live transcription");
+        let segment_transcription = registry
+            .get("meeting.transcription.segment")
+            .expect("segment transcription");
+        let followup = registry.get("meeting.followup.send").expect("followup");
+        let clear_data = registry.get("meeting.clear_data").expect("clear data");
+        let clear_preview = registry
+            .get("meeting.clear_data.preview")
+            .expect("clear data preview");
+
+        assert!(consent_read.available);
+        assert!(session_start.available);
+        assert!(manual_session.available);
+        assert!(file_transcription.available);
+        assert!(transcript_list.available);
+        assert!(diagnostics_read.available);
+        assert_eq!(capture.available, cfg!(target_os = "windows"));
+        assert_eq!(system_capture.available, cfg!(target_os = "windows"));
+        assert_eq!(microphone_capture.available, cfg!(target_os = "windows"));
+        assert!(segment_transcription.available);
+        assert!(!live_transcription.available);
+        assert_eq!(file_transcription.default_risk, RiskLevel::High);
+        assert!(file_transcription.requires_confirmation);
+        assert!(!followup.available);
+        assert_eq!(capture.default_risk, RiskLevel::High);
+        assert!(capture.requires_confirmation);
+        assert_eq!(live_transcription.default_risk, RiskLevel::High);
+        assert!(live_transcription.requires_confirmation);
+        assert!(clear_preview.available);
+        assert_eq!(clear_preview.default_risk, RiskLevel::Low);
+        assert!(!clear_preview.requires_confirmation);
+        assert!(clear_data.available);
+        assert_eq!(clear_data.default_risk, RiskLevel::High);
+        assert!(clear_data.requires_confirmation);
+        if cfg!(target_os = "windows") {
+            assert!(capture.unavailable_reason.is_none());
+        } else {
+            assert_eq!(
+                capture.unavailable_reason.as_deref(),
+                Some("Windows WASAPI loopback capture is unavailable on this platform")
+            );
+        }
     }
 }

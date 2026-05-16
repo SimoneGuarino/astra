@@ -1,0 +1,26 @@
+Read astra-dev-council/agents/09_qa_agent.md, adopt that role, then read astra-dev-council/TASK.md and all required council files before acting.
+
+You are running in HEADLESS execution mode with Claude Code permission mode configured by the launcher.
+
+Do not ask the human for permission to modify authorized council governance files.
+Do not stop after describing what you would do.
+
+Execute your authorized council-governance work now:
+
+1. Read your role file and all required council files.
+2. Create or update your own plan file under astra-dev-council/plans/.
+3. Update AGENT_BOARD.md with your current status, blockers, handoffs, and completion state.
+4. Update CHANGELOG_AGENTIC.md with the council files modified and the rationale.
+5. Update FILE_LOCKS.md only if you take, update, or release a real lock.
+6. Update your role-specific governance file if authorized by your prompt:
+   - Architect: ACTIVE_PLAN.md and DECISIONS.md when planning/architecture-related.
+   - Product: DECISIONS.md and AGENT_BOARD.md when product-scope-related.
+   - Security: SECURITY_REVIEW.md and DECISIONS.md when safety/risk-related.
+   - QA: QA_REPORT.md when validation/regression-related.
+   - Release: CHANGELOG_AGENTIC.md, DECISIONS.md, AGENT_BOARD.md, and lock-resolution notes when release-related.
+7. Do not modify application source code under src/ or src-tauri/ unless ACTIVE_PLAN.md explicitly authorizes an implementation phase for your role.
+8. Do not perform destructive git commands, dependency installation, branch/worktree creation, or writes outside your authorized scope.
+
+Required output:
+- Actually perform the allowed council document updates.
+- Then provide a short final report listing files modified, decisions made, blockers, and next handoff.

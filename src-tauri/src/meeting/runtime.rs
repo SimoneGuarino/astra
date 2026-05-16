@@ -1,0 +1,2074 @@
+pub use super::types::MeetingRuntimeError;
+use super::{
+    audio_capture::{
+        wasapi_backend_available, wasapi_unavailable_reason, AudioCapture, CaptureMetricsReporter,
+        CapturedSegmentQueue,
+    },
+    call_detector::CallDetector,
+    capture_controller::{
+        CaptureController, CaptureControllerConfig, CaptureControllerStartRequest,
+    },
+    note_organizer::NoteOrganizer,
+    privacy_control::PrivacyState,
+    segment_writer::CapturedMeetingSegment,
+    session_registry::SessionRegistry,
+    stt_adapter::{ExistingSttClientMeetingAdapter, MeetingFileTranscriber},
+    types::{
+        normalize_meeting_app_name, ActionItem, CallInfo, CaptureBackend, CaptureControllerState,
+        CaptureHealth, ClearMeetingDataRequest, ConsentState, DecisionLogEntry, ExportedMeeting,
+        MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
+        MeetingCapabilityReadiness, MeetingCapabilityState, MeetingConfig, MeetingDataClearPreview,
+        MeetingDataClearResult, MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode,
+        MeetingSessionState, MeetingStatus, TranscriptEntry, TranscriptSource,
+        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+    },
+};
+use crate::stt_client::SttClient;
+use chrono::Utc;
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+use uuid::Uuid;
+
+pub const MAX_MEETING_TRANSCRIPTION_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
+const SUPPORTED_MEETING_AUDIO_EXTENSIONS: &[&str] = &["wav"];
+
+#[derive(Clone)]
+pub struct MeetingRuntime {
+    registry: Arc<Mutex<SessionRegistry>>,
+    privacy: Arc<Mutex<PrivacyState>>,
+    capture: Arc<Mutex<CaptureController>>,
+    microphone_capture: Arc<Mutex<CaptureController>>,
+    stt_adapter: Arc<dyn MeetingFileTranscriber>,
+    organizer: NoteOrganizer,
+    meeting_storage_dir: PathBuf,
+}
+
+impl MeetingRuntime {
+    pub fn new(project_root: PathBuf) -> Self {
+        Self::with_file_transcriber(
+            project_root,
+            Arc::new(ExistingSttClientMeetingAdapter::new()),
+        )
+    }
+
+    pub fn with_stt_client(project_root: PathBuf, stt_client: SttClient) -> Self {
+        Self::with_file_transcriber(
+            project_root,
+            Arc::new(ExistingSttClientMeetingAdapter::with_stt_client(stt_client)),
+        )
+    }
+
+    pub fn with_file_transcriber(
+        project_root: PathBuf,
+        stt_adapter: Arc<dyn MeetingFileTranscriber>,
+    ) -> Self {
+        let meeting_storage_dir = project_root.join(".astra/meetings");
+        Self {
+            registry: Arc::new(Mutex::new(SessionRegistry::new(project_root.clone()))),
+            privacy: Arc::new(Mutex::new(PrivacyState::new())),
+            capture: Arc::new(Mutex::new(CaptureController::new())),
+            microphone_capture: Arc::new(Mutex::new(CaptureController::new())),
+            stt_adapter,
+            organizer: NoteOrganizer::new(meeting_storage_dir.clone()),
+            meeting_storage_dir,
+        }
+    }
+
+    pub fn consent_state(&self) -> Result<ConsentState, MeetingRuntimeError> {
+        let privacy = self.lock_privacy()?;
+        Ok(ConsentState {
+            given: privacy.consent_given,
+            per_app: privacy.per_app_consent.clone(),
+            global_enabled: privacy.global_enabled,
+        })
+    }
+
+    pub fn grant_consent(&self, app_name: &str) -> Result<ConsentState, MeetingRuntimeError> {
+        let mut privacy = self.lock_privacy()?;
+        privacy.grant_consent(app_name);
+        Ok(ConsentState {
+            given: privacy.consent_given,
+            per_app: privacy.per_app_consent.clone(),
+            global_enabled: privacy.global_enabled,
+        })
+    }
+
+    pub fn revoke_consent(&self, app_name: &str) -> Result<ConsentState, MeetingRuntimeError> {
+        let consent_state = {
+            let mut privacy = self.lock_privacy()?;
+            privacy.revoke_consent(app_name);
+            ConsentState {
+                given: privacy.consent_given,
+                per_app: privacy.per_app_consent.clone(),
+                global_enabled: privacy.global_enabled,
+            }
+        };
+
+        let active_session = {
+            let registry = self.lock_registry()?;
+            registry.get_active_session().cloned()
+        };
+        if let Some(session) = active_session {
+            let consent_still_allows_session = {
+                let privacy = self.lock_privacy()?;
+                privacy.can_record(&session.platform)
+            };
+            if !consent_still_allows_session {
+                {
+                    let mut capture = self.lock_capture()?;
+                    capture.record_consent_revoked(&session.platform);
+                }
+                {
+                    let mut microphone_capture = self.lock_microphone_capture()?;
+                    microphone_capture.record_consent_revoked(&session.platform);
+                }
+                let mut registry = self.lock_registry()?;
+                if registry.get_active_session().is_some() {
+                    let _ = registry.update_capture_status(
+                        false,
+                        Some("capture stopped: consent_revoked".to_string()),
+                    );
+                    let _ = registry
+                        .transition_to(MeetingStatus::Failed("consent_revoked".to_string()));
+                }
+            }
+        }
+
+        Ok(consent_state)
+    }
+
+    pub fn start_session(
+        &self,
+        platform: String,
+        config: MeetingConfig,
+    ) -> Result<MeetingSession, MeetingRuntimeError> {
+        let (platform, config) = validate_meeting_config(&platform, config)?;
+
+        {
+            let privacy = self.lock_privacy()?;
+            if !privacy.can_record(&platform) {
+                return Err(MeetingRuntimeError::ConsentRequired { platform });
+            }
+        }
+
+        match config.session_mode {
+            MeetingSessionMode::Manual => {
+                let mut registry = self.lock_registry()?;
+                registry.start(
+                    platform,
+                    config,
+                    MeetingStatus::Ready,
+                    false,
+                    Some("manual session: no audio capture started".to_string()),
+                )
+            }
+            MeetingSessionMode::RealCapture => self.start_real_capture_session(platform, config),
+        }
+    }
+
+    fn start_real_capture_session(
+        &self,
+        platform: String,
+        config: MeetingConfig,
+    ) -> Result<MeetingSession, MeetingRuntimeError> {
+        let session = {
+            let mut registry = self.lock_registry()?;
+            registry.start(
+                platform.clone(),
+                config.clone(),
+                MeetingStatus::Starting,
+                false,
+                Some("capture controller starting".to_string()),
+            )?
+        };
+
+        let options = config.capture_options;
+        let emit_segments = options.segment_transcription || config.live_transcription_enabled;
+        let mut started_sources = Vec::new();
+        let mut failures = Vec::new();
+
+        if options.system_audio {
+            match self.start_capture_source(
+                &session,
+                &config,
+                TranscriptSource::SystemAudio,
+                emit_segments,
+            ) {
+                Ok(health) => started_sources.push((TranscriptSource::SystemAudio, health)),
+                Err(error) => failures.push((TranscriptSource::SystemAudio, error)),
+            }
+        }
+        if options.microphone {
+            match self.start_capture_source(
+                &session,
+                &config,
+                TranscriptSource::Microphone,
+                emit_segments,
+            ) {
+                Ok(health) => started_sources.push((TranscriptSource::Microphone, health)),
+                Err(error) => failures.push((TranscriptSource::Microphone, error)),
+            }
+        }
+
+        if started_sources.is_empty() {
+            let _ = self.stop_all_captures();
+            let mut registry = self.lock_registry()?;
+            registry.clear();
+            return Err(failures
+                .into_iter()
+                .next()
+                .map(|(_, error)| error)
+                .unwrap_or_else(|| MeetingRuntimeError::InvalidConfig {
+                    message: "real capture requested with no enabled audio sources".to_string(),
+                }));
+        }
+
+        {
+            let mut registry = self.lock_registry()?;
+            for (source, error) in failures {
+                registry.add_diagnostic(
+                    format!("{}_capture_failed", source.as_str()),
+                    super::types::MeetingDiagnosticSeverity::Warning,
+                    format!("{} capture did not start: {}", source.as_str(), error),
+                )?;
+            }
+            registry.update_capture_status(
+                true,
+                Some(capture_status_message(&started_sources, emit_segments)),
+            )?;
+            registry.transition_to(MeetingStatus::Capturing)?;
+            registry
+                .get_active_session()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)
+        }
+    }
+
+    fn start_capture_source(
+        &self,
+        session: &MeetingSession,
+        config: &MeetingConfig,
+        transcript_source: TranscriptSource,
+        emit_segments: bool,
+    ) -> Result<CaptureHealth, MeetingRuntimeError> {
+        let controller_config =
+            CaptureControllerConfig::from_meeting_config_for_source(config, transcript_source);
+        let metrics = CaptureMetricsReporter::new();
+        let (segment_sender, segment_task) = if emit_segments {
+            let effective_pipeline = controller_config.pipeline.effective();
+            let sender = CapturedSegmentQueue::new(
+                effective_pipeline.effective_max_queue_depth,
+                controller_config.pipeline.overflow_policy,
+                metrics.clone(),
+            );
+            let receiver = sender.clone();
+            let runtime = self.clone();
+            let task = tauri::async_runtime::spawn(async move {
+                while let Some(segment) = receiver.recv().await {
+                    let result = runtime
+                        .transcribe_captured_segment(segment, None, true)
+                        .await;
+                    if let Err(error) = result {
+                        log::warn!("managed meeting capture segment transcription failed: {error}");
+                        if matches!(
+                            error,
+                            MeetingRuntimeError::ConsentRevoked { .. }
+                                | MeetingRuntimeError::ConsentRequired { .. }
+                                | MeetingRuntimeError::NoActiveSession
+                        ) {
+                            break;
+                        }
+                    }
+                }
+            });
+            (Some(sender), Some(task))
+        } else {
+            (None, None)
+        };
+
+        self.with_capture_mut_for_source(transcript_source, |capture| {
+            capture.start_real_capture(CaptureControllerStartRequest {
+                config: controller_config,
+                session_id: session.session_id.clone(),
+                meeting_storage_dir: self.meeting_storage_dir.clone(),
+                segment_sender,
+                segment_task,
+                emit_segments,
+                metrics,
+            })
+        })?
+    }
+
+    pub async fn transcribe_audio_file(
+        &self,
+        request: MeetingAudioFileTranscriptionRequest,
+    ) -> Result<MeetingAudioFileTranscriptionResult, MeetingRuntimeError> {
+        let active_session = {
+            let registry = self.lock_registry()?;
+            registry
+                .get_active_session()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)?
+        };
+
+        if let Some(request_session_id) = request
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if request_session_id != active_session.session_id {
+                return Err(MeetingRuntimeError::InvalidConfig {
+                    message: "request.session_id does not match the active meeting session"
+                        .to_string(),
+                });
+            }
+        }
+
+        self.ensure_can_transcribe_platform(&active_session.platform)?;
+
+        let validated = validate_audio_file_path(&request.audio_path)?;
+        let managed_path =
+            self.copy_audio_to_managed_segment(&active_session.session_id, &validated)?;
+        let cleanup_requested = request.cleanup_after_transcription;
+
+        self.transcribe_managed_audio_segment(ManagedAudioTranscriptionInput {
+            active_session: &active_session,
+            managed_path,
+            audio_file_extension: validated.extension,
+            file_size_bytes: validated.size,
+            speaker: request.speaker,
+            cleanup_requested,
+            source_is_captured_segment: false,
+            transcript_source: TranscriptSource::ImportedFile,
+            audio_backend: Some("imported_file".to_string()),
+            segment_id: None,
+            start_ms: None,
+            end_ms: None,
+        })
+        .await
+    }
+
+    pub async fn transcribe_captured_segment(
+        &self,
+        segment: CapturedMeetingSegment,
+        speaker: Option<String>,
+        cleanup_after_transcription: bool,
+    ) -> Result<MeetingAudioFileTranscriptionResult, MeetingRuntimeError> {
+        let active_session = {
+            let registry = self.lock_registry()?;
+            registry
+                .get_active_session()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)?
+        };
+
+        if segment.session_id != active_session.session_id {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "captured segment does not match the active meeting session".to_string(),
+            });
+        }
+
+        if let Err(error) = self.ensure_can_transcribe_platform(&active_session.platform) {
+            if matches!(error, MeetingRuntimeError::ConsentRequired { .. }) {
+                self.with_capture_mut_for_source(segment.transcript_source, |capture| {
+                    capture.record_consent_revoked(&active_session.platform);
+                })?;
+            }
+            let cleanup = self
+                .cleanup_managed_segment_after_failure(cleanup_after_transcription, &segment.path);
+            return Err(error_with_cleanup_warning(
+                MeetingRuntimeError::ConsentRevoked {
+                    platform: active_session.platform.clone(),
+                },
+                cleanup_after_transcription,
+                cleanup,
+            ));
+        }
+
+        let metrics_already_recorded = segment.capture_metrics_recorded;
+        let validated = match self.validate_captured_segment(&segment) {
+            Ok(validated) => validated,
+            Err(error) => {
+                self.record_captured_segment_transcription_failure(
+                    &active_session.platform,
+                    segment.transcript_source,
+                    &error,
+                )?;
+                let cleanup = self.cleanup_managed_segment_after_failure(
+                    cleanup_after_transcription,
+                    &segment.path,
+                );
+                return Err(error_with_cleanup_warning(
+                    error,
+                    cleanup_after_transcription,
+                    cleanup,
+                ));
+            }
+        };
+        {
+            self.with_capture_mut_for_source(segment.transcript_source, |capture| {
+                if !metrics_already_recorded {
+                    capture.record_segment_written(segment.byte_length, segment.duration_ms);
+                }
+            })?;
+        }
+
+        let start_ms = segment.start_ms;
+        let end_ms = segment.end_ms;
+        let segment_id = segment
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string());
+        let result = self
+            .transcribe_managed_audio_segment(ManagedAudioTranscriptionInput {
+                active_session: &active_session,
+                managed_path: segment.path,
+                audio_file_extension: validated.extension,
+                file_size_bytes: validated.size,
+                speaker,
+                cleanup_requested: cleanup_after_transcription,
+                source_is_captured_segment: true,
+                transcript_source: segment.transcript_source,
+                audio_backend: Some(format!("{:?}", segment.source_backend).to_ascii_lowercase()),
+                segment_id,
+                start_ms,
+                end_ms,
+            })
+            .await;
+
+        match &result {
+            Ok(_) => {
+                self.with_capture_mut_for_source(segment.transcript_source, |capture| {
+                    capture.record_segment_transcribed();
+                })?;
+            }
+            Err(MeetingRuntimeError::ConsentRequired { .. })
+            | Err(MeetingRuntimeError::ConsentRevoked { .. }) => {
+                self.with_capture_mut_for_source(segment.transcript_source, |capture| {
+                    capture.record_consent_revoked(&active_session.platform);
+                })?;
+            }
+            Err(error) => {
+                self.record_captured_segment_transcription_failure(
+                    &active_session.platform,
+                    segment.transcript_source,
+                    error,
+                )?;
+            }
+        }
+
+        match result {
+            Err(MeetingRuntimeError::ConsentRequired { .. }) => {
+                Err(MeetingRuntimeError::ConsentRevoked {
+                    platform: active_session.platform,
+                })
+            }
+            other => other,
+        }
+    }
+
+    async fn transcribe_managed_audio_segment(
+        &self,
+        input: ManagedAudioTranscriptionInput<'_>,
+    ) -> Result<MeetingAudioFileTranscriptionResult, MeetingRuntimeError> {
+        let transcript_text = match self.stt_adapter.transcribe_file(&input.managed_path).await {
+            Ok(text) => text,
+            Err(error) => {
+                let cleanup = self.cleanup_managed_segment_after_failure(
+                    input.cleanup_requested,
+                    &input.managed_path,
+                );
+                return Err(error_with_cleanup_warning(
+                    error,
+                    input.cleanup_requested,
+                    cleanup,
+                ));
+            }
+        };
+        let transcript_text = transcript_text.trim().to_string();
+        if transcript_text.is_empty() {
+            let cleanup = self.cleanup_managed_segment_after_failure(
+                input.cleanup_requested,
+                &input.managed_path,
+            );
+            let error = MeetingRuntimeError::TranscriptionUnavailable {
+                reason: "Existing STT returned an empty transcript".to_string(),
+            };
+            return Err(error_with_cleanup_warning(
+                error,
+                input.cleanup_requested,
+                cleanup,
+            ));
+        }
+
+        if let Err(error) = self.ensure_can_transcribe_platform(&input.active_session.platform) {
+            let cleanup = self.cleanup_managed_segment_after_failure(
+                input.cleanup_requested,
+                &input.managed_path,
+            );
+            return Err(error_with_cleanup_warning(
+                error,
+                input.cleanup_requested,
+                cleanup,
+            ));
+        }
+
+        let requested_speaker = input
+            .speaker
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let speaker = requested_speaker
+            .unwrap_or(if input.source_is_captured_segment {
+                "unknown"
+            } else {
+                "stt"
+            })
+            .to_string();
+        let text_length = transcript_text.chars().count();
+        let result_segment_id = input
+            .segment_id
+            .clone()
+            .unwrap_or_else(super::types::new_meeting_artifact_id);
+
+        let transcript_index = match self.lock_registry().and_then(|mut registry| {
+            match registry.get_active_session() {
+                Some(still_active_session)
+                    if still_active_session.session_id == input.active_session.session_id =>
+                {
+                    let index = registry.get_active_state().transcript.len();
+                    let speaker_id =
+                        if requested_speaker.is_none() && input.source_is_captured_segment {
+                            Some(format!("capture_segment_{}", index + 1))
+                        } else {
+                            None
+                        };
+                    let now = Utc::now();
+                    let entry = TranscriptEntry {
+                        segment_id: result_segment_id.clone(),
+                        session_id: input.active_session.session_id.clone(),
+                        source: input.transcript_source,
+                        timestamp: now,
+                        created_at: now,
+                        speaker,
+                        speaker_id,
+                        text: transcript_text,
+                        confidence: 0.0,
+                        start_ms: input.start_ms,
+                        end_ms: input.end_ms,
+                        stt_model: Some(input.active_session.config.transcription_model.clone()),
+                        audio_backend: input.audio_backend.clone(),
+                    };
+                    registry.add_transcript(entry)?;
+                    Ok(registry
+                        .get_active_state()
+                        .transcript
+                        .iter()
+                        .position(|entry| entry.segment_id == result_segment_id.as_str())
+                        .unwrap_or(index))
+                }
+                Some(_) => Err(MeetingRuntimeError::InvalidConfig {
+                    message: "active meeting session changed before transcription completed"
+                        .to_string(),
+                }),
+                None => Err(MeetingRuntimeError::NoActiveSession),
+            }
+        }) {
+            Ok(index) => index,
+            Err(error) => {
+                let cleanup = self.cleanup_managed_segment_after_failure(
+                    input.cleanup_requested,
+                    &input.managed_path,
+                );
+                return Err(error_with_cleanup_warning(
+                    error,
+                    input.cleanup_requested,
+                    cleanup,
+                ));
+            }
+        };
+
+        let cleanup = if input.cleanup_requested {
+            self.cleanup_managed_segment_best_effort(&input.managed_path)
+        } else {
+            ManagedSegmentCleanupOutcome::not_requested()
+        };
+
+        Ok(MeetingAudioFileTranscriptionResult {
+            transcript_added: true,
+            transcript_index,
+            text_length,
+            audio_file_extension: input.audio_file_extension,
+            file_size_bytes: input.file_size_bytes,
+            stt_boundary: self.stt_adapter.boundary().to_string(),
+            transcript_source: input.transcript_source,
+            segment_id: result_segment_id,
+            start_ms: input.start_ms,
+            end_ms: input.end_ms,
+            source_audio_path_redacted: true,
+            managed_audio_path_redacted: true,
+            cleanup_requested: input.cleanup_requested,
+            cleanup_performed: cleanup.performed,
+            cleanup_error: cleanup.error,
+        })
+    }
+
+    pub fn get_active_session(&self) -> Result<Option<MeetingSession>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_session().cloned())
+    }
+
+    pub fn get_active_state(&self) -> Result<MeetingSessionState, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().clone())
+    }
+
+    pub fn get_last_completed_state(
+        &self,
+    ) -> Result<Option<MeetingSessionState>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_last_completed_state().cloned())
+    }
+
+    pub fn list_transcript(&self) -> Result<Vec<TranscriptEntry>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().transcript.clone())
+    }
+
+    pub fn read_notes(&self) -> Result<Vec<super::types::NoteEntry>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().notes.clone())
+    }
+
+    pub fn read_summary(&self) -> Result<Vec<super::types::SummaryEntry>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().summary.clone())
+    }
+
+    pub fn read_action_items(&self) -> Result<Vec<super::types::ActionItem>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().action_items.clone())
+    }
+
+    pub fn read_decisions(
+        &self,
+    ) -> Result<Vec<super::types::DecisionLogEntry>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().decisions.clone())
+    }
+
+    pub fn read_diagnostics(
+        &self,
+    ) -> Result<Vec<super::types::MeetingDiagnostic>, MeetingRuntimeError> {
+        let registry = self.lock_registry()?;
+        Ok(registry.get_active_state().diagnostics.clone())
+    }
+
+    pub fn pause_session(&self) -> Result<(), MeetingRuntimeError> {
+        {
+            let mut registry = self.lock_registry()?;
+            registry.pause()?;
+        }
+
+        self.pause_capture_source(TranscriptSource::SystemAudio)?;
+        self.pause_capture_source(TranscriptSource::Microphone)?;
+        Ok(())
+    }
+
+    pub fn resume_session(&self) -> Result<(), MeetingRuntimeError> {
+        let resumed_status = {
+            let mut registry = self.lock_registry()?;
+            registry.resume()?;
+            registry.get_active_state().status.clone()
+        };
+
+        if matches!(
+            resumed_status,
+            MeetingStatus::Capturing | MeetingStatus::Transcribing
+        ) {
+            self.resume_capture_source(TranscriptSource::SystemAudio)?;
+            self.resume_capture_source(TranscriptSource::Microphone)?;
+        }
+        Ok(())
+    }
+
+    pub fn stop_session(&self) -> Result<ExportedMeeting, MeetingRuntimeError> {
+        {
+            let mut registry = self.lock_registry()?;
+            if registry.get_active_session().is_some() {
+                let _ = registry.transition_to(MeetingStatus::Stopping);
+            }
+        }
+        let stop_result = self.stop_all_captures();
+        if let Err(error) = stop_result {
+            let mut registry = self.lock_registry()?;
+            if registry.get_active_session().is_some() {
+                let _ = registry.update_capture_status(
+                    false,
+                    Some("capture stop failed: redacted_failure".to_string()),
+                );
+                let _ = registry
+                    .transition_to(MeetingStatus::Failed("capture_stop_failed".to_string()));
+            }
+            return Err(error);
+        }
+        let exported = {
+            let mut registry = self.lock_registry()?;
+            registry.stop()?
+        };
+        self.organizer
+            .save_meeting_data(&exported)
+            .map_err(|message| MeetingRuntimeError::StorageError { message })?;
+        Ok(exported)
+    }
+
+    pub fn add_transcript(&self, mut entry: TranscriptEntry) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        let active_session = registry
+            .get_active_session()
+            .cloned()
+            .ok_or(MeetingRuntimeError::NoActiveSession)?;
+        entry.session_id = active_session.session_id;
+        entry.source = TranscriptSource::Manual;
+        entry.stt_model = None;
+        entry.audio_backend = None;
+        registry.add_transcript(entry)
+    }
+
+    pub fn add_action_item(&self, item: ActionItem) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        registry.add_action_item(item)
+    }
+
+    pub fn add_decision(&self, entry: DecisionLogEntry) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        registry.add_decision(entry)
+    }
+
+    pub fn clear_runtime_session(&self) -> Result<(), MeetingRuntimeError> {
+        self.stop_capture_for_clear_operation("clear_runtime_session")?;
+        let mut registry = self.lock_registry()?;
+        registry.clear();
+        Ok(())
+    }
+
+    pub fn preview_clear_all_data(&self) -> Result<MeetingDataClearPreview, MeetingRuntimeError> {
+        let runtime_state_present = {
+            let registry = self.lock_registry()?;
+            registry.has_runtime_state()
+        };
+        let mut preview = self
+            .organizer
+            .preview_clear_all_meeting_data()
+            .map_err(|message| MeetingRuntimeError::StorageError { message })?;
+        preview.runtime_state_present = runtime_state_present;
+        Ok(preview)
+    }
+
+    pub fn clear_all_data(
+        &self,
+        request: ClearMeetingDataRequest,
+    ) -> Result<MeetingDataClearResult, MeetingRuntimeError> {
+        let ClearMeetingDataRequest {
+            scope: _scope,
+            confirmation_phrase,
+        } = request;
+        if confirmation_phrase != CLEAR_MEETING_DATA_CONFIRMATION_PHRASE {
+            return Err(MeetingRuntimeError::ConfirmationRequired {
+                action: "meeting.clear_data".to_string(),
+                required_phrase: CLEAR_MEETING_DATA_CONFIRMATION_PHRASE.to_string(),
+            });
+        }
+        let capture_stop = self.stop_capture_for_clear_operation("clear_data")?;
+        {
+            let mut registry = self.lock_registry()?;
+            registry.clear();
+        }
+        let mut result = self
+            .organizer
+            .clear_all_meeting_data()
+            .map_err(|message| MeetingRuntimeError::StorageError { message })?;
+        result.capture_stop_attempted = capture_stop.attempted;
+        result.capture_stop_succeeded = capture_stop.succeeded;
+        result.capture_stop_error_kind = capture_stop.error_kind;
+        result.clear_aborted = false;
+        Ok(result)
+    }
+
+    pub fn detect_active_call(&self) -> Option<CallInfo> {
+        CallDetector::detect()
+    }
+
+    pub fn available_audio_devices(&self) -> Result<Vec<String>, MeetingRuntimeError> {
+        AudioCapture::list_available_devices()
+            .map_err(|message| MeetingRuntimeError::StorageError { message })
+    }
+
+    pub fn auto_detect_audio_backend(&self) -> CaptureBackend {
+        AudioCapture::auto_detect_backend()
+    }
+
+    pub fn capture_health(&self) -> Result<CaptureHealth, MeetingRuntimeError> {
+        let capture = self.lock_capture()?;
+        Ok(capture.health_snapshot())
+    }
+
+    pub fn microphone_capture_health(&self) -> Result<CaptureHealth, MeetingRuntimeError> {
+        let capture = self.lock_microphone_capture()?;
+        Ok(capture.health_snapshot())
+    }
+
+    pub fn live_capabilities(&self) -> Result<MeetingLiveCapabilitySnapshot, MeetingRuntimeError> {
+        let system_capture_health = self.capture_health()?;
+        let microphone_capture_health = self.microphone_capture_health()?;
+        let capture_health = aggregate_capture_health(
+            system_capture_health.clone(),
+            microphone_capture_health.clone(),
+        );
+        let stt_status = self.stt_adapter.status();
+        let wasapi_available = wasapi_backend_available();
+        let live_segment_transcription_ready =
+            capture_health.active_handle_present && stt_status.file_transcription.available;
+
+        Ok(MeetingLiveCapabilitySnapshot {
+            manual_session: readiness(
+                "meeting.session.manual",
+                true,
+                MeetingCapabilityState::Ready,
+                None,
+            ),
+            audio_capture: readiness(
+                "meeting.audio.capture",
+                wasapi_available,
+                if wasapi_available {
+                    MeetingCapabilityState::Ready
+                } else {
+                    MeetingCapabilityState::Unavailable
+                },
+                if wasapi_available {
+                    None
+                } else {
+                    Some(wasapi_unavailable_reason())
+                },
+            ),
+            microphone_capture: readiness(
+                "meeting.audio.capture.microphone",
+                wasapi_available,
+                if wasapi_available {
+                    MeetingCapabilityState::Ready
+                } else {
+                    MeetingCapabilityState::Unavailable
+                },
+                if wasapi_available {
+                    microphone_capture_health
+                        .last_error
+                        .clone()
+                        .or_else(|| Some("Windows default microphone endpoint is checked when capture starts".to_string()))
+                } else {
+                    Some(wasapi_unavailable_reason())
+                },
+            ),
+            system_audio_capture: readiness(
+                "meeting.audio.capture.system_audio",
+                wasapi_available,
+                if wasapi_available {
+                    MeetingCapabilityState::Ready
+                } else {
+                    MeetingCapabilityState::Unavailable
+                },
+                if wasapi_available {
+                    None
+                } else {
+                    Some(wasapi_unavailable_reason())
+                },
+            ),
+            windows_wasapi_capture: readiness(
+                "meeting.audio.capture.wasapi",
+                wasapi_available,
+                if wasapi_available {
+                    MeetingCapabilityState::Ready
+                } else {
+                    MeetingCapabilityState::Unavailable
+                },
+                if wasapi_available {
+                    None
+                } else {
+                    Some(wasapi_unavailable_reason())
+                },
+            ),
+            system_capture_health,
+            microphone_capture_health,
+            live_transcription: readiness(
+                "meeting.transcription.live",
+                false,
+                MeetingCapabilityState::Unavailable,
+                stt_status.live_transcription.reason.clone(),
+            ),
+            live_segment_transcription: readiness(
+                "meeting.transcription.segment",
+                live_segment_transcription_ready,
+                if live_segment_transcription_ready {
+                    MeetingCapabilityState::Ready
+                } else {
+                    MeetingCapabilityState::Unavailable
+                },
+                if live_segment_transcription_ready {
+                    None
+                } else {
+                    Some("Live segment transcription requires an active governed capture handle and the existing file STT bridge".to_string())
+                },
+            ),
+            live_streaming_stt: readiness(
+                "meeting.transcription.streaming",
+                false,
+                MeetingCapabilityState::Unavailable,
+                Some("Streaming STT protocol is not implemented; only completed managed WAV files can use SttClient::transcribe(Path)".to_string()),
+            ),
+            chunk_streaming: stt_status.chunk_streaming.clone(),
+            diarization: readiness(
+                "meeting.diarization.live",
+                false,
+                MeetingCapabilityState::Unavailable,
+                Some("No tested diarization backend is connected; captured segments use non-identifying capture segment metadata only".to_string()),
+            ),
+            live_summarization: readiness(
+                "meeting.summarization.live",
+                true,
+                MeetingCapabilityState::Ready,
+                Some("Rule-based transcript-derived notes, decisions, action items, and rolling summaries are active; no model-only summaries are fabricated".to_string()),
+            ),
+            follow_up: readiness(
+                "meeting.followup.send",
+                false,
+                MeetingCapabilityState::Unavailable,
+                Some("Follow-up sending remains disabled until draft-first outbound integrations are governed".to_string()),
+            ),
+            capture_health,
+            stt_adapter: stt_status,
+        })
+    }
+
+    fn record_captured_segment_transcription_failure(
+        &self,
+        platform: &str,
+        source: TranscriptSource,
+        error: &MeetingRuntimeError,
+    ) -> Result<(), MeetingRuntimeError> {
+        let error_kind = captured_segment_error_kind(error).to_string();
+        let immediate_failure = captured_segment_error_fails_capture_immediately(error);
+        let terminal_reason = {
+            self.with_capture_mut_for_source(source, |capture| {
+                if immediate_failure {
+                    capture.record_terminal_segment_transcription_failure(&error_kind);
+                    Some(format!(
+                        "{}_segment_transcription_failed:{error_kind}",
+                        source.as_str()
+                    ))
+                } else {
+                    let health = capture.record_segment_transcription_failure(&error_kind);
+                    let threshold = health
+                        .pipeline
+                        .max_consecutive_transcription_failures
+                        .max(1) as u64;
+                    if health.metrics.segment_transcription_failures_consecutive >= threshold {
+                        let _ = capture.abort(format!(
+                            "{}_segment_transcription_failure_threshold",
+                            source.as_str()
+                        ));
+                        Some(format!(
+                            "{}_segment_transcription_failure_threshold",
+                            source.as_str()
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            })?
+        };
+        {
+            let mut registry = self.lock_registry()?;
+            if registry.get_active_session().is_some() {
+                registry.add_diagnostic(
+                    format!("{}_segment_stt_failed", source.as_str()),
+                    super::types::MeetingDiagnosticSeverity::Warning,
+                    format!(
+                        "{} segment transcription failed: {error_kind}",
+                        source.as_str()
+                    ),
+                )?;
+            }
+        }
+
+        if let Some(reason) = terminal_reason {
+            self.mark_active_session_capture_failed(platform, &reason)?;
+        }
+        Ok(())
+    }
+
+    fn mark_active_session_capture_failed(
+        &self,
+        platform: &str,
+        reason: &str,
+    ) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        let matches_platform = registry.get_active_session().is_some_and(|session| {
+            normalize_meeting_app_name(&session.platform) == normalize_meeting_app_name(platform)
+        });
+        if matches_platform {
+            let _ =
+                registry.update_capture_status(false, Some(format!("capture failed: {reason}")));
+            let _ = registry.transition_to(MeetingStatus::Failed(reason.to_string()));
+        }
+        Ok(())
+    }
+
+    fn stop_capture_for_clear_operation(
+        &self,
+        operation: &str,
+    ) -> Result<CaptureStopForClearOutcome, MeetingRuntimeError> {
+        let attempted = self.any_capture_stop_needed()?;
+        let stop_result = self.stop_all_captures();
+
+        match stop_result {
+            Ok(_) => Ok(CaptureStopForClearOutcome {
+                attempted,
+                succeeded: attempted,
+                error_kind: None,
+            }),
+            Err(error) => {
+                let error_kind = capture_stop_error_kind(&error).to_string();
+                self.mark_clear_aborted_after_stop_failure(operation, &error_kind)?;
+                Err(MeetingRuntimeError::ClearAbortedCaptureStopFailed {
+                    operation: operation.to_string(),
+                    error_kind,
+                })
+            }
+        }
+    }
+
+    fn mark_clear_aborted_after_stop_failure(
+        &self,
+        operation: &str,
+        error_kind: &str,
+    ) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        if registry.get_active_session().is_some() {
+            let _ = registry
+                .update_capture_status(false, Some(format!("{operation} aborted: {error_kind}")));
+            let _ =
+                registry.transition_to(MeetingStatus::Failed(format!("{operation}_{error_kind}")));
+        }
+        Ok(())
+    }
+
+    fn lock_registry(&self) -> Result<MutexGuard<'_, SessionRegistry>, MeetingRuntimeError> {
+        self.registry
+            .lock()
+            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
+                component: "session_registry".to_string(),
+            })
+    }
+
+    fn lock_privacy(&self) -> Result<MutexGuard<'_, PrivacyState>, MeetingRuntimeError> {
+        self.privacy
+            .lock()
+            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
+                component: "privacy_state".to_string(),
+            })
+    }
+
+    fn lock_capture(&self) -> Result<MutexGuard<'_, CaptureController>, MeetingRuntimeError> {
+        self.capture
+            .lock()
+            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
+                component: "capture_controller".to_string(),
+            })
+    }
+
+    fn lock_microphone_capture(
+        &self,
+    ) -> Result<MutexGuard<'_, CaptureController>, MeetingRuntimeError> {
+        self.microphone_capture
+            .lock()
+            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
+                component: "microphone_capture_controller".to_string(),
+            })
+    }
+
+    fn with_capture_mut_for_source<T>(
+        &self,
+        source: TranscriptSource,
+        operation: impl FnOnce(&mut CaptureController) -> T,
+    ) -> Result<T, MeetingRuntimeError> {
+        match source {
+            TranscriptSource::Microphone => {
+                let mut capture = self.lock_microphone_capture()?;
+                Ok(operation(&mut capture))
+            }
+            _ => {
+                let mut capture = self.lock_capture()?;
+                Ok(operation(&mut capture))
+            }
+        }
+    }
+
+    fn pause_capture_source(&self, source: TranscriptSource) -> Result<(), MeetingRuntimeError> {
+        self.with_capture_mut_for_source(source, |capture| {
+            if capture.has_active_handle()
+                || matches!(capture.state(), CaptureControllerState::Capturing)
+            {
+                capture.pause()
+            } else {
+                Ok(capture.health_snapshot())
+            }
+        })??;
+        Ok(())
+    }
+
+    fn resume_capture_source(&self, source: TranscriptSource) -> Result<(), MeetingRuntimeError> {
+        self.with_capture_mut_for_source(source, |capture| {
+            if capture.has_active_handle()
+                || matches!(capture.state(), CaptureControllerState::Paused)
+            {
+                capture.resume()
+            } else {
+                Ok(capture.health_snapshot())
+            }
+        })??;
+        Ok(())
+    }
+
+    fn any_capture_stop_needed(&self) -> Result<bool, MeetingRuntimeError> {
+        let system_needed = {
+            let capture = self.lock_capture()?;
+            capture.has_active_handle()
+                || matches!(
+                    capture.state(),
+                    CaptureControllerState::Starting
+                        | CaptureControllerState::Capturing
+                        | CaptureControllerState::Paused
+                        | CaptureControllerState::Stopping
+                )
+        };
+        let microphone_needed = {
+            let capture = self.lock_microphone_capture()?;
+            capture.has_active_handle()
+                || matches!(
+                    capture.state(),
+                    CaptureControllerState::Starting
+                        | CaptureControllerState::Capturing
+                        | CaptureControllerState::Paused
+                        | CaptureControllerState::Stopping
+                )
+        };
+        Ok(system_needed || microphone_needed)
+    }
+
+    fn stop_all_captures(&self) -> Result<(), MeetingRuntimeError> {
+        let system_result = {
+            let mut capture = self.lock_capture()?;
+            capture.stop()
+        };
+        let microphone_result = {
+            let mut capture = self.lock_microphone_capture()?;
+            capture.stop()
+        };
+        system_result?;
+        microphone_result?;
+        Ok(())
+    }
+
+    fn ensure_can_transcribe_platform(&self, platform: &str) -> Result<(), MeetingRuntimeError> {
+        let privacy = self.lock_privacy()?;
+        if !privacy.can_record(platform) {
+            return Err(MeetingRuntimeError::ConsentRequired {
+                platform: platform.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn copy_audio_to_managed_segment(
+        &self,
+        session_id: &str,
+        audio: &ValidatedAudioFile,
+    ) -> Result<PathBuf, MeetingRuntimeError> {
+        let segments_dir = self.meeting_storage_dir.join(session_id).join("segments");
+        std::fs::create_dir_all(&segments_dir).map_err(|error| {
+            MeetingRuntimeError::StorageError {
+                message: format!(
+                    "create managed meeting segment directory failed: {}",
+                    error.kind()
+                ),
+            }
+        })?;
+        let managed_path = segments_dir.join(format!("{}.{}", Uuid::new_v4(), audio.extension));
+        let copied = std::fs::copy(&audio.canonical_path, &managed_path).map_err(|error| {
+            MeetingRuntimeError::StorageError {
+                message: format!("copy managed meeting segment failed: {}", error.kind()),
+            }
+        })?;
+        if copied != audio.size {
+            return Err(MeetingRuntimeError::StorageError {
+                message: "copy managed meeting segment failed: copied byte count mismatch"
+                    .to_string(),
+            });
+        }
+        Ok(managed_path)
+    }
+
+    fn validate_captured_segment(
+        &self,
+        segment: &CapturedMeetingSegment,
+    ) -> Result<ValidatedAudioFile, MeetingRuntimeError> {
+        if !self.is_managed_segment_path(&segment.path) {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "captured segment path is outside managed meeting storage".to_string(),
+            });
+        }
+        let metadata = segment
+            .path
+            .metadata()
+            .map_err(|_| MeetingRuntimeError::InvalidConfig {
+                message: "captured segment metadata cannot be read".to_string(),
+            })?;
+        if !metadata.is_file() {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "captured segment must be a managed file".to_string(),
+            });
+        }
+        let extension = segment
+            .path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extension != "wav" {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "captured segment must be a managed WAV file".to_string(),
+            });
+        }
+        let size = metadata.len();
+        if size > MAX_MEETING_TRANSCRIPTION_AUDIO_BYTES {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: format!(
+                    "captured segment is too large; maximum is {} bytes",
+                    MAX_MEETING_TRANSCRIPTION_AUDIO_BYTES
+                ),
+            });
+        }
+        validate_wav_header(&segment.path, size)?;
+        Ok(ValidatedAudioFile {
+            canonical_path: segment.path.clone(),
+            extension,
+            size,
+        })
+    }
+
+    fn cleanup_managed_segment_after_failure(
+        &self,
+        cleanup_requested: bool,
+        managed_path: &Path,
+    ) -> ManagedSegmentCleanupOutcome {
+        if cleanup_requested {
+            self.cleanup_managed_segment_best_effort(managed_path)
+        } else {
+            ManagedSegmentCleanupOutcome::not_requested()
+        }
+    }
+
+    fn cleanup_managed_segment_best_effort(
+        &self,
+        managed_path: &Path,
+    ) -> ManagedSegmentCleanupOutcome {
+        if !self.is_managed_segment_path(managed_path) {
+            return ManagedSegmentCleanupOutcome {
+                performed: false,
+                error: Some(
+                    "managed meeting segment cleanup skipped: path outside managed segments"
+                        .to_string(),
+                ),
+            };
+        }
+
+        match std::fs::remove_file(managed_path) {
+            Ok(()) => ManagedSegmentCleanupOutcome {
+                performed: true,
+                error: None,
+            },
+            Err(error) => ManagedSegmentCleanupOutcome {
+                performed: false,
+                error: Some(format!(
+                    "managed meeting segment cleanup failed: {}",
+                    error.kind()
+                )),
+            },
+        }
+    }
+
+    fn is_managed_segment_path(&self, managed_path: &Path) -> bool {
+        managed_path.starts_with(&self.meeting_storage_dir)
+            && managed_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "segments")
+    }
+
+    #[doc(hidden)]
+    pub fn install_fake_active_capture_for_test(
+        &self,
+        stop_acknowledges: bool,
+        stop_timeout: Duration,
+    ) -> Result<CaptureHealth, MeetingRuntimeError> {
+        let active_session = {
+            let registry = self.lock_registry()?;
+            registry
+                .get_active_session()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)?
+        };
+        let controller_config =
+            CaptureControllerConfig::from_meeting_config(&active_session.config);
+        let health = {
+            let mut capture = self.lock_capture()?;
+            capture.install_fake_active_capture_for_test(
+                controller_config,
+                stop_acknowledges,
+                stop_timeout,
+            )
+        };
+        {
+            let mut registry = self.lock_registry()?;
+            registry.update_capture_status(
+                health.active_handle_present,
+                Some("test fake capture active".to_string()),
+            )?;
+        }
+        Ok(health)
+    }
+}
+
+struct CaptureStopForClearOutcome {
+    attempted: bool,
+    succeeded: bool,
+    error_kind: Option<String>,
+}
+
+struct ManagedAudioTranscriptionInput<'a> {
+    active_session: &'a MeetingSession,
+    managed_path: PathBuf,
+    audio_file_extension: String,
+    file_size_bytes: u64,
+    speaker: Option<String>,
+    cleanup_requested: bool,
+    source_is_captured_segment: bool,
+    transcript_source: TranscriptSource,
+    audio_backend: Option<String>,
+    segment_id: Option<String>,
+    start_ms: Option<u64>,
+    end_ms: Option<u64>,
+}
+
+struct ValidatedAudioFile {
+    canonical_path: PathBuf,
+    extension: String,
+    size: u64,
+}
+
+struct ManagedSegmentCleanupOutcome {
+    performed: bool,
+    error: Option<String>,
+}
+
+impl ManagedSegmentCleanupOutcome {
+    fn not_requested() -> Self {
+        Self {
+            performed: false,
+            error: None,
+        }
+    }
+}
+
+fn error_with_cleanup_warning(
+    error: MeetingRuntimeError,
+    cleanup_requested: bool,
+    cleanup: ManagedSegmentCleanupOutcome,
+) -> MeetingRuntimeError {
+    if cleanup_requested && cleanup.error.is_some() {
+        MeetingRuntimeError::TranscriptionFailedWithCleanupWarning {
+            reason: error.to_string(),
+            cleanup_requested,
+            cleanup_performed: cleanup.performed,
+            cleanup_error: cleanup.error,
+            managed_path_redacted: true,
+        }
+    } else {
+        error
+    }
+}
+
+fn captured_segment_error_kind(error: &MeetingRuntimeError) -> &'static str {
+    match error {
+        MeetingRuntimeError::ConsentRequired { .. } => "consent_required",
+        MeetingRuntimeError::ConsentRevoked { .. } => "consent_revoked",
+        MeetingRuntimeError::TranscriptionUnavailable { .. } => "transcription_unavailable",
+        MeetingRuntimeError::SttUnavailable { .. } => "stt_unavailable",
+        MeetingRuntimeError::TranscriptionInactive => "transcription_inactive",
+        MeetingRuntimeError::NoAudioFramesReceived { .. } => "no_audio_frames_received",
+        MeetingRuntimeError::TranscriptionFailedWithCleanupWarning { .. } => {
+            "transcription_cleanup_warning"
+        }
+        MeetingRuntimeError::StorageError { .. } => "storage_error",
+        MeetingRuntimeError::CaptureStreamError { .. } => "capture_stream_error",
+        MeetingRuntimeError::AudioCaptureUnavailable { .. } => "audio_capture_unavailable",
+        MeetingRuntimeError::SegmentWriteFailed { .. } => "segment_write_failed",
+        MeetingRuntimeError::SegmentTooLarge { .. } => "segment_too_large",
+        MeetingRuntimeError::InvalidConfig { .. } => "invalid_segment",
+        MeetingRuntimeError::NoActiveSession => "no_active_session",
+        MeetingRuntimeError::SessionPaused { .. } => "session_paused",
+        MeetingRuntimeError::SessionCompleted => "session_completed",
+        MeetingRuntimeError::InvalidLifecycleTransition { .. } => "invalid_lifecycle",
+        MeetingRuntimeError::ClearAbortedCaptureStopFailed { .. } => "clear_aborted",
+        MeetingRuntimeError::CaptureStopTimedOut { .. } => "capture_stop_timed_out",
+        MeetingRuntimeError::CaptureUnavailable { .. } => "capture_unavailable",
+        MeetingRuntimeError::CaptureStartFailed { .. } => "capture_start_failed",
+        MeetingRuntimeError::CaptureStartupTimeout { .. } => "capture_startup_timeout",
+        MeetingRuntimeError::CaptureStartupChannelClosed { .. } => "capture_startup_closed",
+        MeetingRuntimeError::CaptureDeviceUnavailable { .. } => "capture_device_unavailable",
+        MeetingRuntimeError::PermissionDenied { .. } => "permission_denied",
+        MeetingRuntimeError::UnsupportedCapability { .. } => "unsupported_capability",
+        MeetingRuntimeError::ActiveSessionExists { .. } => "active_session_exists",
+        MeetingRuntimeError::ConfirmationRequired { .. } => "confirmation_required",
+        MeetingRuntimeError::SerializationError { .. } => "serialization_error",
+        MeetingRuntimeError::MutexPoisoned { .. } => "mutex_poisoned",
+    }
+}
+
+fn captured_segment_error_fails_capture_immediately(error: &MeetingRuntimeError) -> bool {
+    matches!(
+        error,
+        MeetingRuntimeError::StorageError { .. }
+            | MeetingRuntimeError::CaptureStreamError { .. }
+            | MeetingRuntimeError::SegmentWriteFailed { .. }
+            | MeetingRuntimeError::SegmentTooLarge { .. }
+    )
+}
+
+fn capture_stop_error_kind(error: &MeetingRuntimeError) -> &'static str {
+    match error {
+        MeetingRuntimeError::CaptureStopTimedOut { .. } => "capture_stop_timed_out",
+        MeetingRuntimeError::CaptureStreamError { .. } => "capture_stream_error",
+        MeetingRuntimeError::CaptureUnavailable { .. } => "capture_unavailable",
+        MeetingRuntimeError::CaptureStartFailed { .. } => "capture_start_failed",
+        MeetingRuntimeError::CaptureDeviceUnavailable { .. } => "capture_device_unavailable",
+        MeetingRuntimeError::MutexPoisoned { .. } => "mutex_poisoned",
+        _ => "capture_stop_failed",
+    }
+}
+
+fn validate_meeting_config(
+    platform_arg: &str,
+    mut config: MeetingConfig,
+) -> Result<(String, MeetingConfig), MeetingRuntimeError> {
+    let platform = normalize_meeting_app_name(platform_arg);
+    let config_platform = normalize_meeting_app_name(&config.platform);
+    if platform.is_empty() || config_platform.is_empty() {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "platform and config.platform are required".to_string(),
+        });
+    }
+    if platform != config_platform {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: format!(
+                "platform argument ({platform}) does not match config.platform ({config_platform})"
+            ),
+        });
+    }
+
+    if config.session_mode == MeetingSessionMode::Manual && config.live_transcription_enabled {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "manual meeting sessions cannot enable live transcription".to_string(),
+        });
+    }
+    if config.session_mode == MeetingSessionMode::Manual {
+        config.capture_options = super::types::MeetingCaptureOptions::manual();
+    } else {
+        if config.live_transcription_enabled {
+            config.capture_options.segment_transcription = true;
+        }
+        if !config.capture_options.any_audio_enabled() {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "real capture sessions require system_audio or microphone capture"
+                    .to_string(),
+            });
+        }
+        if config.capture_options.microphone && config.capture_backend != CaptureBackend::Wasapi {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "microphone capture is currently implemented only through Windows WASAPI"
+                    .to_string(),
+            });
+        }
+    }
+
+    if !matches!(config.sample_rate, 16_000 | 44_100 | 48_000) {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: format!(
+                "unsupported sample_rate {}; allowed values are 16000, 44100, 48000",
+                config.sample_rate
+            ),
+        });
+    }
+
+    let transcription_model = config.transcription_model.trim().to_ascii_lowercase();
+    if transcription_model.is_empty() {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "transcription_model is required".to_string(),
+        });
+    }
+    if transcription_model != "local" {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "only local meeting transcription_model is supported".to_string(),
+        });
+    }
+
+    let privacy_mode = config.privacy_mode.trim().to_ascii_lowercase();
+    if privacy_mode.is_empty() {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "privacy_mode is required".to_string(),
+        });
+    }
+    if !matches!(
+        privacy_mode.as_str(),
+        "default" | "redact" | "pause" | "disabled"
+    ) {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: format!("unsupported privacy_mode {privacy_mode}"),
+        });
+    }
+
+    config.platform = config_platform;
+    config.transcription_model = transcription_model;
+    config.privacy_mode = privacy_mode;
+    Ok((platform, config))
+}
+
+fn validate_audio_file_path(audio_path: &str) -> Result<ValidatedAudioFile, MeetingRuntimeError> {
+    let trimmed = audio_path.trim();
+    if trimmed.is_empty() {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "audio_path is required".to_string(),
+        });
+    }
+    let canonical_path =
+        PathBuf::from(trimmed)
+            .canonicalize()
+            .map_err(|_| MeetingRuntimeError::InvalidConfig {
+                message: "audio file does not exist or cannot be resolved".to_string(),
+            })?;
+    let metadata = canonical_path
+        .metadata()
+        .map_err(|_| MeetingRuntimeError::InvalidConfig {
+            message: "audio file metadata cannot be read".to_string(),
+        })?;
+    if !metadata.is_file() {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "audio_path must point to a file".to_string(),
+        });
+    }
+    if is_system_path(&canonical_path) {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "audio_path points to a protected system location".to_string(),
+        });
+    }
+
+    let extension = canonical_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !SUPPORTED_MEETING_AUDIO_EXTENSIONS.contains(&extension.as_str()) {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: format!(
+                "unsupported audio extension {}; supported extensions: {}",
+                if extension.is_empty() {
+                    "none"
+                } else {
+                    extension.as_str()
+                },
+                SUPPORTED_MEETING_AUDIO_EXTENSIONS.join(", ")
+            ),
+        });
+    }
+
+    let size = metadata.len();
+    if size > MAX_MEETING_TRANSCRIPTION_AUDIO_BYTES {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: format!(
+                "audio file is too large; maximum is {} bytes",
+                MAX_MEETING_TRANSCRIPTION_AUDIO_BYTES
+            ),
+        });
+    }
+    validate_wav_header(&canonical_path, size)?;
+
+    Ok(ValidatedAudioFile {
+        canonical_path,
+        extension,
+        size,
+    })
+}
+
+fn validate_wav_header(path: &Path, size: u64) -> Result<(), MeetingRuntimeError> {
+    if size < 12 {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "audio file is too small to contain a valid WAV header".to_string(),
+        });
+    }
+
+    let mut header = [0_u8; 12];
+    let mut file = File::open(path).map_err(|_| MeetingRuntimeError::InvalidConfig {
+        message: "audio file header cannot be read".to_string(),
+    })?;
+    file.read_exact(&mut header)
+        .map_err(|_| MeetingRuntimeError::InvalidConfig {
+            message: "audio file header cannot be read".to_string(),
+        })?;
+
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err(MeetingRuntimeError::InvalidConfig {
+            message: "audio file is not a valid WAV file".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn is_system_path(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        ["WINDIR", "ProgramFiles", "ProgramFiles(x86)"]
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(PathBuf::from))
+            .filter_map(|value| value.canonicalize().ok())
+            .any(|system_root| path.starts_with(system_root))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.starts_with("/bin")
+            || path.starts_with("/sbin")
+            || path.starts_with("/usr/bin")
+            || path.starts_with("/usr/sbin")
+    }
+}
+
+fn readiness(
+    capability: &str,
+    available: bool,
+    state: MeetingCapabilityState,
+    reason: Option<String>,
+) -> MeetingCapabilityReadiness {
+    MeetingCapabilityReadiness {
+        capability: capability.to_string(),
+        available,
+        state,
+        reason,
+    }
+}
+
+fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) -> CaptureHealth {
+    let mut aggregate = system.clone();
+    aggregate.active_handle_present =
+        system.active_handle_present || microphone.active_handle_present;
+    aggregate.backpressure_active = system.backpressure_active || microphone.backpressure_active;
+    aggregate.state = if matches!(system.state, CaptureControllerState::Failed)
+        || matches!(microphone.state, CaptureControllerState::Failed)
+    {
+        CaptureControllerState::Failed
+    } else if matches!(system.state, CaptureControllerState::Capturing)
+        || matches!(microphone.state, CaptureControllerState::Capturing)
+    {
+        CaptureControllerState::Capturing
+    } else if matches!(system.state, CaptureControllerState::Paused)
+        || matches!(microphone.state, CaptureControllerState::Paused)
+    {
+        CaptureControllerState::Paused
+    } else if matches!(system.state, CaptureControllerState::Starting)
+        || matches!(microphone.state, CaptureControllerState::Starting)
+    {
+        CaptureControllerState::Starting
+    } else {
+        system.state
+    };
+    aggregate.metrics.segments_written = system
+        .metrics
+        .segments_written
+        .saturating_add(microphone.metrics.segments_written);
+    aggregate.metrics.segments_queued = system
+        .metrics
+        .segments_queued
+        .saturating_add(microphone.metrics.segments_queued);
+    aggregate.metrics.segments_transcribed = system
+        .metrics
+        .segments_transcribed
+        .saturating_add(microphone.metrics.segments_transcribed);
+    aggregate.metrics.segments_dropped = system
+        .metrics
+        .segments_dropped
+        .saturating_add(microphone.metrics.segments_dropped);
+    aggregate.metrics.segment_transcription_failures_total = system
+        .metrics
+        .segment_transcription_failures_total
+        .saturating_add(microphone.metrics.segment_transcription_failures_total);
+    aggregate.metrics.frames_captured = system
+        .metrics
+        .frames_captured
+        .saturating_add(microphone.metrics.frames_captured);
+    aggregate.metrics.frames_converted = system
+        .metrics
+        .frames_converted
+        .saturating_add(microphone.metrics.frames_converted);
+    aggregate
+}
+
+fn capture_status_message(
+    started_sources: &[(TranscriptSource, CaptureHealth)],
+    segment_transcription: bool,
+) -> String {
+    let sources = started_sources
+        .iter()
+        .map(|(source, health)| {
+            format!(
+                "{}:{:?}:segments_written={}",
+                source.as_str(),
+                health.state,
+                health.metrics.segments_written
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "capture active sources: {sources}; segment_file_stt={}",
+        if segment_transcription {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meeting::types::{
+        ActionItemStatus, ClearMeetingDataRequest, MeetingClearScope, MeetingStatus,
+        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+    };
+    use crate::meeting::{
+        segment_writer::{SegmentWriter, SegmentWriterConfig},
+        stt_adapter::{MeetingFileTranscriber, MeetingFileTranscriptionFuture},
+    };
+    use chrono::Utc;
+    use std::{path::Path, sync::Arc};
+    use uuid::Uuid;
+
+    struct FixedTranscriber;
+
+    impl MeetingFileTranscriber for FixedTranscriber {
+        fn status(&self) -> super::super::types::MeetingSttAdapterStatus {
+            super::super::types::MeetingSttAdapterStatus {
+                state: MeetingCapabilityState::Ready,
+                existing_boundary: "test".to_string(),
+                file_transcription: readiness(
+                    "meeting.transcription.file",
+                    true,
+                    MeetingCapabilityState::Ready,
+                    None,
+                ),
+                live_transcription: readiness(
+                    "meeting.transcription.live",
+                    false,
+                    MeetingCapabilityState::Unavailable,
+                    Some("streaming STT unsupported in test adapter".to_string()),
+                ),
+                chunk_streaming: readiness(
+                    "meeting.transcription.chunk_streaming",
+                    false,
+                    MeetingCapabilityState::Unavailable,
+                    Some("chunk streaming unsupported in test adapter".to_string()),
+                ),
+                chunk_streaming_supported: false,
+                emits_placeholder_transcripts: false,
+                reason: None,
+            }
+        }
+
+        fn transcribe_file<'a>(
+            &'a self,
+            audio_path: &'a Path,
+        ) -> MeetingFileTranscriptionFuture<'a> {
+            let stem = audio_path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("segment")
+                .to_string();
+            Box::pin(async move {
+                Ok(format!(
+                    "We decided to ship this segment. Please follow up on {stem} by tomorrow."
+                ))
+            })
+        }
+    }
+
+    fn temp_root() -> PathBuf {
+        std::env::temp_dir().join(format!("astra_meeting_runtime_{}", Uuid::new_v4()))
+    }
+
+    fn config() -> MeetingConfig {
+        MeetingConfig {
+            platform: "teams".to_string(),
+            capture_backend: CaptureBackend::CoreAudio,
+            transcription_model: "local".to_string(),
+            sample_rate: 16_000,
+            diarization_enabled: false,
+            privacy_mode: "default".to_string(),
+            session_mode: MeetingSessionMode::RealCapture,
+            live_transcription_enabled: false,
+            capture_options: super::super::types::MeetingCaptureOptions::default(),
+        }
+    }
+
+    fn transcript() -> TranscriptEntry {
+        TranscriptEntry::sourced("", TranscriptSource::Manual, "speaker", "hello", 0.95)
+    }
+
+    #[test]
+    fn privacy_state_denies_recording_by_default() {
+        let runtime = MeetingRuntime::new(temp_root());
+        let state = runtime.consent_state().expect("consent state");
+        assert!(!state.given);
+        assert!(!state.global_enabled);
+    }
+
+    #[test]
+    fn start_meeting_requires_explicit_consent() {
+        let runtime = MeetingRuntime::new(temp_root());
+        let result = runtime.start_session("teams".to_string(), config());
+        assert!(matches!(
+            result,
+            Err(MeetingRuntimeError::ConsentRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn unsupported_audio_capture_prevents_session_start_after_consent() {
+        let runtime = MeetingRuntime::new(temp_root());
+        runtime.grant_consent("teams").expect("grant consent");
+        let result = runtime.start_session("teams".to_string(), config());
+        assert!(matches!(
+            result,
+            Err(MeetingRuntimeError::CaptureUnavailable { .. })
+        ));
+        assert!(runtime
+            .get_active_session()
+            .expect("active session")
+            .is_none());
+    }
+
+    #[test]
+    fn cannot_add_transcript_without_active_session() {
+        let runtime = MeetingRuntime::new(temp_root());
+        let result = runtime.add_transcript(transcript());
+        assert!(matches!(result, Err(MeetingRuntimeError::NoActiveSession)));
+    }
+
+    #[test]
+    fn manual_transcript_is_marked_manual_and_derives_artifacts() {
+        let runtime = MeetingRuntime::new(temp_root());
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+
+        let mut entry = TranscriptEntry::sourced(
+            "",
+            TranscriptSource::Unknown,
+            "Simone",
+            "We decided to ship the scoped milestone because it is ready. Please follow up by tomorrow.",
+            0.8,
+        );
+        entry.stt_model = Some("should_be_cleared_for_manual".to_string());
+        entry.audio_backend = Some("should_be_cleared_for_manual".to_string());
+
+        runtime.add_transcript(entry).expect("add transcript");
+
+        let state = runtime.get_active_state().expect("read active state");
+        let transcript = state.transcript.first().expect("transcript entry");
+
+        assert_eq!(transcript.source, TranscriptSource::Manual);
+        assert!(transcript.stt_model.is_none());
+        assert!(transcript.audio_backend.is_none());
+        assert!(state
+            .notes
+            .iter()
+            .any(|note| note.evidence_segment_ids.contains(&transcript.segment_id)));
+        assert!(state
+            .action_items
+            .iter()
+            .any(|item| item.evidence_segment_ids.contains(&transcript.segment_id)));
+        assert!(state.decisions.iter().any(|decision| decision
+            .evidence_segment_ids
+            .contains(&transcript.segment_id)));
+    }
+
+    #[tokio::test]
+    async fn dual_source_segment_stt_is_source_tagged_and_timeline_ordered() {
+        let root = temp_root();
+        let runtime =
+            MeetingRuntime::with_file_transcriber(root.clone(), Arc::new(FixedTranscriber));
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+
+        let storage_dir = root.join(".astra").join("meetings");
+        let samples = vec![100_i16; 16_000];
+        let system_writer = SegmentWriter::new(
+            storage_dir.clone(),
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let mic_writer = SegmentWriter::new(
+            storage_dir,
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::Microphone,
+                ..SegmentWriterConfig::default()
+            },
+        );
+
+        let mut mic_segment = mic_writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("mic segment");
+        mic_segment.sequence_number = 2;
+        mic_segment.start_ms = Some(2_000);
+        mic_segment.end_ms = Some(3_000);
+
+        let mut system_segment = system_writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("system segment");
+        system_segment.sequence_number = 1;
+        system_segment.start_ms = Some(0);
+        system_segment.end_ms = Some(1_000);
+
+        runtime
+            .transcribe_captured_segment(mic_segment, Some("mic".to_string()), false)
+            .await
+            .expect("mic transcription");
+        runtime
+            .transcribe_captured_segment(system_segment, Some("system".to_string()), false)
+            .await
+            .expect("system transcription");
+
+        let state = runtime.get_active_state().expect("active state");
+        assert_eq!(state.transcript.len(), 2);
+        assert_eq!(state.transcript[0].source, TranscriptSource::SystemAudio);
+        assert_eq!(state.transcript[0].start_ms, Some(0));
+        assert_eq!(state.transcript[1].source, TranscriptSource::Microphone);
+        assert_eq!(state.transcript[1].start_ms, Some(2_000));
+        assert!(state.notes.iter().any(|note| {
+            note.evidence_segment_ids
+                .contains(&state.transcript[0].segment_id)
+        }));
+        assert!(state.notes.iter().any(|note| {
+            note.evidence_segment_ids
+                .contains(&state.transcript[1].segment_id)
+        }));
+    }
+
+    #[test]
+    fn cannot_add_transcript_while_paused() {
+        let root = temp_root();
+        let mut registry = SessionRegistry::new(root);
+        registry
+            .start(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+                MeetingStatus::Ready,
+                false,
+                Some("manual session".to_string()),
+            )
+            .expect("registry start");
+        registry.pause().expect("pause");
+        let result = registry.add_transcript(transcript());
+        assert!(result.is_err());
+        assert!(matches!(
+            registry.get_active_state().status,
+            MeetingStatus::Paused
+        ));
+    }
+
+    #[test]
+    fn clear_meeting_data_removes_persisted_files() {
+        let root = temp_root();
+        let runtime = MeetingRuntime::new(root.clone());
+        let meeting_dir = root.join(".astra").join("meetings").join("old_session");
+        std::fs::create_dir_all(&meeting_dir).expect("meeting dir");
+        std::fs::write(meeting_dir.join("notes.json"), "{}").expect("meeting file");
+
+        let result = runtime
+            .clear_all_data(ClearMeetingDataRequest {
+                scope: MeetingClearScope::All,
+                confirmation_phrase: CLEAR_MEETING_DATA_CONFIRMATION_PHRASE.to_string(),
+            })
+            .expect("clear data");
+        assert_eq!(result.persisted_entries_removed, 1);
+        assert!(!meeting_dir.exists());
+    }
+
+    #[test]
+    fn manual_action_item_requires_active_mutable_session() {
+        let runtime = MeetingRuntime::new(temp_root());
+        let item = ActionItem {
+            id: super::super::types::new_meeting_artifact_id(),
+            session_id: String::new(),
+            timestamp: Utc::now(),
+            created_at: Utc::now(),
+            title: "follow up".to_string(),
+            description: "follow up".to_string(),
+            assignee: None,
+            deadline: None,
+            status: ActionItemStatus::Open,
+            evidence_segment_ids: Vec::new(),
+        };
+        let result = runtime.add_action_item(item);
+        assert!(matches!(result, Err(MeetingRuntimeError::NoActiveSession)));
+    }
+}

@@ -6,17 +6,16 @@ use crate::{
         ExecutableTargetConfidenceDiagnostic, FocusedPerceptionFailureReason,
         FocusedPerceptionRequest, FrameUncertainty, GoalConstraints, GoalLoopCompletionDiagnostics,
         GoalLoopRun, GoalLoopStatus, GoalSpec, GoalType, GoalVerificationRecord,
-        GoalVerificationStatus, InteractionSurfaceKind, OffscreenInferenceStage, PageEvidenceSource,
-        PageSemanticEvidence, PageState, PerceptionRequestMode, PerceptionRoutingDecision,
-        PlannerContractDecision,
-        PlannerContractInput, PlannerContractSource, PlannerDecisionDiagnostic,
-        PlannerDecisionStatus, PlannerRejectionReason, PlannerScrollIntent, PlannerStep,
-        PlannerStepExecutionRecord, PlannerStepExecutionStatus, PlannerStepKind,
-        PlannerVisibilityAssessment, PrimaryList, PrimaryListItem, SemanticScreenFrame,
-        SurfaceOwnershipDiagnostic, SurfaceOwnershipStatus, VerifiedInteractionSurface,
-        VisibleActionabilityDiagnostic, VisibleActionabilityStatus, VisibleEntity,
-        VisibleEntityKind, VisibleGroundingGap, VisibleRefinementStrategy, VisibleResultItem,
-        VisibleResultKind,
+        GoalVerificationStatus, InteractionSurfaceKind, OffscreenInferenceStage,
+        PageEvidenceSource, PageSemanticEvidence, PageState, PerceptionRequestMode,
+        PerceptionRoutingDecision, PlannerContractDecision, PlannerContractInput,
+        PlannerContractSource, PlannerDecisionDiagnostic, PlannerDecisionStatus,
+        PlannerRejectionReason, PlannerScrollIntent, PlannerStep, PlannerStepExecutionRecord,
+        PlannerStepExecutionStatus, PlannerStepKind, PlannerVisibilityAssessment, PrimaryList,
+        PrimaryListItem, SemanticScreenFrame, SurfaceOwnershipDiagnostic, SurfaceOwnershipStatus,
+        VerifiedInteractionSurface, VisibleActionabilityDiagnostic, VisibleActionabilityStatus,
+        VisibleEntity, VisibleEntityKind, VisibleGroundingGap, VisibleRefinementStrategy,
+        VisibleResultItem, VisibleResultKind,
     },
     ui_target_grounding::{
         ground_targets_for_request, normalize_browser_app_hint, normalize_content_provider_hint,
@@ -574,12 +573,9 @@ impl GoalLoopRuntime {
                     run.post_action_progress_observed = true;
                 }
                 if post_click.goal_achieved {
-                    let reason = post_click
-                        .achieved_reason
-                        .clone()
-                        .unwrap_or_else(|| {
-                            "post-click frame shows list_item_detail_open transition".into()
-                        });
+                    let reason = post_click.achieved_reason.clone().unwrap_or_else(|| {
+                        "post-click frame shows list_item_detail_open transition".into()
+                    });
                     let verification = GoalVerificationRecord {
                         iteration,
                         status: GoalVerificationStatus::GoalAchieved,
@@ -700,8 +696,7 @@ impl GoalLoopRuntime {
             if verification.status == GoalVerificationStatus::GoalAchieved {
                 run.status = GoalLoopStatus::GoalAchieved;
                 run.failure_reason = None;
-                run.completion_diagnostics.goal_achieved_reason =
-                    Some(verification.reason.clone());
+                run.completion_diagnostics.goal_achieved_reason = Some(verification.reason.clone());
                 run.completion_diagnostics.logical_steps_completed =
                     if !run.executed_steps.is_empty() || run.planner_steps.is_empty() {
                         1
@@ -5060,8 +5055,7 @@ fn record_post_click_completion_diagnostics(
     diagnostics.post_click_page_context = Some(page_context_summary(frame));
     diagnostics.post_click_page_kind = post_click_page_kind_label(frame);
     diagnostics.post_click_provider_hint = frame.page_evidence.content_provider_hint.clone();
-    diagnostics.post_click_title_or_entity_evidence =
-        outcome.title_or_entity_evidence.clone();
+    diagnostics.post_click_title_or_entity_evidence = outcome.title_or_entity_evidence.clone();
     diagnostics.post_click_transition_kind = outcome.transition_kind.clone();
     diagnostics.goal_success_condition = Some(run.goal.success_condition.clone());
     diagnostics.executed_attempts = run.executed_steps.len();
@@ -5088,21 +5082,23 @@ fn structural_list_surface_visible(frame: &SemanticScreenFrame) -> bool {
             .as_deref()
             .is_some_and(page_kind_is_list_like)
         || frame
-        .primary_list
-        .as_ref()
-        .is_some_and(|list| !list.items.is_empty())
+            .primary_list
+            .as_ref()
+            .is_some_and(|list| !list.items.is_empty())
         || frame.page_evidence.result_list_visible == Some(true)
         || !frame.visible_result_items.is_empty()
 }
 
 fn structural_list_surface_dominant(frame: &SemanticScreenFrame) -> bool {
-    frame.page_state.as_ref().is_some_and(|state| {
-        state.kind == "list" || state.dominant_content == "result_list"
-    }) || frame
-        .page_evidence
-        .page_kind_hint
-        .as_deref()
-        .is_some_and(page_kind_is_list_like)
+    frame
+        .page_state
+        .as_ref()
+        .is_some_and(|state| state.kind == "list" || state.dominant_content == "result_list")
+        || frame
+            .page_evidence
+            .page_kind_hint
+            .as_deref()
+            .is_some_and(page_kind_is_list_like)
 }
 
 fn structural_detail_surface_visible(frame: &SemanticScreenFrame) -> bool {
@@ -5144,8 +5140,13 @@ fn page_state_is_detail_like(state: Option<&PageState>) -> bool {
 fn detail_dominant_content_kind(value: &str) -> bool {
     matches!(
         value,
-        "detail_view" | "video_player" | "article" | "document" | "content_page"
-            | "product_detail" | "profile_detail"
+        "detail_view"
+            | "video_player"
+            | "article"
+            | "document"
+            | "content_page"
+            | "product_detail"
+            | "profile_detail"
     )
 }
 
@@ -5208,13 +5209,23 @@ fn opened_content_title_or_entity_evidence(frame: &SemanticScreenFrame) -> Vec<S
         evidence.push(format!("query_hint={query}"));
     }
     for entity in frame.visible_entities.iter().take(3) {
-        if let Some(name) = entity.name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+        if let Some(name) = entity
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
             evidence.push(format!("visible_entity={name}"));
         }
     }
     if evidence.is_empty() && !structural_list_surface_visible(frame) {
         for item in frame.visible_result_items.iter().take(2) {
-            if let Some(title) = item.title.as_deref().map(str::trim).filter(|title| !title.is_empty()) {
+            if let Some(title) = item
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+            {
                 evidence.push(format!("visible_title={title}"));
             }
         }
@@ -5936,12 +5947,10 @@ fn normalize_page_state_kind(value: &str) -> String {
         | "listing"
         | "catalog"
         | "search" => "list".into(),
-        "detail" | "details" | "detail_page" | "web_page" | "article_page"
-        | "content_page" | "document_page" | "product_page" | "profile_page" => "detail".into(),
+        "detail" | "details" | "detail_page" | "web_page" | "article_page" | "content_page"
+        | "document_page" | "product_page" | "profile_page" => "detail".into(),
         "player" | "watch" | "watch_page" | "video" | "video_page" | "video_player"
-        | "media_page" | "media_player" => {
-            "player".into()
-        }
+        | "media_page" | "media_player" => "player".into(),
         "form" | "input_form" => "form".into(),
         "mixed" | "split" => "mixed".into(),
         "youtube" | "google" | "amazon" | "github" => "unknown".into(),

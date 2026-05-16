@@ -1,0 +1,1454 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "../ui/buttons/Button";
+import { useMeeting } from "../hooks/useMeeting";
+import type { CapabilityManifest, CapabilityToolState } from "../types/desktopAgent";
+import type {
+    ActionItem,
+    CallInfo,
+    CaptureBackend,
+    ConsentState,
+    DecisionLogEntry,
+    MeetingConfig,
+    MeetingDataClearPreview,
+    MeetingLiveCapabilitySnapshot,
+    MeetingSession,
+    MeetingSessionState,
+    MeetingStatus,
+    TranscriptEntry,
+} from "../types/meeting";
+import { CLEAR_MEETING_DATA_CONFIRMATION_PHRASE } from "../types/meeting";
+
+type MeetingDebugPanelProps = {
+    capabilities: CapabilityManifest | null;
+};
+
+type MeetingUiState =
+    | "not_started"
+    | "manual_active"
+    | "blocked_permissions"
+    | "ready_to_record"
+    | "recording"
+    | "transcribing"
+    | "paused"
+    | "failed"
+    | "completed";
+
+type MeetingUiSummary = {
+    state: MeetingUiState;
+    title: string;
+    description: string;
+    nextAction?: string;
+    blockingReasons: string[];
+    isRecording: boolean;
+    isTranscribing: boolean;
+};
+
+type MeetingStartReadiness = {
+    canRequestStart: boolean;
+    requiresApprovalOrConfirmation: boolean;
+    hardBlockers: string[];
+    softGates: string[];
+    statusLabel: string;
+    primaryHelpText: string;
+};
+
+type CaptureReadiness = {
+    backendAvailable: boolean;
+    audioToolAvailable: boolean;
+    segmentToolAvailable: boolean;
+    audioPermissionReady: boolean;
+    segmentPermissionReady: boolean;
+    approvalRequired: boolean;
+    blockedReason: string | null;
+    blockedTools: string[];
+};
+
+const DEFAULT_PLATFORM = "teams";
+type CaptureMode = "system_audio" | "microphone" | "both";
+
+function formatStatus(status?: MeetingStatus | null): string {
+    if (!status) return "unknown";
+    if (typeof status === "string") return status;
+    if ("failed" in status) return `failed: ${status.failed}`;
+    return `error: ${status.error}`;
+}
+
+function statusKind(status?: MeetingStatus | null): string {
+    if (!status) return "unknown";
+    if (typeof status === "string") return status;
+    if ("failed" in status) return "failed";
+    return "error";
+}
+
+function transcriptSourceLabel(source?: string | null): string {
+    switch (source) {
+        case "microphone":
+            return "MIC";
+        case "system_audio":
+            return "SYSTEM";
+        case "manual":
+            return "MANUAL";
+        case "imported_file":
+            return "FILE";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+function makeLocalId(): string {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+        return crypto.randomUUID();
+    }
+    return `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function statusFailureReason(status?: MeetingStatus | null): string | null {
+    if (!status || typeof status === "string") return null;
+    if ("failed" in status) return status.failed;
+    return status.error;
+}
+
+function toolState(tool?: CapabilityToolState): string {
+    if (!tool) return "not registered";
+    if (!tool.available) return tool.disabled_reason ?? "unavailable";
+    return tool.state;
+}
+
+function toolReady(tool?: CapabilityToolState): boolean {
+    return tool?.available === true && tool.enabled === true;
+}
+
+function permissionStatus(tool?: CapabilityToolState): string {
+    if (!tool) return "not registered";
+    if (!tool.available) return "unavailable";
+    if (!tool.enabled) return "blocked";
+    if (tool.state === "approval_gated") return "approval required";
+    return "ready";
+}
+
+function pushUnique(values: string[], value: string | null | undefined) {
+    if (value && !values.includes(value)) values.push(value);
+}
+
+function manualMeetingConfig(platform: string, backend: CaptureBackend): MeetingConfig {
+    return {
+        platform,
+        capture_backend: backend,
+        transcription_model: "local",
+        sample_rate: 16_000,
+        diarization_enabled: false,
+        privacy_mode: "default",
+        session_mode: "manual",
+        live_transcription_enabled: false,
+        capture_options: {
+            system_audio: false,
+            microphone: false,
+            segment_transcription: false,
+        },
+    };
+}
+
+function realCaptureConfig(platform: string, backend: CaptureBackend, mode: CaptureMode): MeetingConfig {
+    const systemAudio = mode === "system_audio" || mode === "both";
+    const microphone = mode === "microphone" || mode === "both";
+    return {
+        platform,
+        capture_backend: backend === "default" ? "wasapi" : backend,
+        transcription_model: "local",
+        sample_rate: 16_000,
+        diarization_enabled: false,
+        privacy_mode: "default",
+        session_mode: "real_capture",
+        live_transcription_enabled: true,
+        capture_options: {
+            system_audio: systemAudio,
+            microphone,
+            segment_transcription: true,
+        },
+    };
+}
+
+function normalizePlatformKey(value: string): string {
+    const collapsed = value
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()
+        .replace(/\s+/g, " ");
+    if (["teams", "microsoft teams", "ms teams", "msteams"].includes(collapsed)) {
+        return "teams";
+    }
+    return collapsed.replace(/\s/g, "_");
+}
+
+function errorText(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+}
+
+function summarizeOperationResult(result: unknown): string {
+    if (result == null) return JSON.stringify({ ok: true });
+    if (!isRecord(result)) return JSON.stringify(result);
+
+    if ("persisted_entries_removed" in result) {
+        return JSON.stringify({
+            runtime_state_cleared: result.runtime_state_cleared,
+            persisted_entries_removed: result.persisted_entries_removed,
+            storage_path: result.storage_path,
+            capture_stop_attempted: result.capture_stop_attempted,
+            capture_stop_succeeded: result.capture_stop_succeeded,
+            capture_stop_error_kind: result.capture_stop_error_kind ?? null,
+            clear_aborted: result.clear_aborted,
+        });
+    }
+
+    if ("persisted_entries" in result) {
+        return JSON.stringify({
+            runtime_state_present: result.runtime_state_present,
+            persisted_entries: result.persisted_entries,
+            storage_path: result.storage_path,
+        });
+    }
+
+    if ("transcript_added" in result) {
+        return JSON.stringify({
+            transcript_added: result.transcript_added,
+            transcript_index: result.transcript_index,
+            transcript_source: result.transcript_source,
+            segment_id: result.segment_id,
+            text_length: result.text_length,
+            audio_file_extension: result.audio_file_extension,
+            file_size_bytes: result.file_size_bytes,
+            stt_boundary: result.stt_boundary,
+            source_audio_path_redacted: result.source_audio_path_redacted,
+            managed_audio_path_redacted: result.managed_audio_path_redacted,
+            cleanup_requested: result.cleanup_requested,
+            cleanup_performed: result.cleanup_performed,
+            cleanup_error: result.cleanup_error ?? null,
+        });
+    }
+
+    if ("session_id" in result && "transcript" in result) {
+        const transcript = Array.isArray(result.transcript) ? result.transcript.length : 0;
+        const actionItems = Array.isArray(result.action_items) ? result.action_items.length : 0;
+        const decisions = Array.isArray(result.decisions) ? result.decisions.length : 0;
+        return JSON.stringify({
+            session_id: result.session_id,
+            platform: result.platform,
+            transcript,
+            action_items: actionItems,
+            decisions,
+        });
+    }
+
+    if ("session_id" in result) {
+        return JSON.stringify({
+            session_id: result.session_id,
+            platform: result.platform,
+            status: result.status,
+            session_mode: result.session_mode,
+        });
+    }
+
+    return JSON.stringify(result);
+}
+
+function deadlineToIso(value: string): string | null {
+    if (!value) return null;
+    const parsed = new Date(`${value}T23:59:00`);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function formatEntryTime(value: string): string {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+    });
+}
+
+function relativeTimestamp(value?: string | null): string {
+    if (!value) return "never";
+    const parsed = new Date(value).getTime();
+    if (Number.isNaN(parsed)) return "unknown";
+    const diffSeconds = Math.max(0, Math.round((Date.now() - parsed) / 1000));
+    if (diffSeconds < 10) return "just now";
+    if (diffSeconds < 60) return `${diffSeconds}s ago`;
+    const diffMinutes = Math.round(diffSeconds / 60);
+    if (diffMinutes < 60) return `${diffMinutes}m ago`;
+    const diffHours = Math.round(diffMinutes / 60);
+    return `${diffHours}h ago`;
+}
+
+function callLooksLikeGoogleMeet(callInfo: CallInfo | null): boolean {
+    if (!callInfo?.is_active_call) return false;
+    const haystack = `${callInfo.platform} ${callInfo.process_name} ${callInfo.window_title}`.toLowerCase();
+    return haystack.includes("google meet") || haystack.includes("meet.google") || haystack.includes("google_meet");
+}
+
+function transcriptEmptyCopy(uiState: MeetingUiState, sessionMode?: string | null): string {
+    if (uiState === "recording" || uiState === "transcribing") {
+        return "Recording has started; waiting for the first audio segment.";
+    }
+    if (sessionMode === "manual") {
+        return "Manual session is active. Add a manual transcript or transcribe a .wav file.";
+    }
+    return "Astra is not recording.";
+}
+
+export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
+    const meeting = useMeeting();
+    const transcriptRef = useRef<HTMLElement | null>(null);
+    const [platform, setPlatform] = useState(DEFAULT_PLATFORM);
+    const [consent, setConsent] = useState<ConsentState | null>(null);
+    const [activeSession, setActiveSession] = useState<MeetingSession | null>(null);
+    const [activeState, setActiveState] = useState<MeetingSessionState | null>(null);
+    const [lastCompletedState, setLastCompletedState] = useState<MeetingSessionState | null>(null);
+    const [callInfo, setCallInfo] = useState<CallInfo | null>(null);
+    const [devices, setDevices] = useState<string[]>([]);
+    const [backend, setBackend] = useState<CaptureBackend>("default");
+    const [liveCapabilities, setLiveCapabilities] = useState<MeetingLiveCapabilitySnapshot | null>(null);
+    const [lastResult, setLastResult] = useState<string | null>(null);
+    const [lastError, setLastError] = useState<string | null>(null);
+    const [refreshWarnings, setRefreshWarnings] = useState<Record<string, string>>({});
+    const [isBusy, setIsBusy] = useState(false);
+    const [captureMode, setCaptureMode] = useState<CaptureMode>("both");
+    const [transcriptSpeaker, setTranscriptSpeaker] = useState("unknown");
+    const [transcriptText, setTranscriptText] = useState("");
+    const [transcriptConfidence, setTranscriptConfidence] = useState("0.95");
+    const [audioPath, setAudioPath] = useState("");
+    const [audioSpeaker, setAudioSpeaker] = useState("unknown");
+    const [cleanupAudioFile, setCleanupAudioFile] = useState(true);
+    const [actionDescription, setActionDescription] = useState("");
+    const [actionAssignee, setActionAssignee] = useState("");
+    const [actionDeadline, setActionDeadline] = useState("");
+    const [decisionText, setDecisionText] = useState("");
+    const [decisionRationale, setDecisionRationale] = useState("");
+    const [decisionMadeBy, setDecisionMadeBy] = useState("");
+    const [clearPreview, setClearPreview] = useState<MeetingDataClearPreview | null>(null);
+    const [showClearConfirmation, setShowClearConfirmation] = useState(false);
+    const [clearPhrase, setClearPhrase] = useState("");
+
+    const meetingTools = useMemo(
+        () => capabilities?.tools.filter((tool) => tool.category === "meeting") ?? [],
+        [capabilities]
+    );
+    const toolByName = useCallback(
+        (name: string) => meetingTools.find((tool) => tool.tool_name === name),
+        [meetingTools]
+    );
+
+    const normalizedPlatform = useMemo(() => normalizePlatformKey(platform), [platform]);
+    const displayedState = activeSession ? activeState : lastCompletedState;
+    const stateKind = activeSession ? "active" : lastCompletedState ? "last completed" : "none";
+    const hasActiveSession = activeSession !== null;
+    const currentStatus = displayedState?.status ?? activeSession?.status ?? null;
+    const currentStatusKind = statusKind(currentStatus);
+    const sessionMode = activeSession?.session_mode ?? displayedState?.session.session_mode ?? null;
+    const transcriptEntries = displayedState?.transcript ?? [];
+    const notes = displayedState?.notes ?? [];
+    const summaries = displayedState?.summary ?? [];
+    const actionItems = displayedState?.action_items ?? [];
+    const decisions = displayedState?.decisions ?? [];
+    const diagnostics = displayedState?.diagnostics ?? [];
+    const metrics = liveCapabilities?.capture_health.metrics;
+    const systemHealth = liveCapabilities?.system_capture_health;
+    const microphoneHealth = liveCapabilities?.microphone_capture_health;
+    const systemMetrics = systemHealth?.metrics;
+    const microphoneMetrics = microphoneHealth?.metrics;
+    const segmentsWritten = metrics?.segments_written ?? 0;
+    const segmentsTranscribed = metrics?.segments_transcribed ?? 0;
+    const pendingSegments = Math.max(0, segmentsWritten - segmentsTranscribed);
+    const lastTranscriptAt = transcriptEntries.length
+        ? transcriptEntries[transcriptEntries.length - 1]?.timestamp
+        : null;
+    const lastSummaryTimestamp = displayedState?.summary.length
+        ? displayedState.summary[displayedState.summary.length - 1]?.timestamp
+        : null;
+    const audioCaptureTool = toolByName("meeting.audio.capture");
+    const segmentTranscriptionTool = toolByName("meeting.transcription.segment");
+    const googleMeetDetected = callLooksLikeGoogleMeet(callInfo);
+
+    const realCaptureReadiness = useMemo<CaptureReadiness>(() => {
+        const backendAvailable = liveCapabilities?.windows_wasapi_capture.available === true;
+        const audioToolAvailable = audioCaptureTool?.available === true;
+        const segmentToolAvailable = segmentTranscriptionTool?.available === true;
+        const audioPermissionReady = toolReady(audioCaptureTool);
+        const segmentPermissionReady = toolReady(segmentTranscriptionTool);
+        const approvalRequired =
+            audioCaptureTool?.requires_approval === true ||
+            segmentTranscriptionTool?.requires_approval === true ||
+            audioCaptureTool?.state === "approval_gated" ||
+            segmentTranscriptionTool?.state === "approval_gated";
+        const blockedTools: string[] = [];
+
+        if (audioCaptureTool && (!audioToolAvailable || !audioCaptureTool.enabled)) {
+            blockedTools.push("MeetingAudioCapture");
+        }
+        if (segmentTranscriptionTool && (!segmentToolAvailable || !segmentTranscriptionTool.enabled)) {
+            blockedTools.push("MeetingTranscriptionSegment");
+        }
+
+        let blockedReason: string | null = null;
+        if (!liveCapabilities) {
+            blockedReason = "Live capture capability state has not been loaded.";
+        } else if (!backendAvailable) {
+            blockedReason = liveCapabilities.windows_wasapi_capture.reason ?? "WASAPI capture backend is unavailable.";
+        } else if (!audioToolAvailable) {
+            blockedReason = audioCaptureTool?.disabled_reason ?? "Meeting audio capture tool is unavailable.";
+        } else if (!segmentToolAvailable) {
+            blockedReason = segmentTranscriptionTool?.disabled_reason ?? "Meeting segment transcription tool is unavailable.";
+        } else if (!audioPermissionReady || !segmentPermissionReady) {
+            blockedReason = "Required meeting capture permissions are disabled.";
+        }
+
+        return {
+            backendAvailable,
+            audioToolAvailable,
+            segmentToolAvailable,
+            audioPermissionReady,
+            segmentPermissionReady,
+            approvalRequired,
+            blockedReason,
+            blockedTools,
+        };
+    }, [audioCaptureTool, liveCapabilities, segmentTranscriptionTool]);
+
+    const consentReady =
+        consent?.given === true &&
+        consent.global_enabled === true &&
+        consent.per_app?.[normalizedPlatform] === true;
+
+    const startReadiness = useMemo<MeetingStartReadiness>(() => {
+        const hardBlockers: string[] = [];
+        const softGates: string[] = [];
+        if (consent === null) {
+            pushUnique(hardBlockers, "Consent state not loaded");
+        } else if (!consentReady) {
+            pushUnique(hardBlockers, "Consent required");
+        }
+        if (!liveCapabilities) {
+            pushUnique(hardBlockers, "Recording readiness not loaded");
+        } else if (!realCaptureReadiness.backendAvailable) {
+            pushUnique(hardBlockers, "WASAPI backend unavailable");
+        }
+        realCaptureReadiness.blockedTools.forEach((tool) => pushUnique(hardBlockers, tool));
+        if (realCaptureReadiness.approvalRequired) {
+            pushUnique(softGates, "Approval/confirmation required on click");
+        }
+
+        const canRequestStart = hardBlockers.length === 0;
+        const requiresApprovalOrConfirmation = softGates.length > 0;
+        const statusLabel = canRequestStart
+            ? requiresApprovalOrConfirmation
+                ? "Recording ready for governed start"
+                : "Recording ready"
+            : "Recording unavailable";
+        const primaryHelpText = canRequestStart
+            ? requiresApprovalOrConfirmation
+                ? "Ready for governed start. Confirmation/audit will occur when you click Start."
+                : "Ready to start WASAPI capture."
+            : "No pending approval exists because the request is blocked before approval creation.";
+
+        return {
+            canRequestStart,
+            requiresApprovalOrConfirmation,
+            hardBlockers,
+            softGates,
+            statusLabel,
+            primaryHelpText,
+        };
+    }, [consent, consentReady, liveCapabilities, realCaptureReadiness]);
+
+    const uiSummary = useMemo<MeetingUiSummary>(() => {
+        const isRecording =
+            activeSession?.capture_active === true ||
+            liveCapabilities?.capture_health.state === "capturing" ||
+            currentStatusKind === "capturing";
+        const isTranscribing =
+            isRecording &&
+            (currentStatusKind === "transcribing" ||
+                pendingSegments > 0 ||
+                (metrics?.segments_queued ?? 0) > 0);
+        const failureReason =
+            statusFailureReason(currentStatus) ??
+            liveCapabilities?.capture_health.last_error ??
+            metrics?.last_backend_error_message ??
+            metrics?.last_segment_transcription_error_kind ??
+            null;
+
+        if (
+            currentStatusKind === "failed" ||
+            currentStatusKind === "error" ||
+            liveCapabilities?.capture_health.state === "failed" ||
+            liveCapabilities?.capture_health.status === "failed"
+        ) {
+            return {
+                state: "failed",
+                title: "Capture failed",
+                description: failureReason ? `Reason: ${failureReason}` : "The meeting capture pipeline reported a failure.",
+                nextAction: "Check advanced diagnostics or restart capture.",
+                blockingReasons: failureReason ? [failureReason] : [],
+                isRecording,
+                isTranscribing,
+            };
+        }
+
+        if (currentStatusKind === "paused" || liveCapabilities?.capture_health.state === "paused") {
+            return {
+                state: "paused",
+                title: "Paused",
+                description: "Audio capture is paused. Astra is not recording new audio right now.",
+                nextAction: "Resume to continue capture, or stop the session.",
+                blockingReasons: [],
+                isRecording: false,
+                isTranscribing: false,
+            };
+        }
+
+        if (isTranscribing) {
+            return {
+                state: "transcribing",
+                title: "Transcribing",
+                description: `Astra is processing captured audio with the existing STT pipeline. Last transcript: ${relativeTimestamp(lastTranscriptAt)}.`,
+                nextAction: pendingSegments > 0 ? "Wait for queued segments to finish." : "Keep recording or stop when finished.",
+                blockingReasons: [],
+                isRecording,
+                isTranscribing,
+            };
+        }
+
+        if (isRecording) {
+            return {
+                state: "recording",
+                title: "Recording",
+                description: `Astra is capturing Windows system audio through WASAPI. Segments: ${segmentsWritten} written / ${segmentsTranscribed} transcribed.`,
+                nextAction: "Keep the meeting audio playing, or stop when finished.",
+                blockingReasons: [],
+                isRecording,
+                isTranscribing: false,
+            };
+        }
+
+        if (hasActiveSession && sessionMode === "manual") {
+            const description = googleMeetDetected
+                ? "Astra is not listening to Google Meet. Browser or call detection is not recording."
+                : "Astra is not listening to system audio. You can add notes manually or transcribe a .wav file.";
+            return {
+                state: "manual_active",
+                title: "Manual session active - not recording",
+                description,
+                nextAction: startReadiness.hardBlockers.length
+                    ? "Enable the blocked permissions, then start recording."
+                    : startReadiness.requiresApprovalOrConfirmation
+                      ? "Recording ready for governed start. Confirmation/audit will occur when you click Start."
+                      : "Use manual tools, transcribe a .wav file, or start WASAPI capture.",
+                blockingReasons: startReadiness.hardBlockers,
+                isRecording: false,
+                isTranscribing: false,
+            };
+        }
+
+        if (currentStatusKind === "completed") {
+            return {
+                state: "completed",
+                title: "Completed",
+                description: "The last meeting session has ended. Transcript and notes remain visible until cleared.",
+                nextAction: "Review the transcript or clear meeting data when finished.",
+                blockingReasons: startReadiness.hardBlockers,
+                isRecording: false,
+                isTranscribing: false,
+            };
+        }
+
+        if (currentStatusKind === "stopped") {
+            return {
+                state: "completed",
+                title: "Stopped",
+                description: "The last meeting session has ended. Transcript and notes remain visible until cleared.",
+                nextAction: "Review the transcript or clear meeting data when finished.",
+                blockingReasons: startReadiness.hardBlockers,
+                isRecording: false,
+                isTranscribing: false,
+            };
+        }
+
+        if (!startReadiness.canRequestStart) {
+            return {
+                state: startReadiness.hardBlockers.length ? "blocked_permissions" : "not_started",
+                title: startReadiness.hardBlockers.length ? "Recording blocked" : "Not started",
+                description: startReadiness.hardBlockers.length
+                    ? "Astra cannot start WASAPI recording because required consent, backend, or permissions are not ready."
+                    : "Astra is not recording or transcribing.",
+                nextAction: startReadiness.hardBlockers.length
+                    ? "Resolve the blocked items below, then start recording."
+                    : "Grant consent and start a manual session or recording.",
+                blockingReasons: startReadiness.hardBlockers,
+                isRecording: false,
+                isTranscribing: false,
+            };
+        }
+
+        return {
+            state: "ready_to_record",
+            title: startReadiness.statusLabel,
+            description: startReadiness.requiresApprovalOrConfirmation
+                ? "This action is high-risk and will be confirmed/audited when you click Start. No pending approval exists yet."
+                : "Consent is granted and the WASAPI capture path is available.",
+            nextAction: startReadiness.requiresApprovalOrConfirmation
+                ? "Click Start recording to enter the governed confirmation path."
+                : "Start recording.",
+            blockingReasons: [],
+            isRecording: false,
+            isTranscribing: false,
+        };
+    }, [
+        activeSession?.capture_active,
+        consentReady,
+        currentStatus,
+        currentStatusKind,
+        googleMeetDetected,
+        hasActiveSession,
+        lastTranscriptAt,
+        liveCapabilities,
+        metrics,
+        pendingSegments,
+        segmentsTranscribed,
+        segmentsWritten,
+        sessionMode,
+        startReadiness,
+    ]);
+
+    const startRecordingDisabledReason = startReadiness.canRequestStart
+        ? startReadiness.primaryHelpText
+        : startReadiness.hardBlockers.join("; ") || "Recording unavailable";
+    const canStartRealCapture = startReadiness.canRequestStart;
+
+    const refreshMeeting = useCallback(async () => {
+        const results = await Promise.allSettled([
+            meeting.getConsentState(),
+            meeting.getActiveSession(),
+            meeting.getActiveState(),
+            meeting.getLastCompletedState(),
+            meeting.getAvailableAudioDevices(),
+            meeting.autoDetectAudioBackend(),
+            meeting.getLiveCapabilities(),
+        ]);
+        const warnings: Record<string, string> = {};
+
+        const [
+            nextConsent,
+            nextSession,
+            nextState,
+            nextLastCompleted,
+            nextDevices,
+            nextBackend,
+            nextLiveCapabilities,
+        ] = results;
+
+        if (nextConsent.status === "fulfilled") setConsent(nextConsent.value);
+        else warnings.consent = errorText(nextConsent.reason);
+
+        if (nextSession.status === "fulfilled") setActiveSession(nextSession.value);
+        else warnings.session = errorText(nextSession.reason);
+
+        if (nextState.status === "fulfilled") setActiveState(nextState.value);
+        else warnings.state = errorText(nextState.reason);
+
+        if (nextLastCompleted.status === "fulfilled") setLastCompletedState(nextLastCompleted.value);
+        else warnings.last_completed = errorText(nextLastCompleted.reason);
+
+        if (nextDevices.status === "fulfilled") setDevices(nextDevices.value);
+        else warnings.devices = errorText(nextDevices.reason);
+
+        if (nextBackend.status === "fulfilled") setBackend(nextBackend.value);
+        else warnings.backend = errorText(nextBackend.reason);
+
+        if (nextLiveCapabilities.status === "fulfilled") setLiveCapabilities(nextLiveCapabilities.value);
+        else warnings.live_capabilities = errorText(nextLiveCapabilities.reason);
+
+        setRefreshWarnings(warnings);
+    }, [meeting]);
+
+    useEffect(() => {
+        void refreshMeeting();
+    }, [refreshMeeting]);
+
+    const runOperation = useCallback(
+        async (label: string, operation: () => Promise<unknown>, refreshAfter = true) => {
+            try {
+                setIsBusy(true);
+                setLastError(null);
+                const result = await operation();
+                setLastResult(`${label}: ${summarizeOperationResult(result)}`);
+                if (refreshAfter) {
+                    await refreshMeeting();
+                }
+                return true;
+            } catch (err) {
+                setLastResult(null);
+                setLastError(`${label}: ${errorText(err)}`);
+                return false;
+            } finally {
+                setIsBusy(false);
+            }
+        },
+        [refreshMeeting]
+    );
+
+    const handleDetect = useCallback(
+        () =>
+            runOperation(
+                "detect call",
+                async () => {
+                    const detected = await meeting.detectActiveCall();
+                    setCallInfo(detected);
+                    return detected ?? { detection_state: "idle" };
+                },
+                false
+            ),
+        [meeting, runOperation]
+    );
+
+    const handleAddTranscript = useCallback(async () => {
+        const text = transcriptText.trim();
+        if (!text) {
+            setLastError("add transcript: text is required");
+            return;
+        }
+        const parsedConfidence = Number.parseFloat(transcriptConfidence);
+        const confidence = Number.isFinite(parsedConfidence)
+            ? Math.max(0, Math.min(1, parsedConfidence))
+            : 1;
+        const entry: TranscriptEntry = {
+            segment_id: makeLocalId(),
+            session_id: activeSession?.session_id ?? "",
+            source: "manual",
+            timestamp: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+            speaker: transcriptSpeaker.trim() || "unknown",
+            speaker_id: null,
+            text,
+            confidence,
+            start_ms: null,
+            end_ms: null,
+            stt_model: null,
+            audio_backend: null,
+        };
+        const ok = await runOperation("add transcript", () => meeting.addTranscript(entry));
+        if (ok) setTranscriptText("");
+    }, [activeSession?.session_id, meeting, runOperation, transcriptConfidence, transcriptSpeaker, transcriptText]);
+
+    const handleTranscribeAudioFile = useCallback(async () => {
+        const path = audioPath.trim();
+        if (!path) {
+            setLastError("transcribe file: .wav file path is required");
+            return;
+        }
+        const ok = await runOperation("transcribe file", () =>
+            meeting.transcribeAudioFile({
+                session_id: activeSession?.session_id ?? null,
+                audio_path: path,
+                speaker: audioSpeaker.trim() || null,
+                cleanup_after_transcription: cleanupAudioFile,
+            })
+        );
+        if (ok && cleanupAudioFile) setAudioPath("");
+    }, [activeSession?.session_id, audioPath, audioSpeaker, cleanupAudioFile, meeting, runOperation]);
+
+    const handleAddActionItem = useCallback(async () => {
+        const description = actionDescription.trim();
+        if (!description) {
+            setLastError("add action item: description is required");
+            return;
+        }
+        const item: ActionItem = {
+            timestamp: new Date().toISOString(),
+            description,
+            assignee: actionAssignee.trim()
+                ? { name: actionAssignee.trim(), speaker_id: null }
+                : null,
+            deadline: deadlineToIso(actionDeadline),
+            status: "open",
+        };
+        const ok = await runOperation("add action item", () => meeting.addActionItem(item));
+        if (ok) {
+            setActionDescription("");
+            setActionAssignee("");
+            setActionDeadline("");
+        }
+    }, [actionAssignee, actionDeadline, actionDescription, meeting, runOperation]);
+
+    const handleAddDecision = useCallback(async () => {
+        const decision = decisionText.trim();
+        if (!decision) {
+            setLastError("add decision: decision is required");
+            return;
+        }
+        const entry: DecisionLogEntry = {
+            timestamp: new Date().toISOString(),
+            decision,
+            rationale: decisionRationale.trim(),
+            made_by: decisionMadeBy.trim()
+                ? { name: decisionMadeBy.trim(), speaker_id: null }
+                : null,
+        };
+        const ok = await runOperation("add decision", () => meeting.addDecision(entry));
+        if (ok) {
+            setDecisionText("");
+            setDecisionRationale("");
+            setDecisionMadeBy("");
+        }
+    }, [decisionMadeBy, decisionRationale, decisionText, meeting, runOperation]);
+
+    const handlePreviewClearData = useCallback(
+        () =>
+            runOperation(
+                "preview clear data",
+                async () => {
+                    const preview = await meeting.previewClearData();
+                    setClearPreview(preview);
+                    setClearPhrase("");
+                    setShowClearConfirmation(true);
+                    return preview;
+                },
+                false
+            ),
+        [meeting, runOperation]
+    );
+
+    const handleConfirmClearData = useCallback(async () => {
+        const ok = await runOperation("clear meeting data", () =>
+            meeting.clearData({
+                scope: "all",
+                confirmation_phrase: clearPhrase,
+            })
+        );
+        if (ok) {
+            setClearPreview(null);
+            setClearPhrase("");
+            setShowClearConfirmation(false);
+        }
+    }, [clearPhrase, meeting, runOperation]);
+
+    const scrollToTranscript = useCallback(() => {
+        transcriptRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, []);
+
+    return (
+        <div className="desktop-agent-section meeting-control-center">
+            <section className={`desktop-agent-card meeting-status-card meeting-status-card--${uiSummary.state}`}>
+                <div className="meeting-status-card__header">
+                    <div>
+                        <p className="meeting-section-kicker">Overview</p>
+                        <h3>Meeting / Work Session</h3>
+                        <p>Governed meeting capture and transcription</p>
+                    </div>
+                    <span className="meeting-status-pill">{uiSummary.title}</span>
+                </div>
+
+                <div className="meeting-status-main">
+                    <div>
+                        <p className="meeting-status-label">Status</p>
+                        <h2>{uiSummary.title}</h2>
+                        <p className="meeting-status-description">{uiSummary.description}</p>
+                        {googleMeetDetected && !uiSummary.isRecording ? (
+                            <p className="meeting-call-warning">
+                                Google Meet may be open, but Astra is not recording. Start WASAPI capture to listen to Windows system audio.
+                            </p>
+                        ) : null}
+                        {uiSummary.nextAction ? (
+                            <p className="meeting-next-action"><strong>Next step:</strong> {uiSummary.nextAction}</p>
+                        ) : null}
+                    </div>
+                    <div className="meeting-state-facts">
+                        <span>Audio capture: <strong>{uiSummary.isRecording ? "active" : "inactive"}</strong></span>
+                        <span>Transcription: <strong>{uiSummary.isTranscribing ? "active" : "inactive"}</strong></span>
+                        <span>Session: <strong>{hasActiveSession ? sessionMode ?? "active" : stateKind}</strong></span>
+                    </div>
+                </div>
+
+                <div className="meeting-runtime-status-grid">
+                    <article>
+                        <span>Session lifecycle</span>
+                        <strong>{formatStatus(currentStatus)}</strong>
+                    </article>
+                    <article>
+                        <span>Microphone capture</span>
+                        <strong>{microphoneHealth?.state ?? liveCapabilities?.microphone_capture.state ?? "unknown"}</strong>
+                        <small>
+                            {microphoneMetrics?.segments_written ?? 0} written / {microphoneMetrics?.segments_transcribed ?? 0} transcribed
+                            {liveCapabilities?.microphone_capture.reason ? ` - ${liveCapabilities.microphone_capture.reason}` : ""}
+                        </small>
+                    </article>
+                    <article>
+                        <span>System audio capture</span>
+                        <strong>{systemHealth?.state ?? liveCapabilities?.system_audio_capture.state ?? "unknown"}</strong>
+                        <small>
+                            {systemMetrics?.segments_written ?? 0} written / {systemMetrics?.segments_transcribed ?? 0} transcribed
+                            {liveCapabilities?.system_audio_capture.reason ? ` - ${liveCapabilities.system_audio_capture.reason}` : ""}
+                        </small>
+                    </article>
+                    <article>
+                        <span>Segment STT</span>
+                        <strong>{uiSummary.isTranscribing ? "active" : liveCapabilities?.live_segment_transcription.state ?? "inactive"}</strong>
+                        <small>{liveCapabilities?.live_segment_transcription.reason ?? "Segments are transcribed only after managed audio reaches the STT file bridge."}</small>
+                    </article>
+                    <article>
+                        <span>Summary / notes</span>
+                        <strong>{liveCapabilities?.live_summarization.state ?? "unknown"}</strong>
+                        <small>{summaries.length} summaries / {notes.length} notes</small>
+                    </article>
+                </div>
+
+                {uiSummary.blockingReasons.length ? (
+                    <div className="meeting-blockers">
+                        <strong>Blocked by:</strong>
+                        <ul>
+                            {uiSummary.blockingReasons.map((reason) => (
+                                <li key={reason}>{reason}</li>
+                            ))}
+                        </ul>
+                    </div>
+                ) : null}
+
+                <div className="meeting-primary-actions">
+                    <label className="meeting-capture-mode">
+                        <span>Capture mode</span>
+                        <select
+                            value={captureMode}
+                            disabled={isBusy || hasActiveSession}
+                            onChange={(event) => setCaptureMode(event.target.value as CaptureMode)}
+                        >
+                            <option value="both">System + microphone</option>
+                            <option value="system_audio">System audio only</option>
+                            <option value="microphone">Microphone only</option>
+                        </select>
+                    </label>
+                    <Button variant="secondary" radius="full" size="xs" disabled={isBusy} onClick={() => void runOperation("grant consent", () => meeting.grantConsent(platform))}>
+                        Grant consent
+                    </Button>
+                    <Button
+                        variant="secondary"
+                        radius="full"
+                        size="xs"
+                        disabled={isBusy}
+                        onClick={() =>
+                            void runOperation("start manual session", () =>
+                                meeting.startSession(platform, manualMeetingConfig(platform, backend))
+                            )
+                        }
+                    >
+                        Start manual session
+                    </Button>
+                    <Button
+                        variant="secondary"
+                        radius="full"
+                        size="xs"
+                        disabled={isBusy || !canStartRealCapture}
+                        title={startRecordingDisabledReason}
+                        onClick={() =>
+                            void runOperation("start recording", () =>
+                                meeting.startSession(platform, realCaptureConfig(platform, backend, captureMode))
+                            )
+                        }
+                    >
+                        Start recording
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void runOperation("pause session", meeting.pauseSession)}>
+                        Pause
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void runOperation("resume session", meeting.resumeSession)}>
+                        Resume
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void runOperation("stop session", meeting.stopSession)}>
+                        Stop
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" onClick={scrollToTranscript}>
+                        Open transcript
+                    </Button>
+                    <Button variant="danger" radius="full" size="xs" disabled={isBusy} onClick={() => void handlePreviewClearData()}>
+                        Clear data
+                    </Button>
+                </div>
+
+                {Object.entries(refreshWarnings).map(([scope, warning]) => (
+                    <div key={scope} className="desktop-agent-error">{scope}: {warning}</div>
+                ))}
+                {lastError ? <div className="desktop-agent-error">{lastError}</div> : null}
+                {lastResult ? <pre className="desktop-agent-json meeting-operation-result">{lastResult}</pre> : null}
+            </section>
+
+            <section className="desktop-agent-card meeting-section-card">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Live recording</p>
+                        <h3>Recording readiness</h3>
+                    </div>
+                    <Button variant="text" radius="full" size="xs" disabled={isBusy} onClick={() => void refreshMeeting()}>
+                        Refresh
+                    </Button>
+                </div>
+                <div className="meeting-readiness-grid">
+                    <div>
+                        <span>WASAPI backend</span>
+                        <strong>{realCaptureReadiness.backendAvailable ? "ready" : "unavailable"}</strong>
+                    </div>
+                    <div>
+                        <span>Audio capture permission</span>
+                        <strong>{permissionStatus(audioCaptureTool)}</strong>
+                    </div>
+                    <div>
+                        <span>Segment transcription permission</span>
+                        <strong>{permissionStatus(segmentTranscriptionTool)}</strong>
+                    </div>
+                    <div>
+                        <span>Approval required</span>
+                        <strong>{realCaptureReadiness.approvalRequired ? "yes" : "no"}</strong>
+                    </div>
+                    <div>
+                        <span>Result</span>
+                        <strong>{startReadiness.statusLabel}</strong>
+                    </div>
+                    <div>
+                        <span>Capture mode</span>
+                        <strong>{captureMode === "both" ? "system + mic" : captureMode === "microphone" ? "microphone" : "system"}</strong>
+                    </div>
+                </div>
+                <p className="desktop-agent-muted">{startReadiness.primaryHelpText}</p>
+                {startReadiness.requiresApprovalOrConfirmation && startReadiness.canRequestStart ? (
+                    <div className="meeting-governed-start-note">
+                        <strong>Recording ready for governed start.</strong>
+                        <p>This action is high-risk and will be confirmed/audited when you click Start. No pending approval exists yet.</p>
+                    </div>
+                ) : null}
+                {startReadiness.hardBlockers.length ? (
+                    <div className="meeting-blockers">
+                        <strong>Disabled by policy or readiness:</strong>
+                        <ul>
+                            {startReadiness.hardBlockers.map((reason) => (
+                                <li key={reason}>{reason}</li>
+                            ))}
+                        </ul>
+                        <p>No pending approval exists because the request is blocked before approval creation.</p>
+                    </div>
+                ) : null}
+                {realCaptureReadiness.blockedReason ? (
+                    <p className="desktop-agent-muted">{realCaptureReadiness.blockedReason}</p>
+                ) : null}
+                {sessionMode === "manual" && !uiSummary.isRecording ? (
+                    <p className="desktop-agent-muted">Manual session is active, but it is not listening to system audio.</p>
+                ) : null}
+                <div className="meeting-capture-summary">
+                    <span>Segments written: <strong>{segmentsWritten}</strong></span>
+                    <span>Segments transcribed: <strong>{segmentsTranscribed}</strong></span>
+                    <span>System segments: <strong>{systemMetrics?.segments_written ?? 0}</strong></span>
+                    <span>Mic segments: <strong>{microphoneMetrics?.segments_written ?? 0}</strong></span>
+                    <span>Queued: <strong>{metrics?.segments_queued ?? 0}</strong></span>
+                    <span>Silence dropped: <strong>{metrics?.dropped_silence_segments ?? 0}</strong></span>
+                </div>
+                <div className="desktop-agent-inline-actions">
+                    <Button
+                        variant="secondary"
+                        radius="full"
+                        size="xs"
+                        disabled={isBusy || !canStartRealCapture}
+                        title={startRecordingDisabledReason}
+                        onClick={() =>
+                            void runOperation("start recording", () =>
+                                meeting.startSession(platform, realCaptureConfig(platform, backend, captureMode))
+                            )
+                        }
+                    >
+                        Start WASAPI capture
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" disabled title={liveCapabilities?.live_transcription.reason ?? "Live STT unsupported"}>
+                        Streaming STT unsupported
+                    </Button>
+                </div>
+            </section>
+
+            <section ref={transcriptRef} className="desktop-agent-card meeting-section-card">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Transcript</p>
+                        <h3>Live Transcript</h3>
+                    </div>
+                    <span className="meeting-count-pill">{transcriptEntries.length} entries</span>
+                </div>
+                {transcriptEntries.length === 0 ? (
+                    <div className="desktop-agent-empty">
+                        <strong>No transcript yet.</strong>
+                        <p>{transcriptEmptyCopy(uiSummary.state, sessionMode)}</p>
+                    </div>
+                ) : (
+                    <div className="meeting-transcript-list">
+                        {transcriptEntries.map((entry, index) => (
+                            <article key={`${entry.timestamp}-${index}`} className="meeting-transcript-entry">
+                                <span>[{formatEntryTime(entry.timestamp)}]</span>
+                                <span className={`meeting-source-badge meeting-source-badge--${entry.source ?? "unknown"}`}>
+                                    {transcriptSourceLabel(entry.source)}
+                                </span>
+                                <strong>{entry.speaker || "unknown"}:</strong>
+                                <p>{entry.text}</p>
+                            </article>
+                        ))}
+                    </div>
+                )}
+            </section>
+
+            <section className="meeting-intelligence-grid">
+                <article className="desktop-agent-card meeting-section-card">
+                    <div className="meeting-section-heading">
+                        <div>
+                            <p className="meeting-section-kicker">Notes</p>
+                            <h3>Structured Notes</h3>
+                        </div>
+                        <span className="meeting-count-pill">{notes.length}</span>
+                    </div>
+                    {notes.length ? notes.slice(-6).map((note) => (
+                        <div key={note.id} className="meeting-intelligence-item">
+                            <p>{note.content}</p>
+                            <span>Evidence: {note.evidence_segment_ids.join(", ") || "none"}</span>
+                        </div>
+                    )) : <div className="desktop-agent-empty">Notes are created only after transcript entries exist.</div>}
+                </article>
+
+                <article className="desktop-agent-card meeting-section-card">
+                    <div className="meeting-section-heading">
+                        <div>
+                            <p className="meeting-section-kicker">Actions</p>
+                            <h3>Action Items</h3>
+                        </div>
+                        <span className="meeting-count-pill">{actionItems.length}</span>
+                    </div>
+                    {actionItems.length ? actionItems.map((item, index) => (
+                        <div key={item.id ?? `${item.timestamp}-${index}`} className="meeting-intelligence-item">
+                            <strong>{item.title || item.description}</strong>
+                            <p>{item.description}</p>
+                            <span>{item.assignee?.name ?? "unassigned"} / {item.status}</span>
+                            <span>Evidence: {(item.evidence_segment_ids ?? []).join(", ") || "manual"}</span>
+                        </div>
+                    )) : <div className="desktop-agent-empty">No action items derived from transcript yet.</div>}
+                </article>
+
+                <article className="desktop-agent-card meeting-section-card">
+                    <div className="meeting-section-heading">
+                        <div>
+                            <p className="meeting-section-kicker">Decisions</p>
+                            <h3>Decisions</h3>
+                        </div>
+                        <span className="meeting-count-pill">{decisions.length}</span>
+                    </div>
+                    {decisions.length ? decisions.map((decision, index) => (
+                        <div key={decision.id ?? `${decision.timestamp}-${index}`} className="meeting-intelligence-item">
+                            <strong>{decision.decision}</strong>
+                            {decision.rationale ? <p>{decision.rationale}</p> : null}
+                            <span>Evidence: {(decision.evidence_segment_ids ?? []).join(", ") || "manual"}</span>
+                        </div>
+                    )) : <div className="desktop-agent-empty">No decisions derived from transcript yet.</div>}
+                </article>
+            </section>
+
+            <section className="meeting-card-stack">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Manual tools</p>
+                        <h3>Manual notes and file transcription</h3>
+                    </div>
+                </div>
+                <div className="desktop-agent-card-grid">
+                    <article className="desktop-agent-card meeting-form-card">
+                        <h3>Add manual transcript</h3>
+                        <input className="desktop-agent-input" value={transcriptSpeaker} onChange={(event) => setTranscriptSpeaker(event.target.value)} aria-label="Transcript speaker" placeholder="unknown" />
+                        <textarea className="desktop-agent-textarea" value={transcriptText} onChange={(event) => setTranscriptText(event.target.value)} rows={3} aria-label="Transcript text" placeholder="Transcript text" />
+                        <input className="desktop-agent-input" type="number" min="0" max="1" step="0.01" value={transcriptConfidence} onChange={(event) => setTranscriptConfidence(event.target.value)} aria-label="Transcript confidence" />
+                        <div className="desktop-agent-inline-actions">
+                            <Button variant="secondary" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleAddTranscript()}>
+                                Add transcript
+                            </Button>
+                        </div>
+                    </article>
+
+                    <article className="desktop-agent-card meeting-form-card">
+                        <h3>Transcribe .wav file</h3>
+                        <input className="desktop-agent-input" value={audioPath} onChange={(event) => setAudioPath(event.target.value)} aria-label="Audio file path" placeholder=".wav file path" />
+                        <input className="desktop-agent-input" value={audioSpeaker} onChange={(event) => setAudioSpeaker(event.target.value)} aria-label="File transcription speaker" placeholder="unknown" />
+                        <label className="desktop-agent-toggle-row">
+                            <input type="checkbox" checked={cleanupAudioFile} onChange={(event) => setCleanupAudioFile(event.target.checked)} />
+                            <span>Cleanup managed copy</span>
+                        </label>
+                        <div className="desktop-agent-inline-actions">
+                            <Button variant="secondary" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleTranscribeAudioFile()}>
+                                Transcribe file
+                            </Button>
+                        </div>
+                    </article>
+
+                    <article className="desktop-agent-card meeting-form-card">
+                        <h3>Add action item</h3>
+                        <textarea className="desktop-agent-textarea" value={actionDescription} onChange={(event) => setActionDescription(event.target.value)} rows={3} aria-label="Action item description" placeholder="Action item" />
+                        <input className="desktop-agent-input" value={actionAssignee} onChange={(event) => setActionAssignee(event.target.value)} aria-label="Action item assignee" placeholder="optional assignee" />
+                        <input className="desktop-agent-input" type="date" value={actionDeadline} onChange={(event) => setActionDeadline(event.target.value)} aria-label="Action item deadline" />
+                        <div className="desktop-agent-inline-actions">
+                            <Button variant="secondary" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleAddActionItem()}>
+                                Add action
+                            </Button>
+                        </div>
+                    </article>
+
+                    <article className="desktop-agent-card meeting-form-card">
+                        <h3>Add decision</h3>
+                        <textarea className="desktop-agent-textarea" value={decisionText} onChange={(event) => setDecisionText(event.target.value)} rows={2} aria-label="Decision text" placeholder="Decision" />
+                        <textarea className="desktop-agent-textarea" value={decisionRationale} onChange={(event) => setDecisionRationale(event.target.value)} rows={2} aria-label="Decision rationale" placeholder="Rationale" />
+                        <input className="desktop-agent-input" value={decisionMadeBy} onChange={(event) => setDecisionMadeBy(event.target.value)} aria-label="Decision made by" placeholder="optional made by" />
+                        <div className="desktop-agent-inline-actions">
+                            <Button variant="secondary" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleAddDecision()}>
+                                Add decision
+                            </Button>
+                        </div>
+                    </article>
+                </div>
+            </section>
+
+            <section className="desktop-agent-card meeting-section-card">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Data & privacy</p>
+                        <h3>Consent and clear data</h3>
+                    </div>
+                    <span className="meeting-count-pill">{consentReady ? "consent ready" : "consent required"}</span>
+                </div>
+                <div className="meeting-privacy-grid">
+                    <div>
+                        <span>Platform key</span>
+                        <input
+                            className="desktop-agent-input"
+                            value={platform}
+                            onChange={(event) => setPlatform(event.target.value)}
+                            aria-label="Meeting platform"
+                        />
+                    </div>
+                    <div>
+                        <span>Consent</span>
+                        <strong>{consent?.given ? "granted" : "not granted"}</strong>
+                    </div>
+                    <div>
+                        <span>Global consent</span>
+                        <strong>{consent?.global_enabled ? "enabled" : "disabled"}</strong>
+                    </div>
+                    <div>
+                        <span>Scoped app</span>
+                        <strong>{consent?.per_app?.[normalizedPlatform] ? "allowed" : "not allowed"}</strong>
+                    </div>
+                </div>
+                <div className="desktop-agent-inline-actions">
+                    <Button variant="secondary" radius="full" size="xs" disabled={isBusy} onClick={() => void runOperation("read consent", meeting.getConsentState)}>
+                        Read consent
+                    </Button>
+                    <Button variant="secondary" radius="full" size="xs" disabled={isBusy} onClick={() => void runOperation("grant consent", () => meeting.grantConsent(platform))}>
+                        Grant consent
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" disabled={isBusy} onClick={() => void runOperation("revoke consent", () => meeting.revokeConsent(platform))}>
+                        Revoke consent
+                    </Button>
+                    <Button variant="secondary" radius="full" size="xs" disabled={isBusy} onClick={() => void handleDetect()}>
+                        Detect active call
+                    </Button>
+                    <Button variant="danger" radius="full" size="xs" disabled={isBusy} onClick={() => void handlePreviewClearData()}>
+                        Preview clear data
+                    </Button>
+                </div>
+                <div className="meeting-call-status">
+                    <p>Call detection: <strong>{callInfo?.detection_state ?? "not checked"}</strong></p>
+                    <p>Platform: <strong>{callInfo?.platform || "unknown"}</strong></p>
+                    <p>Process: <strong>{callInfo?.process_name || "unknown"}</strong></p>
+                    <p>Active call: <strong>{callInfo?.is_active_call ? "yes" : "no"}</strong></p>
+                </div>
+
+                {showClearConfirmation ? (
+                    <div className="meeting-clear-confirmation">
+                        <h3>Confirm clear data</h3>
+                        <p>Runtime state: <strong>{clearPreview?.runtime_state_present ? "present" : "empty"}</strong></p>
+                        <p>Persisted entries: <strong>{clearPreview?.persisted_entries ?? 0}</strong></p>
+                        <p className="desktop-agent-muted">{clearPreview?.storage_path ?? "Storage path unavailable."}</p>
+                        <input
+                            className="desktop-agent-input"
+                            value={clearPhrase}
+                            onChange={(event) => setClearPhrase(event.target.value)}
+                            aria-label="Clear data confirmation phrase"
+                            placeholder={CLEAR_MEETING_DATA_CONFIRMATION_PHRASE}
+                        />
+                        <div className="desktop-agent-inline-actions">
+                            <Button
+                                variant="danger"
+                                radius="full"
+                                size="xs"
+                                disabled={isBusy || clearPhrase !== CLEAR_MEETING_DATA_CONFIRMATION_PHRASE}
+                                onClick={() => void handleConfirmClearData()}
+                            >
+                                Confirm delete
+                            </Button>
+                            <Button
+                                variant="text"
+                                radius="full"
+                                size="xs"
+                                disabled={isBusy}
+                                onClick={() => {
+                                    setShowClearConfirmation(false);
+                                    setClearPhrase("");
+                                }}
+                            >
+                                Cancel
+                            </Button>
+                        </div>
+                    </div>
+                ) : null}
+            </section>
+
+            <details className="desktop-agent-card meeting-diagnostics">
+                <summary>Advanced diagnostics</summary>
+                <div className="desktop-agent-card-grid meeting-diagnostics-grid">
+                    <article className="desktop-agent-card">
+                        <h3>Session</h3>
+                        <p>State: <strong>{stateKind}</strong></p>
+                        <p>ID: <strong>{activeSession?.session_id || displayedState?.session.session_id || "none"}</strong></p>
+                        <p>Status: <strong>{formatStatus(currentStatus)}</strong></p>
+                        <p>Mode: <strong>{sessionMode ?? "none"}</strong></p>
+                        <p>Capture active: <strong>{activeSession?.capture_active ? "yes" : "no"}</strong></p>
+                        <p className="desktop-agent-muted">{activeSession?.capture_backend_status ?? "No active session."}</p>
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>Counts</h3>
+                        <p>Transcript: <strong>{displayedState?.transcript.length ?? 0}</strong></p>
+                        <p>Actions: <strong>{displayedState?.action_items.length ?? 0}</strong></p>
+                        <p>Decisions: <strong>{displayedState?.decisions.length ?? 0}</strong></p>
+                        <p>Notes: <strong>{displayedState?.notes.length ?? 0}</strong></p>
+                        <p>Diagnostics: <strong>{diagnostics.length}</strong></p>
+                        {diagnostics.slice(-3).map((diagnostic) => (
+                            <p key={`${diagnostic.code}-${diagnostic.created_at}`} className="desktop-agent-muted">
+                                {diagnostic.severity}: {diagnostic.code}
+                            </p>
+                        ))}
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>Backend</h3>
+                        <p>Preferred: <strong>{backend}</strong></p>
+                        <p>Devices: <strong>{devices.length}</strong></p>
+                        <p className="desktop-agent-muted">{devices.join(", ") || "No devices reported."}</p>
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>Capture metrics</h3>
+                        <p>Controller: <strong>{liveCapabilities?.capture_health.state ?? "unknown"}</strong></p>
+                        <p>Health: <strong>{liveCapabilities?.capture_health.status ?? "unknown"}</strong></p>
+                        <p>Handle: <strong>{liveCapabilities?.capture_health.active_handle_present ? "present" : "absent"}</strong></p>
+                        <p>WASAPI: <strong>{liveCapabilities?.windows_wasapi_capture.state ?? "unknown"}</strong></p>
+                        <p>System controller: <strong>{systemHealth?.state ?? "unknown"}</strong></p>
+                        <p>Microphone controller: <strong>{microphoneHealth?.state ?? "unknown"}</strong></p>
+                        <p>Endpoint: <strong>{metrics?.wasapi_endpoint_acquired ? "acquired" : "not acquired"}</strong></p>
+                        <p>Mix format: <strong>{metrics?.wasapi_mix_format_detected ? `${metrics.wasapi_sample_rate ?? 0} Hz / ${metrics.wasapi_channel_count ?? 0} ch / ${metrics.wasapi_sample_format ?? "unknown"}` : "unknown"}</strong></p>
+                        <p>Buffer frames: <strong>{metrics?.wasapi_buffer_frame_count ?? 0}</strong></p>
+                        <p>Stream: <strong>{metrics?.wasapi_stream_started ? "started" : metrics?.wasapi_stream_initialized ? "initialized" : "not initialized"}</strong></p>
+                        <p>Packets read: <strong>{metrics?.wasapi_packets_read ?? 0}</strong></p>
+                        <p>Frames captured: <strong>{metrics?.frames_captured ?? 0}</strong></p>
+                        <p>Frames converted: <strong>{metrics?.frames_converted ?? 0}</strong></p>
+                        <p>Segments: <strong>{segmentsWritten}</strong></p>
+                        <p>System segments: <strong>{systemMetrics?.segments_written ?? 0} / {systemMetrics?.segments_transcribed ?? 0}</strong></p>
+                        <p>Microphone segments: <strong>{microphoneMetrics?.segments_written ?? 0} / {microphoneMetrics?.segments_transcribed ?? 0}</strong></p>
+                        <p>Queued: <strong>{metrics?.segments_queued ?? 0}</strong></p>
+                        <p>Transcribed: <strong>{segmentsTranscribed}</strong></p>
+                        <p>STT failures: <strong>{metrics?.segment_transcription_failures_total ?? metrics?.segment_transcription_failures ?? 0}</strong></p>
+                        <p>Consecutive STT failures: <strong>{metrics?.segment_transcription_failures_consecutive ?? 0}</strong></p>
+                        <p>Last STT error: <strong>{metrics?.last_segment_transcription_error_kind ?? "none"}</strong></p>
+                        <p>Dropped: <strong>{metrics?.segments_dropped ?? 0}</strong></p>
+                        <p>Silence dropped: <strong>{metrics?.dropped_silence_segments ?? 0}</strong></p>
+                        <p>Silence frames skipped: <strong>{metrics?.silence_frames_skipped ?? 0}</strong></p>
+                        <p>VAD speech/silence: <strong>{metrics?.last_speech_ratio_bps ?? 0} / {metrics?.last_silence_ratio_bps ?? 0} bps</strong></p>
+                        <p>Clipping count: <strong>{metrics?.audio_clipped_sample_count ?? 0}</strong></p>
+                        <p>Audio peak/RMS: <strong>{metrics?.audio_peak_abs ?? 0} / {metrics?.audio_rms_bps ?? 0} bps</strong></p>
+                        <p>Queue full: <strong>{metrics?.queue_full_events ?? 0}</strong></p>
+                        <p>Max queue: <strong>{metrics?.max_queue_depth_seen ?? 0}</strong></p>
+                        <p>Effective segment: <strong>{liveCapabilities?.capture_health.effective_pipeline.effective_segment_duration_ms ?? 0} ms</strong></p>
+                        <p>Session cap: <strong>{liveCapabilities?.capture_health.effective_pipeline.effective_max_segments_per_session ?? 0}</strong></p>
+                        <p>Failure threshold: <strong>{liveCapabilities?.capture_health.pipeline.max_consecutive_transcription_failures ?? 0}</strong></p>
+                        <p>VAD config: <strong>{liveCapabilities?.capture_health.pipeline.vad_enabled ? `${liveCapabilities.capture_health.pipeline.vad_silence_threshold_pcm} pcm / ${liveCapabilities.capture_health.pipeline.vad_min_speech_ms} ms` : "disabled"}</strong></p>
+                        <p>Write failures: <strong>{metrics?.segment_write_failures ?? 0}</strong></p>
+                        <p>Backend error: <strong>{metrics?.last_backend_error_kind ?? "none"}</strong></p>
+                        <p>Stop state: <strong>{liveCapabilities?.capture_health.last_error ?? "none"}</strong></p>
+                        <p className="desktop-agent-muted">{liveCapabilities?.capture_health.last_segment_status ?? liveCapabilities?.audio_capture.reason ?? "Live capture status not loaded."}</p>
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>Capability raw details</h3>
+                        <p>Manual mode: <strong>{liveCapabilities?.manual_session.state ?? "unknown"}</strong></p>
+                        <p>File transcription: <strong>{toolState(toolByName("meeting.transcription.file"))}</strong></p>
+                        <p>Audio capture: <strong>{toolState(toolByName("meeting.audio.capture"))}</strong></p>
+                        <p>Windows WASAPI: <strong>{liveCapabilities?.windows_wasapi_capture.state ?? "unknown"}</strong></p>
+                        <p>Live transcription: <strong>{toolState(toolByName("meeting.transcription.live"))}</strong></p>
+                        <p>Segment STT tool: <strong>{toolState(toolByName("meeting.transcription.segment"))}</strong></p>
+                        <p>Live segment STT: <strong>{liveCapabilities?.live_segment_transcription.state ?? "unknown"}</strong></p>
+                        <p>Live streaming STT: <strong>{liveCapabilities?.live_streaming_stt.state ?? "unknown"}</strong></p>
+                        <p>Chunk streaming: <strong>{liveCapabilities?.chunk_streaming.state ?? "unknown"}</strong></p>
+                        <p>Diarization: <strong>{liveCapabilities?.diarization.state ?? "unknown"}</strong></p>
+                        <p>Live summary: <strong>{liveCapabilities?.live_summarization.state ?? "unknown"}</strong></p>
+                        <p>Last summary update: <strong>{lastSummaryTimestamp ?? "none"}</strong></p>
+                        <p>Follow-up sending: <strong>{toolState(toolByName("meeting.followup.send"))}</strong></p>
+                        <p>Clear data: <strong>{toolState(toolByName("meeting.clear_data"))}</strong></p>
+                        <p className="desktop-agent-muted">Diarization: {liveCapabilities?.diarization.reason ?? "unavailable; captured segments use non-identifying segment metadata only."}</p>
+                        <p className="desktop-agent-muted">Summary: {liveCapabilities?.live_summarization.reason ?? "live summary is unavailable unless a governed model adapter is connected."}</p>
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>STT boundary</h3>
+                        <p>Adapter: <strong>{liveCapabilities?.stt_adapter.state ?? "unknown"}</strong></p>
+                        <p>File transcription: <strong>{liveCapabilities?.stt_adapter.file_transcription.state ?? "unknown"}</strong></p>
+                        <p>Live transcription: <strong>{liveCapabilities?.stt_adapter.live_transcription.state ?? "unknown"}</strong></p>
+                        <p>Chunk streaming: <strong>{liveCapabilities?.stt_adapter.chunk_streaming.state ?? "unknown"}</strong></p>
+                        <p>Boundary: <strong>{liveCapabilities?.stt_adapter.existing_boundary ?? "unknown"}</strong></p>
+                        <p>Segment STT: <strong>{liveCapabilities?.live_segment_transcription.state ?? "unknown"}</strong></p>
+                        <p>Streaming STT: <strong>{liveCapabilities?.live_streaming_stt.state ?? "unknown"}</strong></p>
+                        <p>Chunk stream: <strong>{liveCapabilities?.stt_adapter.chunk_streaming_supported ? "supported" : "unsupported"}</strong></p>
+                        <p>Placeholder text: <strong>{liveCapabilities?.stt_adapter.emits_placeholder_transcripts ? "possible" : "never"}</strong></p>
+                        {liveCapabilities?.stt_adapter.reason ? (
+                            <p className="desktop-agent-muted">Adapter: {liveCapabilities.stt_adapter.reason}</p>
+                        ) : null}
+                        <p className="desktop-agent-muted">File: {liveCapabilities?.stt_adapter.file_transcription.reason ?? "Ready when the existing file STT bridge is attached."}</p>
+                        <p className="desktop-agent-muted">Live: {liveCapabilities?.stt_adapter.live_transcription.reason ?? "Live transcription remains unavailable."}</p>
+                        <p className="desktop-agent-muted">Chunk: {liveCapabilities?.stt_adapter.chunk_streaming.reason ?? "Chunk streaming remains unavailable."}</p>
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>Hardware validation</h3>
+                        <p>1. Enable MeetingAudioCapture and MeetingTranscriptionSegment.</p>
+                        <p>2. Grant consent for the meeting platform.</p>
+                        <p>3. Start WASAPI capture and play system audio.</p>
+                        <p>4. Wait one effective segment duration.</p>
+                        <p>5. Confirm segments written and transcribed increase.</p>
+                        <p>6. Confirm VAD does not drop speech.</p>
+                        <p>7. Revoke consent and confirm capture stops.</p>
+                    </article>
+
+                    <article className="desktop-agent-card">
+                        <h3>Registered meeting tools</h3>
+                        <div className="desktop-agent-tool-list">
+                            {meetingTools.map((tool) => (
+                                <div key={tool.tool_name} className="desktop-agent-tool-row">
+                                    <strong>{tool.tool_name}</strong>
+                                    <span>{tool.available ? "available" : "unavailable"}</span>
+                                </div>
+                            ))}
+                        </div>
+                    </article>
+                </div>
+            </details>
+        </div>
+    );
+}

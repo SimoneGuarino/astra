@@ -59,6 +59,7 @@ use crate::{
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    future::Future,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -1032,6 +1033,385 @@ impl DesktopAgentRuntime {
     pub fn recent_audit_events(&self, limit: usize) -> Vec<DesktopAuditEvent> {
         self.audit.tail(limit)
     }
+    pub fn execute_governed_direct_action<F>(
+        &self,
+        request_id: String,
+        tool_name: &str,
+        params: Value,
+        allow_unavailable_runtime_tool: bool,
+        operation: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce() -> Result<Value, String>,
+    {
+        self.execute_governed_direct_action_internal(
+            request_id,
+            tool_name,
+            params,
+            allow_unavailable_runtime_tool,
+            None,
+            operation,
+        )
+    }
+
+    pub fn execute_confirmed_governed_direct_action<F>(
+        &self,
+        request_id: String,
+        tool_name: &str,
+        params: Value,
+        confirmation_details: Value,
+        operation: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce() -> Result<Value, String>,
+    {
+        self.execute_governed_direct_action_internal(
+            request_id,
+            tool_name,
+            params,
+            false,
+            Some(confirmation_details),
+            operation,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub async fn execute_governed_direct_action_async<F, Fut>(
+        &self,
+        request_id: String,
+        tool_name: &str,
+        params: Value,
+        allow_unavailable_runtime_tool: bool,
+        operation: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, String>>,
+    {
+        self.execute_governed_direct_action_internal_async(
+            request_id,
+            tool_name,
+            params,
+            allow_unavailable_runtime_tool,
+            None,
+            operation,
+        )
+        .await
+    }
+
+    pub async fn execute_confirmed_governed_direct_action_async<F, Fut>(
+        &self,
+        request_id: String,
+        tool_name: &str,
+        params: Value,
+        confirmation_details: Value,
+        operation: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, String>>,
+    {
+        self.execute_governed_direct_action_internal_async(
+            request_id,
+            tool_name,
+            params,
+            false,
+            Some(confirmation_details),
+            operation,
+        )
+        .await
+    }
+
+    fn execute_governed_direct_action_internal<F>(
+        &self,
+        request_id: String,
+        tool_name: &str,
+        params: Value,
+        allow_unavailable_runtime_tool: bool,
+        direct_confirmation: Option<Value>,
+        operation: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce() -> Result<Value, String>,
+    {
+        let descriptor = self
+            .registry
+            .get(tool_name)
+            .ok_or_else(|| format!("Unknown tool: {tool_name}"))?;
+        let action_id = Uuid::new_v4().to_string();
+        let direct_confirmation_provided = direct_confirmation.is_some();
+
+        if !descriptor.available && !allow_unavailable_runtime_tool {
+            self.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id,
+                request_id,
+                tool_name: tool_name.to_string(),
+                stage: "policy".into(),
+                status: "unavailable".into(),
+                timestamp: now_ms(),
+                risk_level: descriptor.default_risk.clone(),
+                details: json!({
+                    "params": params,
+                    "reason": descriptor.unavailable_reason.clone(),
+                }),
+            });
+            return Err(descriptor
+                .unavailable_reason
+                .unwrap_or_else(|| format!("Tool is unavailable: {tool_name}")));
+        }
+
+        for permission in &descriptor.required_permissions {
+            if !self.permissions.allows(permission) || !self.policy.permission_enabled(permission) {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "policy".into(),
+                    status: "permission_denied".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk.clone(),
+                    details: json!({
+                        "params": params,
+                        "permission": format!("{permission:?}"),
+                    }),
+                });
+                return Err(format!("Permission denied for {permission:?}"));
+            }
+        }
+
+        if descriptor.requires_confirmation
+            || self.policy.requires_approval(&descriptor.default_risk)
+        {
+            if let Some(confirmation_details) = direct_confirmation.as_ref() {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id: action_id.clone(),
+                    request_id: request_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    stage: "policy".into(),
+                    status: "direct_confirmation_accepted".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk.clone(),
+                    details: json!({
+                        "params": params.clone(),
+                        "confirmation": confirmation_details,
+                    }),
+                });
+            } else {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "policy".into(),
+                    status: "approval_required".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk.clone(),
+                    details: json!({
+                        "params": params,
+                        "reason": "direct runtime command requires approval by policy",
+                    }),
+                });
+                return Err(format!("Approval required for {tool_name}"));
+            }
+        }
+
+        self.audit.append(&DesktopAuditEvent {
+            audit_id: Uuid::new_v4().to_string(),
+            action_id: action_id.clone(),
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_string(),
+            stage: "execution".into(),
+            status: "started".into(),
+            timestamp: now_ms(),
+            risk_level: descriptor.default_risk.clone(),
+            details: json!({
+                "params": params,
+                "runtime_tool_available": descriptor.available,
+                "unavailable_reason": descriptor.unavailable_reason.clone(),
+                "direct_confirmation": direct_confirmation_provided,
+            }),
+        });
+
+        match operation() {
+            Ok(value) => {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "execution".into(),
+                    status: "completed".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk,
+                    details: json!({"result": audit_result_summary(tool_name, &value)}),
+                });
+                Ok(value)
+            }
+            Err(error) => {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "execution".into(),
+                    status: "failed".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk,
+                    details: json!({"error": error}),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    async fn execute_governed_direct_action_internal_async<F, Fut>(
+        &self,
+        request_id: String,
+        tool_name: &str,
+        params: Value,
+        allow_unavailable_runtime_tool: bool,
+        direct_confirmation: Option<Value>,
+        operation: F,
+    ) -> Result<Value, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, String>>,
+    {
+        let descriptor = self
+            .registry
+            .get(tool_name)
+            .ok_or_else(|| format!("Unknown tool: {tool_name}"))?;
+        let action_id = Uuid::new_v4().to_string();
+        let direct_confirmation_provided = direct_confirmation.is_some();
+
+        if !descriptor.available && !allow_unavailable_runtime_tool {
+            self.audit.append(&DesktopAuditEvent {
+                audit_id: Uuid::new_v4().to_string(),
+                action_id,
+                request_id,
+                tool_name: tool_name.to_string(),
+                stage: "policy".into(),
+                status: "unavailable".into(),
+                timestamp: now_ms(),
+                risk_level: descriptor.default_risk.clone(),
+                details: json!({
+                    "params": params,
+                    "reason": descriptor.unavailable_reason.clone(),
+                }),
+            });
+            return Err(descriptor
+                .unavailable_reason
+                .unwrap_or_else(|| format!("Tool is unavailable: {tool_name}")));
+        }
+
+        for permission in &descriptor.required_permissions {
+            if !self.permissions.allows(permission) || !self.policy.permission_enabled(permission) {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "policy".into(),
+                    status: "permission_denied".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk.clone(),
+                    details: json!({
+                        "params": params,
+                        "permission": format!("{permission:?}"),
+                    }),
+                });
+                return Err(format!("Permission denied for {permission:?}"));
+            }
+        }
+
+        if descriptor.requires_confirmation
+            || self.policy.requires_approval(&descriptor.default_risk)
+        {
+            if let Some(confirmation_details) = direct_confirmation.as_ref() {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id: action_id.clone(),
+                    request_id: request_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    stage: "policy".into(),
+                    status: "direct_confirmation_accepted".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk.clone(),
+                    details: json!({
+                        "params": params.clone(),
+                        "confirmation": confirmation_details,
+                    }),
+                });
+            } else {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "policy".into(),
+                    status: "approval_required".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk.clone(),
+                    details: json!({
+                        "params": params,
+                        "reason": "direct runtime command requires approval by policy",
+                    }),
+                });
+                return Err(format!("Approval required for {tool_name}"));
+            }
+        }
+
+        self.audit.append(&DesktopAuditEvent {
+            audit_id: Uuid::new_v4().to_string(),
+            action_id: action_id.clone(),
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_string(),
+            stage: "execution".into(),
+            status: "started".into(),
+            timestamp: now_ms(),
+            risk_level: descriptor.default_risk.clone(),
+            details: json!({
+                "params": params,
+                "runtime_tool_available": descriptor.available,
+                "unavailable_reason": descriptor.unavailable_reason.clone(),
+                "direct_confirmation": direct_confirmation_provided,
+            }),
+        });
+
+        match operation().await {
+            Ok(value) => {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "execution".into(),
+                    status: "completed".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk,
+                    details: json!({"result": audit_result_summary(tool_name, &value)}),
+                });
+                Ok(value)
+            }
+            Err(error) => {
+                self.audit.append(&DesktopAuditEvent {
+                    audit_id: Uuid::new_v4().to_string(),
+                    action_id,
+                    request_id,
+                    tool_name: tool_name.to_string(),
+                    stage: "execution".into(),
+                    status: "failed".into(),
+                    timestamp: now_ms(),
+                    risk_level: descriptor.default_risk,
+                    details: json!({"error": error}),
+                });
+                Err(error)
+            }
+        }
+    }
     pub fn screen_status(&self) -> ScreenObservationStatus {
         self.screen_capture.status()
     }
@@ -1866,6 +2246,11 @@ impl DesktopAgentRuntime {
             .registry
             .get(&request.tool_name)
             .ok_or_else(|| format!("Unknown tool: {}", request.tool_name))?;
+        if !descriptor.available {
+            return Err(descriptor
+                .unavailable_reason
+                .unwrap_or_else(|| format!("Tool is unavailable: {}", request.tool_name)));
+        }
         for permission in &descriptor.required_permissions {
             if !self.permissions.allows(permission) || !self.policy.permission_enabled(permission) {
                 return Err(format!("Permission denied for {:?}", permission));
@@ -2117,8 +2502,107 @@ impl DesktopAgentRuntime {
                 let args = string_array_param(&request.params, &["args", "arguments"]);
                 launch_app(&path, &args)
             }
+            tool_name if tool_name.starts_with("meeting.") => Err(
+                "Meeting tools are executed by the dedicated MeetingRuntime Tauri boundary".into(),
+            ),
             _ => Err(format!("Unsupported tool: {}", request.tool_name)),
         }
+    }
+}
+
+fn audit_result_summary(tool_name: &str, value: &Value) -> Value {
+    if !tool_name.starts_with("meeting.") {
+        return value.clone();
+    }
+
+    if tool_name == "meeting.transcription.file" {
+        return meeting_file_transcription_audit_summary(value);
+    }
+
+    json!({
+        "redacted": true,
+        "data_category": meeting_audit_data_category(tool_name),
+        "result_kind": match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        },
+    })
+}
+
+fn meeting_file_transcription_audit_summary(value: &Value) -> Value {
+    let result_kind = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    let Some(object) = value.as_object() else {
+        return json!({
+            "redacted": true,
+            "data_category": meeting_audit_data_category("meeting.transcription.file"),
+            "result_kind": result_kind,
+        });
+    };
+
+    json!({
+        "redacted": true,
+        "data_category": meeting_audit_data_category("meeting.transcription.file"),
+        "result_kind": result_kind,
+        "transcript_added": object.get("transcript_added").and_then(Value::as_bool),
+        "transcript_index": object.get("transcript_index").and_then(Value::as_u64),
+        "text_length": object.get("text_length").and_then(Value::as_u64),
+        "audio_file_extension": object
+            .get("audio_file_extension")
+            .and_then(Value::as_str),
+        "file_size_bytes": object.get("file_size_bytes").and_then(Value::as_u64),
+        "stt_boundary": object.get("stt_boundary").and_then(Value::as_str),
+        "source_audio_path_redacted": object
+            .get("source_audio_path_redacted")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        "managed_audio_path_redacted": object
+            .get("managed_audio_path_redacted")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        "cleanup_requested": object.get("cleanup_requested").and_then(Value::as_bool),
+        "cleanup_performed": object.get("cleanup_performed").and_then(Value::as_bool),
+        "cleanup_error_present": object
+            .get("cleanup_error")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()),
+    })
+}
+
+fn meeting_audit_data_category(tool_name: &str) -> &'static str {
+    match tool_name {
+        "meeting.consent.read" | "meeting.consent.grant" | "meeting.consent.revoke" => {
+            "meeting_consent"
+        }
+        "meeting.session.read"
+        | "meeting.session.start"
+        | "meeting.session.manual"
+        | "meeting.session.pause"
+        | "meeting.session.resume"
+        | "meeting.session.stop"
+        | "meeting.session.clear" => "meeting_session_metadata",
+        "meeting.transcript.add" => "meeting_transcript",
+        "meeting.transcription.file" => "meeting_transcription_file_metadata",
+        "meeting.action_item.add" | "meeting.decision.add" => "meeting_notes",
+        "meeting.audio.devices"
+        | "meeting.audio.backend"
+        | "meeting.audio.capture"
+        | "meeting.transcription.segment"
+        | "meeting.transcription.live"
+        | "meeting.detect" => "meeting_detection_metadata",
+        "meeting.clear_data.preview" => "meeting_storage_metadata",
+        "meeting.clear_data" => "meeting_storage",
+        _ => "meeting_metadata",
     }
 }
 
@@ -2640,7 +3124,8 @@ fn screen_workflow_run_from_goal_loop(
     primitive_capabilities: UIPrimitiveCapabilitySet,
     mut goal_loop: GoalLoopRun,
 ) -> ScreenWorkflowRun {
-    if goal_loop_has_verified_success(&goal_loop) && goal_loop.status != GoalLoopStatus::GoalAchieved
+    if goal_loop_has_verified_success(&goal_loop)
+        && goal_loop.status != GoalLoopStatus::GoalAchieved
     {
         goal_loop.status = GoalLoopStatus::GoalAchieved;
         goal_loop.failure_reason = None;
@@ -2945,9 +3430,10 @@ mod tests {
         desktop_agent_types::{
             DesktopActionRequest, DesktopActionStatus, GoalConstraints, GoalLoopRun,
             GoalLoopStatus, GoalSpec, GoalType, GoalVerificationStatus, PendingApproval,
-            PlannerContractInput, PlannerStepExecutionRecord, PlannerStepExecutionStatus,
-            VisibleActionabilityDiagnostic, VisibleResultKind,
+            Permission, PlannerContractInput, PlannerStepExecutionRecord,
+            PlannerStepExecutionStatus, VisibleActionabilityDiagnostic, VisibleResultKind,
         },
+        permissions::PermissionProfile,
         screen_workflow::{
             ScreenFreshness, ScreenGroundingState, ScreenWorkflow, ScreenWorkflowDomain,
             WorkflowSupportSummary,
@@ -3036,6 +3522,512 @@ mod tests {
         .expect("pending approval json");
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].tool_name, "filesystem.write_text");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_session_registered_in_audit_log() {
+        let root = std::env::temp_dir().join(format!("astra_meeting_audit_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_governed_direct_action(
+                "meeting-audit-test".into(),
+                "meeting.detect",
+                json!({"source": "unit_test"}),
+                false,
+                || Ok(json!({"detection_state": "detected"})),
+            )
+            .expect("governed meeting action");
+
+        let events = runtime.recent_audit_events(10);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.detect"
+                && event.request_id == "meeting-audit-test"
+                && event.status == "completed"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_read_operations_require_permission() {
+        let root = std::env::temp_dir().join(format!("astra_meeting_read_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let mut runtime = DesktopAgentRuntime::new(root.clone());
+        runtime.permissions = PermissionProfile {
+            allowed: vec![Permission::MeetingDetect],
+        };
+
+        let result = runtime.execute_governed_direct_action(
+            "meeting-read-denied".into(),
+            "meeting.session.read",
+            json!({"read": "active_state"}),
+            false,
+            || Ok(json!({"transcript": ["should not execute"]})),
+        );
+
+        assert!(result
+            .expect_err("read permission should be denied")
+            .contains("Permission denied"));
+        let events = runtime.recent_audit_events(10);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.session.read"
+                && event.request_id == "meeting-read-denied"
+                && event.status == "permission_denied"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_read_audit_results_are_redacted() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_read_redact_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_governed_direct_action(
+                "meeting-read-redacted".into(),
+                "meeting.session.read",
+                json!({"read": "active_state"}),
+                false,
+                || Ok(json!({"transcript": ["sensitive content"]})),
+            )
+            .expect("read action");
+
+        let events = runtime.recent_audit_events(10);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event.tool_name == "meeting.session.read"
+                    && event.request_id == "meeting-read-redacted"
+                    && event.status == "completed"
+            })
+            .expect("completed audit event");
+        assert_eq!(
+            completed.details["result"]["data_category"],
+            "meeting_session_metadata"
+        );
+        assert_eq!(completed.details["result"]["redacted"], true);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_file_transcription_audit_does_not_include_filename_or_paths() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_file_redact_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_confirmed_governed_direct_action(
+                "meeting-file-redacted".into(),
+                "meeting.transcription.file",
+                json!({
+                    "path_provided": true,
+                    "extension_hint": "wav",
+                    "audio_path_redacted": true,
+                    "speaker_provided": true,
+                    "cleanup_after_transcription": true,
+                    "metadata_only": true,
+                }),
+                json!({"method": "direct_debug_user_action", "audio_path_redacted": true}),
+                || {
+                    Ok(json!({
+                        "transcript_added": true,
+                        "transcript_index": 0,
+                        "text_length": 21,
+                        "audio_file_name": "sample.wav",
+                        "audio_file_extension": "wav",
+                        "file_size_bytes": 16,
+                        "stt_boundary": "SttClient::transcribe(Path)",
+                        "source_audio_path_redacted": true,
+                        "managed_audio_path_redacted": true,
+                        "cleanup_requested": true,
+                        "cleanup_performed": false,
+                        "cleanup_error": "managed meeting segment cleanup failed: PermissionDenied",
+                        "transcript_text": "sensitive transcript text",
+                        "managed_path": "C:/secret/.astra/meetings/session/segments/raw.wav",
+                    }))
+                },
+            )
+            .expect("confirmed file transcription action");
+
+        let events = runtime.recent_audit_events(10);
+        let completed = events
+            .iter()
+            .find(|event| {
+                event.tool_name == "meeting.transcription.file"
+                    && event.request_id == "meeting-file-redacted"
+                    && event.status == "completed"
+            })
+            .expect("completed audit event");
+        let result = &completed.details["result"];
+        let serialized = result.to_string();
+        assert_eq!(
+            result["data_category"],
+            "meeting_transcription_file_metadata"
+        );
+        assert_eq!(result["redacted"], true);
+        assert_eq!(result["cleanup_requested"], true);
+        assert_eq!(result["cleanup_performed"], false);
+        assert_eq!(result["cleanup_error_present"], true);
+        assert_eq!(result["audio_file_extension"], "wav");
+        assert_eq!(result["file_size_bytes"], 16);
+        assert_eq!(result["source_audio_path_redacted"], true);
+        assert_eq!(result["managed_audio_path_redacted"], true);
+        assert!(!serialized.contains("sample.wav"));
+        assert!(!serialized.contains("sensitive transcript text"));
+        assert!(!serialized.contains("C:/secret"));
+
+        let all_file_audit = events
+            .iter()
+            .filter(|event| event.tool_name == "meeting.transcription.file")
+            .map(|event| serde_json::to_string(event).expect("audit json"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all_file_audit.contains("sample.wav"));
+        assert!(!all_file_audit.contains("C:/secret"));
+        assert!(!all_file_audit.contains("sensitive transcript text"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn real_capture_preflight_still_denies_when_permission_missing() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_capture_perm_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let mut runtime = DesktopAgentRuntime::new(root.clone());
+        runtime.permissions = PermissionProfile {
+            allowed: Vec::new(),
+        };
+
+        let result = runtime.execute_governed_direct_action(
+            "meeting-capture-permission".into(),
+            "meeting.audio.capture",
+            json!({
+                "platform": "teams",
+                "capture_backend": "wasapi",
+                "audio_payload": "not_provided",
+                "metadata_only": true,
+            }),
+            true,
+            || Ok(json!({"permission_checked": true})),
+        );
+
+        assert!(result
+            .expect_err("audio capture permission should be denied by default")
+            .contains("Permission denied"));
+        let events = runtime.recent_audit_events(10);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.audio.capture"
+                && event.request_id == "meeting-capture-permission"
+                && event.status == "permission_denied"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn segment_transcription_requires_segment_stt_permission() {
+        let root = std::env::temp_dir().join(format!("astra_meeting_stt_perm_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let mut runtime = DesktopAgentRuntime::new(root.clone());
+        runtime.permissions = PermissionProfile {
+            allowed: vec![Permission::MeetingTranscriptWrite],
+        };
+
+        let result = runtime.execute_governed_direct_action(
+            "meeting-stt-permission".into(),
+            "meeting.transcription.segment",
+            json!({
+                "platform": "teams",
+                "transcription_model": "local",
+                "audio_payload": "not_provided",
+                "transcript_text": "not_provided",
+                "metadata_only": true,
+            }),
+            true,
+            || Ok(json!({"permission_checked": true})),
+        );
+
+        assert!(result
+            .expect_err("segment transcription permission should be denied by default")
+            .contains("Permission denied"));
+        let events = runtime.recent_audit_events(10);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.transcription.segment"
+                && event.request_id == "meeting-stt-permission"
+                && event.status == "permission_denied"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn real_capture_audio_preflight_accepts_direct_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "astra_meeting_audio_direct_confirm_{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        let result = runtime
+            .execute_confirmed_governed_direct_action(
+                "meeting-audio-direct-confirmed".into(),
+                "meeting.audio.capture",
+                json!({
+                    "platform": "teams",
+                    "session_mode": "real_capture",
+                    "capture_backend": "wasapi",
+                    "metadata_only": true,
+                    "raw_audio_included": false,
+                    "transcript_text_included": false,
+                }),
+                json!({
+                    "method": "meeting_control_center_explicit_start",
+                    "user_initiated": true,
+                    "operation": "start_wasapi_capture",
+                    "raw_audio": "not_included",
+                    "transcript_text": "not_included",
+                    "metadata_only": true,
+                }),
+                || {
+                    Ok(json!({
+                        "permission_checked": true,
+                        "capability_available": true,
+                        "direct_confirmation": true,
+                        "metadata_only": true,
+                    }))
+                },
+            )
+            .expect("confirmed audio capture preflight");
+
+        assert_eq!(result["permission_checked"], true);
+        let events = runtime.recent_audit_events(20);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.audio.capture"
+                && event.status == "direct_confirmation_accepted"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn real_capture_segment_preflight_accepts_direct_confirmation() {
+        let root = std::env::temp_dir().join(format!(
+            "astra_meeting_segment_direct_confirm_{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        let result = runtime
+            .execute_confirmed_governed_direct_action(
+                "meeting-segment-direct-confirmed".into(),
+                "meeting.transcription.segment",
+                json!({
+                    "platform": "teams",
+                    "session_mode": "real_capture",
+                    "capture_backend": "wasapi",
+                    "transcription_model": "local",
+                    "metadata_only": true,
+                    "raw_audio_included": false,
+                    "transcript_text_included": false,
+                }),
+                json!({
+                    "method": "meeting_control_center_explicit_start",
+                    "user_initiated": true,
+                    "operation": "start_wasapi_capture",
+                    "raw_audio": "not_included",
+                    "transcript_text": "not_included",
+                    "metadata_only": true,
+                }),
+                || {
+                    Ok(json!({
+                        "permission_checked": true,
+                        "capability_available": true,
+                        "direct_confirmation": true,
+                        "metadata_only": true,
+                    }))
+                },
+            )
+            .expect("confirmed segment transcription preflight");
+
+        assert_eq!(result["permission_checked"], true);
+        let events = runtime.recent_audit_events(20);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.transcription.segment"
+                && event.status == "direct_confirmation_accepted"
+        }));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unconfirmed_approval_gated_capture_preflight_is_rejected_without_pending_claim() {
+        let root = std::env::temp_dir().join(format!(
+            "astra_meeting_segment_unconfirmed_{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        let result = runtime.execute_governed_direct_action(
+            "meeting-segment-unconfirmed".into(),
+            "meeting.transcription.segment",
+            json!({
+                "platform": "teams",
+                "session_mode": "real_capture",
+                "capture_backend": "wasapi",
+                "transcription_model": "local",
+                "metadata_only": true,
+            }),
+            false,
+            || Ok(json!({"permission_checked": true})),
+        );
+
+        assert!(result
+            .expect_err("unconfirmed preflight should require approval")
+            .contains("Approval required"));
+        assert!(runtime.pending_approvals().is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_capture_permission_audit_uses_metadata_only() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_audit_metadata_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        let _ = runtime.execute_governed_direct_action(
+            "meeting-live-audit-metadata".into(),
+            "meeting.audio.capture",
+            json!({
+                "platform": "teams",
+                "capture_backend": "wasapi",
+                "audio_payload": "not_provided",
+                "metadata_only": true,
+            }),
+            true,
+            || Ok(json!({"permission_checked": true})),
+        );
+
+        let events = runtime.recent_audit_events(10);
+        let serialized = serde_json::to_string(&events).expect("audit json");
+        assert!(serialized.contains("metadata_only"));
+        assert!(!serialized.contains("raw_audio_samples"));
+        assert!(!serialized.contains("full transcript"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_raw_audio_path_or_filename_in_audit_for_capture_segments() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_capture_redact_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let mut runtime = DesktopAgentRuntime::new(root.clone());
+        runtime.permissions = PermissionProfile {
+            allowed: vec![Permission::MeetingAudioCapture],
+        };
+
+        runtime
+            .execute_governed_direct_action_internal(
+                "meeting-capture-redacted".into(),
+                "meeting.audio.capture",
+                json!({
+                    "platform": "teams",
+                    "capture_backend": "wasapi",
+                    "segment_path_redacted": true,
+                    "metadata_only": true,
+                }),
+                true,
+                Some(json!({
+                    "method": "direct_debug_user_action",
+                    "segment_path_redacted": true,
+                })),
+                || {
+                    Ok(json!({
+                        "status": "segment_written",
+                        "segment_file_name": "salary_review.wav",
+                        "managed_path": "C:/secret/.astra/meetings/session/segments/salary_review.wav",
+                        "source_path": "C:/Users/Simone/Documents/salary_review.wav",
+                        "transcript_text": "sensitive transcript text",
+                        "segment_duration_bucket": "0_30s",
+                        "managed_path_redacted": true,
+                    }))
+                },
+            )
+            .expect("capture audit action");
+
+        let events = runtime.recent_audit_events(10);
+        let capture_events = events
+            .iter()
+            .filter(|event| event.tool_name == "meeting.audio.capture")
+            .map(|event| serde_json::to_string(event).expect("audit json"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!capture_events.contains("salary_review.wav"));
+        assert!(!capture_events.contains("C:/secret"));
+        assert!(!capture_events.contains("C:/Users"));
+        assert!(!capture_events.contains("sensitive transcript text"));
+        assert!(capture_events.contains("meeting_detection_metadata"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirmed_direct_high_risk_meeting_action_executes_after_confirmation() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_direct_confirm_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        let unconfirmed = runtime.execute_governed_direct_action(
+            "meeting-clear-unconfirmed".into(),
+            "meeting.clear_data",
+            json!({"scope": "all"}),
+            false,
+            || Ok(json!({"deleted": true})),
+        );
+
+        assert!(unconfirmed
+            .expect_err("unconfirmed action should require approval")
+            .contains("Approval required"));
+
+        let confirmed = runtime
+            .execute_confirmed_governed_direct_action(
+                "meeting-clear-confirmed".into(),
+                "meeting.clear_data",
+                json!({"scope": "all", "confirmation": "typed_phrase_required"}),
+                json!({"method": "typed_phrase", "phrase_redacted": true}),
+                || Ok(json!({"deleted": true})),
+            )
+            .expect("confirmed action");
+
+        assert_eq!(confirmed["deleted"], true);
+        let events = runtime.recent_audit_events(20);
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.clear_data"
+                && event.request_id == "meeting-clear-confirmed"
+                && event.status == "direct_confirmation_accepted"
+        }));
+        assert!(events.iter().any(|event| {
+            event.tool_name == "meeting.clear_data"
+                && event.request_id == "meeting-clear-confirmed"
+                && event.status == "completed"
+        }));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3542,6 +4534,8 @@ mod tests {
             repeated_click_protection_triggered: false,
             selected_target_candidate: Some(candidate),
             verifier_status: Some("GoalAchieved".into()),
+            completion_diagnostics:
+                crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
             failure_reason: None,
         };
 
@@ -3628,6 +4622,8 @@ mod tests {
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: Some("Ambiguous".into()),
+            completion_diagnostics:
+                crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
             failure_reason: Some("final watch-page confirmation remained uncertain".into()),
         };
 
@@ -3801,6 +4797,8 @@ mod tests {
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: Some("GoalAchieved".into()),
+            completion_diagnostics:
+                crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
             failure_reason: None,
         };
 
@@ -3869,6 +4867,8 @@ mod tests {
             repeated_click_protection_triggered: false,
             selected_target_candidate: None,
             verifier_status: Some("Refused".into()),
+            completion_diagnostics:
+                crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
             failure_reason: Some("no sufficiently grounded candidate was found".into()),
         };
 

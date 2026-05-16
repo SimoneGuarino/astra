@@ -627,9 +627,10 @@ pub fn render_screen_workflow_run_response(run: &ScreenWorkflowRun, italian: boo
             }
         }
         WorkflowRunStatus::NeedsTargetGrounding => {
-            if let Some(message) =
-                render_goal_loop_no_click_response(run.workflow.grounding.goal_loop.as_ref(), italian)
-            {
+            if let Some(message) = render_goal_loop_no_click_response(
+                run.workflow.grounding.goal_loop.as_ref(),
+                italian,
+            ) {
                 return message;
             }
             if italian {
@@ -736,9 +737,10 @@ fn render_continuation_workflow_run_response(
             }
         }
         WorkflowRunStatus::NeedsTargetGrounding => {
-            if let Some(message) =
-                render_goal_loop_no_click_response(run.workflow.grounding.goal_loop.as_ref(), italian)
-            {
+            if let Some(message) = render_goal_loop_no_click_response(
+                run.workflow.grounding.goal_loop.as_ref(),
+                italian,
+            ) {
                 return message;
             }
             if italian {
@@ -1914,6 +1916,8 @@ mod tests {
                             repeated_click_protection_triggered: false,
                             selected_target_candidate: None,
                             verifier_status: Some("Ambiguous".into()),
+                            completion_diagnostics:
+                                crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
                             failure_reason: Some(
                                 "final watch-page confirmation remained uncertain".into(),
                             ),
@@ -2048,6 +2052,8 @@ mod tests {
                             repeated_click_protection_triggered: false,
                             selected_target_candidate: None,
                             verifier_status: Some("GoalNotAchieved".into()),
+                            completion_diagnostics:
+                                crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
                             failure_reason: Some("goal was not confirmed".into()),
                         }),
                         recent_target_candidates: Vec::new(),
@@ -2196,7 +2202,7 @@ mod tests {
                                 utterance: "aprimi il primo video".into(),
                                 confidence: 0.9,
                             },
-                            status: GoalLoopStatus::GoalAchieved,
+                            status: GoalLoopStatus::VerificationFailed,
                             iteration_count: 2,
                             retry_budget: 3,
                             retries_used: 0,
@@ -2240,6 +2246,18 @@ mod tests {
                             repeated_click_protection_triggered: false,
                             selected_target_candidate: None,
                             verifier_status: Some("GoalAchieved".into()),
+                            completion_diagnostics: crate::desktop_agent_types::GoalLoopCompletionDiagnostics {
+                                goal_success_condition: Some("media_watch_page_visible".into()),
+                                goal_verifier_status: Some(
+                                    crate::desktop_agent_types::GoalVerificationStatus::GoalAchieved,
+                                ),
+                                goal_achieved_reason: Some("watch page visible".into()),
+                                logical_steps_completed: 1,
+                                planned_steps: 1,
+                                executed_attempts: 1,
+                                success_terminal_stop: true,
+                                ..crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default()
+                            },
                             failure_reason: None,
                         }),
                         recent_target_candidates: Vec::new(),

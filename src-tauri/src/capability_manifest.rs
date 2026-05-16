@@ -162,20 +162,25 @@ fn tool_state(tool: &ToolDescriptor, policy: &DesktopPolicySnapshot) -> Capabili
         .collect::<Vec<_>>();
 
     let enabled = missing_permissions.is_empty() && disabled_by_policy.is_empty();
+    let enabled = enabled && tool.available;
     let requires_approval = tool.requires_confirmation
         || (policy.approval_required_for_high_risk
             && matches!(
                 tool.default_risk,
                 crate::desktop_agent_types::RiskLevel::High
             ));
-    let state = if !enabled {
+    let state = if !tool.available {
+        CapabilityRuntimeState::Unavailable
+    } else if !enabled {
         CapabilityRuntimeState::Disabled
     } else if requires_approval {
         CapabilityRuntimeState::ApprovalGated
     } else {
         CapabilityRuntimeState::Ready
     };
-    let disabled_reason = if missing_permissions.is_empty() && disabled_by_policy.is_empty() {
+    let disabled_reason = if !tool.available {
+        tool.unavailable_reason.clone()
+    } else if missing_permissions.is_empty() && disabled_by_policy.is_empty() {
         None
     } else {
         let mut reasons = Vec::new();
@@ -201,7 +206,7 @@ fn tool_state(tool: &ToolDescriptor, policy: &DesktopPolicySnapshot) -> Capabili
         required_permissions: tool.required_permissions.clone(),
         default_risk: tool.default_risk.clone(),
         requires_confirmation: tool.requires_confirmation,
-        available: true,
+        available: tool.available,
         enabled,
         requires_approval,
         state,
@@ -289,6 +294,20 @@ fn permission_name(permission: &Permission) -> &'static str {
         Permission::BrowserAction => "browser_action",
         Permission::DesktopObserve => "desktop_observe",
         Permission::DesktopControl => "desktop_control",
+        Permission::MeetingDetect => "meeting_detect",
+        Permission::MeetingConsentRead => "meeting_consent_read",
+        Permission::MeetingConsentWrite => "meeting_consent_write",
+        Permission::MeetingSessionRead => "meeting_session_read",
+        Permission::MeetingSessionManage => "meeting_session_manage",
+        Permission::MeetingTranscriptWrite => "meeting_transcript_write",
+        Permission::MeetingNotesWrite => "meeting_notes_write",
+        Permission::MeetingExport => "meeting_export",
+        Permission::MeetingClearData => "meeting_clear_data",
+        Permission::MeetingAudioCapture => "meeting_audio_capture",
+        Permission::MeetingTranscriptionFile => "meeting_transcription_file",
+        Permission::MeetingTranscriptionSegment => "meeting_transcription_segment",
+        Permission::MeetingTranscriptionLive => "meeting_transcription_live",
+        Permission::MeetingFollowUpSend => "meeting_followup_send",
     }
 }
 

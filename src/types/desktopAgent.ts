@@ -7,7 +7,21 @@ export type DesktopPermission =
     | "browser_read"
     | "browser_action"
     | "desktop_observe"
-    | "desktop_control";
+    | "desktop_control"
+    | "meeting_detect"
+    | "meeting_consent_read"
+    | "meeting_consent_write"
+    | "meeting_session_read"
+    | "meeting_session_manage"
+    | "meeting_transcript_write"
+    | "meeting_notes_write"
+    | "meeting_export"
+    | "meeting_clear_data"
+    | "meeting_audio_capture"
+    | "meeting_transcription_file"
+    | "meeting_transcription_segment"
+    | "meeting_transcription_live"
+    | "meeting_followup_send";
 
 export type DesktopRiskLevel = "low" | "medium" | "high";
 
@@ -18,6 +32,8 @@ export type ToolDescriptor = {
     required_permissions: DesktopPermission[];
     default_risk: DesktopRiskLevel;
     requires_confirmation: boolean;
+    available: boolean;
+    unavailable_reason?: string | null;
 };
 
 export type DesktopActionRequest = {

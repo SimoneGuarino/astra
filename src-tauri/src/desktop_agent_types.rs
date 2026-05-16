@@ -15,6 +15,20 @@ pub enum Permission {
     BrowserAction,
     DesktopObserve,
     DesktopControl,
+    MeetingDetect,
+    MeetingConsentRead,
+    MeetingConsentWrite,
+    MeetingSessionRead,
+    MeetingSessionManage,
+    MeetingTranscriptWrite,
+    MeetingNotesWrite,
+    MeetingExport,
+    MeetingClearData,
+    MeetingAudioCapture,
+    MeetingTranscriptionFile,
+    MeetingTranscriptionSegment,
+    MeetingTranscriptionLive,
+    MeetingFollowUpSend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,6 +47,14 @@ pub struct ToolDescriptor {
     pub required_permissions: Vec<Permission>,
     pub default_risk: RiskLevel,
     pub requires_confirmation: bool,
+    #[serde(default = "default_tool_available")]
+    pub available: bool,
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
+}
+
+fn default_tool_available() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

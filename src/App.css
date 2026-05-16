@@ -370,11 +370,19 @@ input {
     align-items: center;
 }
 
+.desktop-agent-panel {
+    overflow: hidden;
+}
+
 .desktop-agent-panel__header {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
+    flex: 0 0 auto;
+    position: sticky;
+    top: 0;
+    z-index: 2;
 }
 
 .desktop-agent-panel__header h2 {
@@ -393,6 +401,9 @@ input {
 .desktop-agent-tabs {
     display: flex;
     gap: 8px;
+    flex: 0 0 auto;
+    overflow-x: auto;
+    padding-bottom: 2px;
 }
 
 .desktop-agent-tab {
@@ -415,6 +426,9 @@ input {
     display: flex;
     flex-direction: column;
     gap: 12px;
+    flex: 1 1 auto;
+    min-height: 0;
+    padding-right: 2px;
 }
 
 .desktop-agent-card-grid {
@@ -513,4 +527,422 @@ input {
     white-space: pre-wrap;
     line-height: 1.55;
     color: #f3f8ff;
+}
+
+.desktop-agent-inline-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.desktop-agent-input {
+    min-width: 160px;
+    border: 1px solid rgba(102, 127, 210, 0.2);
+    background: rgba(255, 255, 255, 0.78);
+    color: #3b4668;
+    border-radius: 999px;
+    padding: 8px 12px;
+}
+
+.desktop-agent-tool-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 220px;
+    overflow: auto;
+}
+
+.desktop-agent-toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: rgba(64, 78, 120, 0.86);
+}
+
+.meeting-control-center {
+    gap: 14px;
+}
+
+.meeting-status-card {
+    background: rgba(255, 255, 255, 0.9);
+    border-color: rgba(68, 93, 180, 0.22);
+}
+
+.meeting-status-card--blocked_permissions,
+.meeting-status-card--failed {
+    border-color: rgba(212, 78, 86, 0.32);
+    background: rgba(255, 247, 248, 0.95);
+}
+
+.meeting-status-card--recording,
+.meeting-status-card--transcribing,
+.meeting-status-card--ready_to_record {
+    border-color: rgba(28, 145, 98, 0.3);
+    background: rgba(246, 255, 250, 0.95);
+}
+
+.meeting-status-card--manual_active,
+.meeting-status-card--paused {
+    border-color: rgba(198, 141, 31, 0.32);
+    background: rgba(255, 251, 242, 0.95);
+}
+
+.meeting-status-card__header,
+.meeting-section-heading {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.meeting-status-card__header h3,
+.meeting-section-heading h3,
+.meeting-form-card h3,
+.meeting-diagnostics h3 {
+    margin: 0;
+}
+
+.meeting-status-card__header p,
+.meeting-section-heading p {
+    margin: 2px 0 0 0;
+}
+
+.meeting-section-kicker,
+.meeting-status-label {
+    margin: 0;
+    color: rgba(58, 79, 128, 0.76);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.meeting-status-pill,
+.meeting-count-pill {
+    border: 1px solid rgba(85, 108, 190, 0.22);
+    background: rgba(255, 255, 255, 0.8);
+    color: rgba(45, 63, 126, 0.96);
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.meeting-status-main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 280px);
+    gap: 14px;
+    margin-top: 14px;
+}
+
+.meeting-status-main h2 {
+    margin: 3px 0 8px 0;
+    color: #26335f;
+    font-size: 24px;
+    line-height: 1.15;
+}
+
+.meeting-status-description,
+.meeting-next-action,
+.meeting-call-warning {
+    margin: 8px 0 0 0;
+    color: rgba(48, 59, 95, 0.9);
+    font-size: 14px;
+    line-height: 1.45;
+}
+
+.meeting-call-warning {
+    padding: 9px 11px;
+    border-radius: 12px;
+    background: rgba(255, 214, 102, 0.2);
+    border: 1px solid rgba(199, 142, 16, 0.22);
+}
+
+.meeting-state-facts,
+.meeting-capture-summary {
+    display: grid;
+    gap: 8px;
+}
+
+.meeting-runtime-status-grid,
+.meeting-intelligence-grid {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.meeting-runtime-status-grid {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.meeting-runtime-status-grid article {
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.72);
+    border-radius: 12px;
+    padding: 9px 10px;
+    min-width: 0;
+}
+
+.meeting-runtime-status-grid span,
+.meeting-runtime-status-grid small,
+.meeting-intelligence-item span {
+    display: block;
+    color: rgba(58, 79, 128, 0.72);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.meeting-runtime-status-grid strong {
+    display: block;
+    color: #24325f;
+    margin: 3px 0;
+}
+
+.meeting-intelligence-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.meeting-intelligence-item {
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.74);
+    border-radius: 12px;
+    padding: 10px;
+}
+
+.meeting-intelligence-item p {
+    margin: 3px 0;
+    color: rgba(41, 49, 78, 0.96);
+    line-height: 1.4;
+}
+
+.meeting-state-facts span,
+.meeting-capture-summary span,
+.meeting-readiness-grid div,
+.meeting-privacy-grid div {
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.72);
+    border-radius: 12px;
+    padding: 9px 10px;
+    color: rgba(56, 66, 103, 0.88);
+    font-size: 13px;
+}
+
+.meeting-state-facts strong,
+.meeting-capture-summary strong,
+.meeting-readiness-grid strong,
+.meeting-privacy-grid strong {
+    color: #24325f;
+}
+
+.meeting-blockers {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(255, 89, 94, 0.1);
+    color: rgba(128, 34, 43, 0.95);
+}
+
+.meeting-blockers ul {
+    margin: 6px 0 0 18px;
+    padding: 0;
+}
+
+.meeting-governed-start-note {
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(28, 145, 98, 0.1);
+    border: 1px solid rgba(28, 145, 98, 0.2);
+    color: rgba(30, 92, 67, 0.96);
+}
+
+.meeting-governed-start-note p {
+    margin: 4px 0 0 0;
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.meeting-primary-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+}
+
+.meeting-capture-mode {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid rgba(85, 108, 190, 0.18);
+    background: rgba(255, 255, 255, 0.74);
+    border-radius: 999px;
+    padding: 5px 8px 5px 10px;
+    color: rgba(58, 79, 128, 0.86);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.meeting-capture-mode select {
+    border: 0;
+    background: transparent;
+    color: #24325f;
+    font: inherit;
+    outline: none;
+}
+
+.meeting-section-card,
+.meeting-card-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.meeting-readiness-grid,
+.meeting-privacy-grid {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.meeting-privacy-grid {
+    grid-template-columns: 1.4fr repeat(3, minmax(0, 1fr));
+}
+
+.meeting-readiness-grid span,
+.meeting-privacy-grid span {
+    display: block;
+    margin-bottom: 4px;
+    color: rgba(58, 79, 128, 0.72);
+    font-size: 12px;
+}
+
+.meeting-capture-summary {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.meeting-transcript-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 260px;
+    overflow: auto;
+}
+
+.meeting-transcript-entry {
+    display: grid;
+    grid-template-columns: auto auto auto minmax(0, 1fr);
+    gap: 8px;
+    align-items: baseline;
+    padding: 10px;
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.74);
+    border-radius: 12px;
+    font-size: 13px;
+}
+
+.meeting-source-badge {
+    border: 1px solid rgba(85, 108, 190, 0.2);
+    border-radius: 999px;
+    padding: 2px 7px;
+    color: rgba(45, 63, 126, 0.96);
+    background: rgba(255, 255, 255, 0.75);
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.meeting-source-badge--system_audio {
+    border-color: rgba(28, 145, 98, 0.25);
+    background: rgba(246, 255, 250, 0.95);
+}
+
+.meeting-source-badge--manual {
+    border-color: rgba(198, 141, 31, 0.25);
+    background: rgba(255, 251, 242, 0.95);
+}
+
+.meeting-source-badge--imported_file {
+    border-color: rgba(67, 97, 194, 0.25);
+    background: rgba(246, 248, 255, 0.95);
+}
+
+.meeting-transcript-entry span {
+    color: rgba(58, 79, 128, 0.72);
+}
+
+.meeting-transcript-entry p {
+    margin: 0;
+    color: rgba(41, 49, 78, 0.96);
+    line-height: 1.45;
+    white-space: pre-wrap;
+}
+
+.meeting-form-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.meeting-call-status {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 8px;
+}
+
+.meeting-call-status p {
+    margin: 0;
+    padding: 8px 10px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.62);
+    color: rgba(56, 66, 103, 0.88);
+    font-size: 13px;
+}
+
+.meeting-clear-confirmation {
+    border: 1px solid rgba(212, 78, 86, 0.25);
+    background: rgba(255, 247, 248, 0.88);
+    border-radius: 14px;
+    padding: 12px;
+}
+
+.meeting-operation-result {
+    max-height: 90px;
+}
+
+.meeting-diagnostics > summary {
+    cursor: pointer;
+    color: #2c438e;
+    font-weight: 700;
+}
+
+.meeting-diagnostics-grid {
+    margin-top: 12px;
+}
+
+@media (max-width: 760px) {
+    .desktop-agent-panel {
+        bottom: 0;
+        width: 100%;
+        height: 85vh;
+        max-height: 85vh;
+        border-radius: 16px 16px 0 0;
+    }
+
+    .desktop-agent-card-grid,
+    .meeting-status-main,
+    .meeting-readiness-grid,
+    .meeting-privacy-grid,
+    .meeting-capture-summary,
+    .meeting-runtime-status-grid,
+    .meeting-intelligence-grid,
+    .meeting-call-status {
+        grid-template-columns: 1fr;
+    }
+
+    .meeting-transcript-entry {
+        grid-template-columns: 1fr;
+    }
 }

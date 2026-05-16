@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDesktopAgent } from "../hooks/useDesktopAgent";
+import { MeetingDebugPanel } from "./MeetingDebugPanel";
 import type {
     CapabilityManifest,
     DesktopAuditEvent,
@@ -26,7 +27,7 @@ type DesktopAgentPanelProps = {
     onClose: () => void;
 };
 
-type ViewKey = "overview" | "approvals" | "audit" | "screen";
+type ViewKey = "overview" | "approvals" | "audit" | "screen" | "meeting";
 
 export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
     const agent = useDesktopAgent();
@@ -183,8 +184,8 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
     }
 
     return (
-        <aside className="flex p-4 bg-white/60 flex-col absolute bottom-0 
-        z-10 w-full h-1/2 backdrop-blur-sm border-t border-gray-200 gap-2 min-h-[300px]">
+        <aside className="desktop-agent-panel flex p-4 bg-white/80 flex-col fixed left-1/2 bottom-4 
+        z-10 w-[min(1100px,96vw)] h-[80vh] max-h-[85vh] -translate-x-1/2 backdrop-blur-sm border border-gray-200 shadow-2xl rounded-2xl gap-2 min-h-[420px]">
             <div className="desktop-agent-panel__header">
                 <div>
                     <p className="desktop-agent-panel__kicker">DESKTOP AGENT</p>
@@ -202,7 +203,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             </div>
 
             <div className="desktop-agent-tabs">
-                {(["overview", "screen", "approvals", "audit"] as ViewKey[]).map((key) => (
+                {(["overview", "screen", "meeting", "approvals", "audit"] as ViewKey[]).map((key) => (
                     <button
                         key={key}
                         className={`desktop-agent-tab ${view === key ? "active" : ""}`}
@@ -396,6 +397,10 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
                         ) : null}
                     </section>
                 </div>
+            ) : null}
+
+            {view === "meeting" ? (
+                <MeetingDebugPanel capabilities={capabilities} />
             ) : null}
 
             {view === "approvals" ? (

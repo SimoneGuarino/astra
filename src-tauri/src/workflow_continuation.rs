@@ -3571,6 +3571,8 @@ mod tests {
                 repeated_click_protection_triggered: false,
                 selected_target_candidate: None,
                 verifier_status: Some("GoalAchieved".into()),
+                completion_diagnostics:
+                    crate::desktop_agent_types::GoalLoopCompletionDiagnostics::default(),
                 failure_reason: None,
             }),
         );
