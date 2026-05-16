@@ -1,0 +1,553 @@
+{
+  "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+  "platform": "teams",
+  "started_at": "2026-05-16T23:41:37.365479600Z",
+  "ended_at": "2026-05-16T23:46:13.325622900Z",
+  "participants": [],
+  "transcript": [
+    {
+      "segment_id": "27709c9b-f2b5-4501-9585-356bc9b78888",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:42:14.443639300Z",
+      "created_at": "2026-05-16T23:42:14.443639300Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Faccio cagare a vestirmi quindi potrebbe essere che in realtà sono una cessa atomica e sono ridicola e non me ne sto rendendo conto. Ho trovato questo angolo nello scorso video e devo dire che mi piace molto. E' carino qua. E insomma bentornati ragazzoni in questo incredibile nuovissimo f...",
+      "confidence": 0.0,
+      "start_ms": 0,
+      "end_ms": 15000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "5686a79b-8620-459c-b95a-3b2a5aa450e2",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:42:14.717354300Z",
+      "created_at": "2026-05-16T23:42:14.717354300Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "un nuovo di pacca solo per voi! Ieri ho dato il mio ultimo esame! Sì, esatta! Sono troppo contenta questa settimana, ho fatto le ultime lezioni, questo sole caldissimo, secondo me voi state frigendo. Ok!",
+      "confidence": 0.0,
+      "start_ms": 15000,
+      "end_ms": 30000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "3b63a81f-0c36-4152-b23a-802b2ec7e0fb",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:42:23.992989800Z",
+      "created_at": "2026-05-16T23:42:23.992989800Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Sudero solo io, tranquilli. Sono anche un po' triste sotto un giro punto di vista perché è assurdo, nel senso quando ti scrivi in università a 500 anni il tempo passa velocissimo. Io non vedo l'ora di finire, non vedo l'ora adesso di dare la tesi, adesso mi dovrò occupare della tesi.",
+      "confidence": 0.0,
+      "start_ms": 30000,
+      "end_ms": 45000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "c1e0b3c8-4a5d-41e7-93e7-aea46673b965",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:42:38.990458Z",
+      "created_at": "2026-05-16T23:42:38.990458Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "così velocemente che mi sento triste, a fine delle cose mi rende sempre un po' nostalgica, in senso buono ovviamente. Diciamo che questa settimana mi sono dedicata appunto a questa chiusura delle lezioni dell'esame. In più abbiamo festeggiato, siamo andati...",
+      "confidence": 0.0,
+      "start_ms": 45000,
+      "end_ms": 60000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "827a0bdd-e6e3-425b-91b1-662510eac3be",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:42:53.946204500Z",
+      "created_at": "2026-05-16T23:42:53.946204500Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "a mangiare in un grottino che mi piace molto in tutto molto buono ottimo cibo come sempre ottimo per festeggiare quella è una zona in cui spesso ci sono borane e anfibi e niente quindi finalmente abbiamo trovato una ranetta in strada",
+      "confidence": 0.0,
+      "start_ms": 60000,
+      "end_ms": 75000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "224e1455-055c-49c6-92ad-46d1e78363a9",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:43:08.746256Z",
+      "created_at": "2026-05-16T23:43:08.746256Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "quindi io ho cercato di salvarla vai fratello viene vedere che fico che l'espaventato a morte non si muove vai sembrava panata è panata, oh dio carina che se...",
+      "confidence": 0.0,
+      "start_ms": 75000,
+      "end_ms": 90000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "4ce63d7e-e693-469e-8576-e4c040beaf07",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:43:23.918247300Z",
+      "created_at": "2026-05-16T23:43:23.918247300Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Brava! Vai, vai! Oppale la! Vai! Save it! Ah, Dio! L'hai buttato in un burrone adesso! Era pesantissimo eh! 7 Kg di rana! In realtà era un roso!",
+      "confidence": 0.0,
+      "start_ms": 90000,
+      "end_ms": 105000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "7d3e215c-9f48-4d0d-a4b7-3ffc19775d54",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:43:38.991376600Z",
+      "created_at": "2026-05-16T23:43:38.991376600Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Molto molto carino poi tra l'altro scoperto che i rospi in realtà sono velerosi. Ho anche fatto il bagnetto a Nala sempre bagnetto di festeggiamento Nala non ama tanto farsi fare il bagnetto devo dire, puzzava veramente di merda. Anche questo sei ingrassato se io mi sono indebolita",
+      "confidence": 0.0,
+      "start_ms": 105000,
+      "end_ms": 120000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "0cacc625-d1cc-4eee-868b-0fe101b97872",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "source": "system_audio",
+      "timestamp": "2026-05-16T23:43:53.926831200Z",
+      "created_at": "2026-05-16T23:43:53.926831200Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "non umiliarla amore ma non devi essere così depressa secondo me pensa che è in una trappola mortale alla so che tipo l'acqua salirà per sempre e lei sta per morire a negata e puci ancora di me brava amore e perfetti",
+      "confidence": 0.0,
+      "start_ms": 120000,
+      "end_ms": 135000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    }
+  ],
+  "summary": [
+    {
+      "id": "567bfc2b-cbcb-4231-81cd-985ec599baac",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:14.443760500Z",
+      "created_at": "2026-05-16T23:42:14.443760500Z",
+      "summary": "Speaking: Speaker 1",
+      "evidence_segment_ids": [
+        "27709c9b-f2b5-4501-9585-356bc9b78888"
+      ]
+    },
+    {
+      "id": "f88e45ca-b3ef-46de-ac77-7ee736463960",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:23.993116500Z",
+      "created_at": "2026-05-16T23:42:23.993116500Z",
+      "summary": "Speaking: Speaker 1",
+      "evidence_segment_ids": [
+        "27709c9b-f2b5-4501-9585-356bc9b78888",
+        "5686a79b-8620-459c-b95a-3b2a5aa450e2",
+        "3b63a81f-0c36-4152-b23a-802b2ec7e0fb"
+      ]
+    },
+    {
+      "id": "8803d1ec-7a33-4ab1-a974-efd2694102e4",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:43:08.746427100Z",
+      "created_at": "2026-05-16T23:43:08.746427100Z",
+      "summary": "Speaking: Speaker 1",
+      "evidence_segment_ids": [
+        "c1e0b3c8-4a5d-41e7-93e7-aea46673b965",
+        "827a0bdd-e6e3-425b-91b1-662510eac3be",
+        "224e1455-055c-49c6-92ad-46d1e78363a9"
+      ]
+    },
+    {
+      "id": "a404d6f5-d72e-45e0-a2b6-46d194e93fa7",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:43:53.926951400Z",
+      "created_at": "2026-05-16T23:43:53.926951400Z",
+      "summary": "Speaking: Speaker 1",
+      "evidence_segment_ids": [
+        "4ce63d7e-e693-469e-8576-e4c040beaf07",
+        "7d3e215c-9f48-4d0d-a4b7-3ffc19775d54",
+        "0cacc625-d1cc-4eee-868b-0fe101b97872"
+      ]
+    }
+  ],
+  "action_items": [],
+  "decisions": [],
+  "notes": [
+    {
+      "id": "c848181a-1c4c-4eb9-bed4-85d9ed594166",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:14.443707200Z",
+      "created_at": "2026-05-16T23:42:14.443707200Z",
+      "content": "[Speaker 1] Faccio cagare a vestirmi quindi potrebbe essere che in realtà sono una cessa atomica e sono ridicola e non me ne sto rendendo conto. Ho trovato questo angolo nello scorso video e devo dire che mi piace molto. E' carino q",
+      "evidence_segment_ids": [
+        "27709c9b-f2b5-4501-9585-356bc9b78888"
+      ]
+    },
+    {
+      "id": "3c8a544d-0ce5-4b16-8ab7-d05dc2e24415",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:14.717395Z",
+      "created_at": "2026-05-16T23:42:14.717395Z",
+      "content": "[Speaker 1] un nuovo di pacca solo per voi! Ieri ho dato il mio ultimo esame! Sì, esatta! Sono troppo contenta questa settimana, ho fatto le ultime lezioni, questo sole caldissimo, secondo me voi state frigendo. Ok!",
+      "evidence_segment_ids": [
+        "5686a79b-8620-459c-b95a-3b2a5aa450e2"
+      ]
+    },
+    {
+      "id": "56f25588-bd44-4128-b06a-d787d7abf902",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:23.993041700Z",
+      "created_at": "2026-05-16T23:42:23.993041700Z",
+      "content": "[Speaker 1] Sudero solo io, tranquilli. Sono anche un po' triste sotto un giro punto di vista perché è assurdo, nel senso quando ti scrivi in università a 500 anni il tempo passa velocissimo. Io non vedo l'ora di finire, non vedo l'",
+      "evidence_segment_ids": [
+        "3b63a81f-0c36-4152-b23a-802b2ec7e0fb"
+      ]
+    },
+    {
+      "id": "5d7b519d-8671-4086-afdd-548f027b61f4",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:38.990505Z",
+      "created_at": "2026-05-16T23:42:38.990505Z",
+      "content": "[Speaker 1] così velocemente che mi sento triste, a fine delle cose mi rende sempre un po' nostalgica, in senso buono ovviamente. Diciamo che questa settimana mi sono dedicata appunto a questa chiusura delle lezioni dell'esame. In p",
+      "evidence_segment_ids": [
+        "c1e0b3c8-4a5d-41e7-93e7-aea46673b965"
+      ]
+    },
+    {
+      "id": "d9908712-bde1-49f4-81cc-020590734fd6",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:42:53.946249900Z",
+      "created_at": "2026-05-16T23:42:53.946249900Z",
+      "content": "[Speaker 1] a mangiare in un grottino che mi piace molto in tutto molto buono ottimo cibo come sempre ottimo per festeggiare quella è una zona in cui spesso ci sono borane e anfibi e niente quindi finalmente abbiamo trovato una rane",
+      "evidence_segment_ids": [
+        "827a0bdd-e6e3-425b-91b1-662510eac3be"
+      ]
+    },
+    {
+      "id": "8e0852cf-cdb4-44a6-a90b-c3bc8b655003",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:43:08.746293400Z",
+      "created_at": "2026-05-16T23:43:08.746293400Z",
+      "content": "[Speaker 1] quindi io ho cercato di salvarla vai fratello viene vedere che fico che l'espaventato a morte non si muove vai sembrava panata è panata, oh dio carina che se...",
+      "evidence_segment_ids": [
+        "224e1455-055c-49c6-92ad-46d1e78363a9"
+      ]
+    },
+    {
+      "id": "9f72b3e7-ad67-4af6-9f97-5d28939644cd",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:43:23.918282900Z",
+      "created_at": "2026-05-16T23:43:23.918282900Z",
+      "content": "[Speaker 1] Brava! Vai, vai! Oppale la! Vai! Save it! Ah, Dio! L'hai buttato in un burrone adesso! Era pesantissimo eh! 7 Kg di rana! In realtà era un roso!",
+      "evidence_segment_ids": [
+        "4ce63d7e-e693-469e-8576-e4c040beaf07"
+      ]
+    },
+    {
+      "id": "cddfa4d2-83be-4b17-9327-8edf99ab8bda",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:43:38.991424700Z",
+      "created_at": "2026-05-16T23:43:38.991424700Z",
+      "content": "[Speaker 1] Molto molto carino poi tra l'altro scoperto che i rospi in realtà sono velerosi. Ho anche fatto il bagnetto a Nala sempre bagnetto di festeggiamento Nala non ama tanto farsi fare il bagnetto devo dire, puzzava veramente ",
+      "evidence_segment_ids": [
+        "7d3e215c-9f48-4d0d-a4b7-3ffc19775d54"
+      ]
+    },
+    {
+      "id": "fdbb7c86-4094-4281-b759-54fc34847876",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "timestamp": "2026-05-16T23:43:53.926882400Z",
+      "created_at": "2026-05-16T23:43:53.926882400Z",
+      "content": "[Speaker 1] non umiliarla amore ma non devi essere così depressa secondo me pensa che è in una trappola mortale alla so che tipo l'acqua salirà per sempre e lei sta per morire a negata e puci ancora di me brava amore e perfetti",
+      "evidence_segment_ids": [
+        "0cacc625-d1cc-4eee-868b-0fe101b97872"
+      ]
+    }
+  ],
+  "intelligence": {
+    "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+    "status": "generated",
+    "summary": {
+      "id": "ab51962e-05df-4260-8344-c0d39b0141d0",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "text": "Speaker shared excitement about completing exams, described a celebratory outing, and recounted a humorous incident involving frogs.",
+      "bullets": [
+        "Speaker excited about finishing exams.",
+        "Celebrated with friends at a local eatery.",
+        "Recounted a playful anecdote involving frogs."
+      ],
+      "evidence_segment_ids": [
+        "27709c9b-f2b5-4501-9585-356bc9b78888",
+        "5686a79b-8620-459c-b95a-3b2a5aa450e2",
+        "3b63a81f-0c36-4152-b23a-802b2ec7e0fb",
+        "c1e0b3c8-4a5d-41e7-93e7-aea46673b965",
+        "827a0bdd-e6e3-425b-91b1-662510eac3be",
+        "224e1455-055c-49c6-92ad-46d1e78363a9",
+        "4ce63d7e-e693-469e-8576-e4c040beaf07",
+        "7d3e215c-9f48-4d0d-a4b7-3ffc19775d54",
+        "0cacc625-d1cc-4eee-868b-0fe101b97872"
+      ],
+      "generated_at": "2026-05-16T23:44:53.464170200Z",
+      "generator": {
+        "type": "local_llm",
+        "provider": "ollama",
+        "model": "gpt-oss:20b"
+      },
+      "confidence": 0.8
+    },
+    "decisions": [],
+    "action_items": [],
+    "open_questions": [],
+    "risks": [],
+    "technical_recap": null,
+    "follow_up_draft": {
+      "id": "cc75bab0-72b8-4478-8b88-2f2262bbe335",
+      "session_id": "e557e00e-4415-4d9f-b550-eb1e56d11281",
+      "subject": "Meeting Recap",
+      "body": "Speaker shared excitement about completing exams, described a celebratory outing, and recounted a humorous incident involving frogs.",
+      "tone": "professional",
+      "evidence_segment_ids": [
+        "27709c9b-f2b5-4501-9585-356bc9b78888",
+        "5686a79b-8620-459c-b95a-3b2a5aa450e2",
+        "3b63a81f-0c36-4152-b23a-802b2ec7e0fb",
+        "c1e0b3c8-4a5d-41e7-93e7-aea46673b965",
+        "827a0bdd-e6e3-425b-91b1-662510eac3be",
+        "224e1455-055c-49c6-92ad-46d1e78363a9",
+        "4ce63d7e-e693-469e-8576-e4c040beaf07",
+        "7d3e215c-9f48-4d0d-a4b7-3ffc19775d54",
+        "0cacc625-d1cc-4eee-868b-0fe101b97872"
+      ],
+      "confidence": 0.8,
+      "generated_at": "2026-05-16T23:44:53.464170200Z",
+      "generator": {
+        "type": "local_llm",
+        "provider": "ollama",
+        "model": "gpt-oss:20b"
+      }
+    },
+    "timeline": [
+      {
+        "id": "1d109cda-3c8f-4e0d-bf7a-62df2710d856",
+        "timestamp_ms": 0,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Opening remarks",
+        "detail": "Speaker expresses feelings about being tired and excited.",
+        "evidence_segment_ids": [
+          "27709c9b-f2b5-4501-9585-356bc9b78888"
+        ]
+      },
+      {
+        "id": "ced62c72-1d08-443a-a36c-a76486a375c3",
+        "timestamp_ms": 15000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Exam update",
+        "detail": "Speaker announces passing final exam.",
+        "evidence_segment_ids": [
+          "5686a79b-8620-459c-b95a-3b2a5aa450e2"
+        ]
+      },
+      {
+        "id": "fd81ab1c-5071-43e8-aa4d-0c54f26ed55f",
+        "timestamp_ms": 30000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Academic reflections",
+        "detail": "Speaker reflects on university life.",
+        "evidence_segment_ids": [
+          "3b63a81f-0c36-4152-b23a-802b2ec7e0fb"
+        ]
+      },
+      {
+        "id": "c4786b81-2dc5-408d-b2a7-0236862a8f5f",
+        "timestamp_ms": 45000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Emotional reflection",
+        "detail": "Speaker feels nostalgic.",
+        "evidence_segment_ids": [
+          "c1e0b3c8-4a5d-41e7-93e7-aea46673b965"
+        ]
+      },
+      {
+        "id": "a52a3ab7-5788-41ac-ad2d-5feb70d3bf3e",
+        "timestamp_ms": 60000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Celebration outing",
+        "detail": "Speaker describes eating at a local place.",
+        "evidence_segment_ids": [
+          "827a0bdd-e6e3-425b-91b1-662510eac3be"
+        ]
+      },
+      {
+        "id": "eb2e4e2b-8931-455d-a443-8dcfbc3c0731",
+        "timestamp_ms": 75000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Frog anecdote",
+        "detail": "Speaker mentions saving a frog.",
+        "evidence_segment_ids": [
+          "224e1455-055c-49c6-92ad-46d1e78363a9"
+        ]
+      },
+      {
+        "id": "f6a73614-da62-4943-b0bf-8dab4b36fdcd",
+        "timestamp_ms": 90000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Excitement",
+        "detail": "Speaker expresses excitement.",
+        "evidence_segment_ids": [
+          "4ce63d7e-e693-469e-8576-e4c040beaf07"
+        ]
+      },
+      {
+        "id": "4b5ba6c6-e915-4d7b-b3ae-509eb9670d7f",
+        "timestamp_ms": 105000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Frog incident",
+        "detail": "Speaker describes dropping frog.",
+        "evidence_segment_ids": [
+          "7d3e215c-9f48-4d0d-a4b7-3ffc19775d54"
+        ]
+      },
+      {
+        "id": "41db96af-2775-472c-9faa-766bca071966",
+        "timestamp_ms": 120000,
+        "speaker_id": "remote_speaker_1",
+        "speaker_display_name": "Speaker 1",
+        "title": "Emotional support",
+        "detail": "Speaker talks about not being depressed.",
+        "evidence_segment_ids": [
+          "0cacc625-d1cc-4eee-868b-0fe101b97872"
+        ]
+      }
+    ],
+    "diagnostics": {
+      "status": "generated",
+      "generator": {
+        "type": "local_llm",
+        "provider": "ollama",
+        "model": "gpt-oss:20b"
+      },
+      "model_provider": "ollama",
+      "model_name": "gpt-oss:20b",
+      "degraded_reason": null,
+      "model_unavailable_reason": null,
+      "llm_used": true,
+      "json_parse_failed": false,
+      "invalid_evidence_ids": 0,
+      "rejected_artifact_count": 1,
+      "fallback_used": false,
+      "input_segment_count": 9,
+      "input_truncated": false,
+      "input_char_count": 2072,
+      "max_segments": 120,
+      "max_chars_total": 24000,
+      "max_chars_per_segment": 900,
+      "transcript_changed_during_generation": false,
+      "snapshot_transcript_segment_count": 9,
+      "transcript_text_logged": false,
+      "audit_redacted": true,
+      "warnings": [],
+      "generated_at": "2026-05-16T23:44:53.464242Z"
+    },
+    "source_transcript_segment_count": 9,
+    "generated_at": "2026-05-16T23:44:53.464170200Z"
+  },
+  "metadata": {
+    "capture_active": false,
+    "capture_backend": "wasapi",
+    "capture_backend_status": "capture active sources: system_audio:Capturing:segments_written=0; microphone:Capturing:segments_written=0; segment_file_stt=enabled",
+    "diarization_enabled": false,
+    "session_mode": "real_capture",
+    "speaker_rename_count": 0,
+    "speakers": [
+      {
+        "attribution_method": "source_default",
+        "confidence": 1.0,
+        "display_name": "You",
+        "source": "microphone",
+        "speaker_id": "local_user"
+      },
+      {
+        "attribution_method": "source_default",
+        "confidence": 0.6499999761581421,
+        "display_name": "Speaker 1",
+        "source": "system_audio",
+        "speaker_id": "remote_speaker_1"
+      },
+      {
+        "attribution_method": "source_default",
+        "confidence": 0.8999999761581421,
+        "display_name": "Manual",
+        "source": "manual",
+        "speaker_id": "manual_entry"
+      },
+      {
+        "attribution_method": "source_default",
+        "confidence": 0.800000011920929,
+        "display_name": "Imported",
+        "source": "imported_file",
+        "speaker_id": "imported_file"
+      },
+      {
+        "attribution_method": "unknown",
+        "confidence": 0.0,
+        "display_name": "Unknown",
+        "source": "unknown",
+        "speaker_id": "unknown_speaker"
+      }
+    ],
+    "transcription_model": "local"
+  }
+}

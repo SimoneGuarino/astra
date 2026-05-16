@@ -1435,12 +1435,32 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <div className="meeting-intelligence-meta">
                             <span>Generator: <strong>{generatorLabel(intelligence)}</strong></span>
                             <span>Segments: <strong>{intelligence.source_transcript_segment_count}</strong></span>
+                            <span>LLM: <strong>{intelligence.diagnostics.llm_used ? "used" : "not used"}</strong></span>
+                            <span>Fallback: <strong>{intelligence.diagnostics.fallback_used ? "yes" : "no"}</strong></span>
+                            <span>Input: <strong>{intelligence.diagnostics.input_segment_count || intelligence.source_transcript_segment_count}</strong></span>
                             <span>Audit: <strong>{intelligence.diagnostics.audit_redacted ? "redacted" : "not redacted"}</strong></span>
                             <span>Transcript logged: <strong>{intelligence.diagnostics.transcript_text_logged ? "yes" : "no"}</strong></span>
                         </div>
+                        {intelligence.diagnostics.input_truncated ? (
+                            <p className="meeting-intelligence-warning">
+                                Local model input was truncated to {intelligence.diagnostics.input_segment_count} segment(s)
+                                and {intelligence.diagnostics.input_char_count} character(s).
+                            </p>
+                        ) : null}
+                        {intelligence.diagnostics.rejected_artifact_count || intelligence.diagnostics.invalid_evidence_ids ? (
+                            <p className="meeting-intelligence-warning">
+                                Evidence validation rejected {intelligence.diagnostics.rejected_artifact_count} artifact(s)
+                                and ignored {intelligence.diagnostics.invalid_evidence_ids} invalid evidence id(s).
+                            </p>
+                        ) : null}
+                        {intelligence.diagnostics.transcript_changed_during_generation ? (
+                            <p className="meeting-intelligence-warning">
+                                Transcript changed during generation. Regenerate to include the newest context.
+                            </p>
+                        ) : null}
                         {intelligence.diagnostics.model_unavailable_reason ? (
                             <p className="meeting-intelligence-warning">
-                                Local model degraded: {intelligence.diagnostics.model_unavailable_reason}. Rule-based fallback is displayed.
+                                Local model degraded: {intelligence.diagnostics.degraded_reason ?? intelligence.diagnostics.model_unavailable_reason}. Rule-based fallback is displayed.
                             </p>
                         ) : null}
                         {intelligence.diagnostics.warnings.length ? (

@@ -1,17 +1,34 @@
 //! Transcript-backed meeting intelligence.
 //!
 //! This module treats transcript entries as the source of truth. Model output,
-//! when connected in a future milestone, must pass through the same schema and
-//! evidence validation before it can be stored.
+//! local model output must pass through the same schema and evidence validation
+//! before it can be stored.
 
 use super::{action_item_tracker::ActionItemTracker, decision_log::DecisionLog, types::*};
 use chrono::Utc;
+use reqwest::Client;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use serde_json::{json, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    future::Future,
+    pin::Pin,
+    time::Duration,
+};
 
 const MAX_SUMMARY_BULLETS: usize = 6;
+const MAX_DECISIONS: usize = 24;
+const MAX_ACTION_ITEMS: usize = 40;
+const MAX_OPEN_QUESTIONS: usize = 40;
+const MAX_RISKS: usize = 30;
 const MAX_TIMELINE_ITEMS: usize = 40;
 const MAX_TECHNICAL_ITEMS: usize = 12;
+const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+const DEFAULT_MEETING_LLM_CANDIDATES: &str = "gpt-oss:20b,qwen3:14b,qwen3:8b,llama3.1:8b";
+const DEFAULT_PROMPT_MAX_CHARS_TOTAL: usize = 24_000;
+const DEFAULT_PROMPT_MAX_CHARS_PER_SEGMENT: usize = 900;
+const DEFAULT_MEETING_LLM_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Debug, Clone)]
 pub struct MeetingIntelligenceInput {
@@ -19,6 +36,279 @@ pub struct MeetingIntelligenceInput {
     pub transcript_entries: Vec<TranscriptEntry>,
     pub speakers: Vec<SpeakerLabel>,
     pub generation_options: MeetingIntelligenceGenerationOptions,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MeetingLlmPromptStats {
+    pub input_segment_count: usize,
+    pub input_truncated: bool,
+    pub input_char_count: usize,
+    pub max_segments: usize,
+    pub max_chars_total: usize,
+    pub max_chars_per_segment: usize,
+    pub included_segment_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeetingLlmPromptSegment {
+    pub segment_id: String,
+    pub speaker_id: Option<String>,
+    pub speaker_label: String,
+    pub source: TranscriptSource,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeetingLlmPromptInput {
+    pub session_id: String,
+    pub prompt: String,
+    pub segments: Vec<MeetingLlmPromptSegment>,
+    pub stats: MeetingLlmPromptStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct MeetingLlmRawOutput {
+    pub raw_json: String,
+    pub provider: String,
+    pub model: String,
+    pub stats: MeetingLlmPromptStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeetingLlmErrorKind {
+    Unavailable,
+    Timeout,
+    Http,
+    InvalidResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingLlmError {
+    pub kind: MeetingLlmErrorKind,
+    pub message: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub stats: MeetingLlmPromptStats,
+}
+
+impl MeetingLlmError {
+    pub fn unavailable(message: impl Into<String>, stats: MeetingLlmPromptStats) -> Self {
+        Self {
+            kind: MeetingLlmErrorKind::Unavailable,
+            message: bounded_error_message(message.into()),
+            provider: "ollama".to_string(),
+            model: None,
+            stats,
+        }
+    }
+
+    fn with_kind(
+        kind: MeetingLlmErrorKind,
+        message: impl Into<String>,
+        model: Option<String>,
+        stats: MeetingLlmPromptStats,
+    ) -> Self {
+        Self {
+            kind,
+            message: bounded_error_message(message.into()),
+            provider: "ollama".to_string(),
+            model,
+            stats,
+        }
+    }
+
+    fn reason_code(&self) -> String {
+        match self.kind {
+            MeetingLlmErrorKind::Unavailable => "local_llm_unavailable",
+            MeetingLlmErrorKind::Timeout => "local_llm_timeout",
+            MeetingLlmErrorKind::Http => "local_llm_http_error",
+            MeetingLlmErrorKind::InvalidResponse => "local_llm_invalid_response",
+        }
+        .to_string()
+    }
+}
+
+pub type MeetingLlmFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<MeetingLlmRawOutput, MeetingLlmError>> + Send + 'a>>;
+
+pub trait MeetingIntelligenceLlm: Send + Sync {
+    fn generate_intelligence_json<'a>(
+        &'a self,
+        input: MeetingLlmPromptInput,
+    ) -> MeetingLlmFuture<'a>;
+}
+
+#[derive(Clone)]
+pub struct OllamaMeetingIntelligenceLlm {
+    client: Client,
+    timeout: Duration,
+}
+
+impl OllamaMeetingIntelligenceLlm {
+    pub fn new() -> Self {
+        let timeout_secs = env::var("ASTRA_MEETING_INTELLIGENCE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=300).contains(value))
+            .unwrap_or(DEFAULT_MEETING_LLM_TIMEOUT_SECS);
+        Self {
+            client: Client::new(),
+            timeout: Duration::from_secs(timeout_secs),
+        }
+    }
+
+    async fn select_model(&self) -> Result<String, String> {
+        if let Ok(model) = env::var("ASTRA_MEETING_INTELLIGENCE_MODEL") {
+            let model = model.trim();
+            if !model.is_empty() {
+                return Ok(model.to_string());
+            }
+        }
+
+        let installed = self.fetch_installed_models().await.unwrap_or_default();
+        let candidates = env::var("ASTRA_MEETING_INTELLIGENCE_MODEL_CANDIDATES")
+            .unwrap_or_else(|_| DEFAULT_MEETING_LLM_CANDIDATES.to_string())
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        select_first_available(&candidates, &installed)
+            .or_else(|| candidates.first().cloned())
+            .ok_or_else(|| "no meeting intelligence model candidates configured".to_string())
+    }
+
+    async fn fetch_installed_models(&self) -> Result<Vec<String>, String> {
+        let response = self
+            .client
+            .get(format!("{OLLAMA_BASE_URL}/api/tags"))
+            .send()
+            .await
+            .map_err(|error| format!("Ollama tags request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Ollama tags HTTP error: {}", response.status()));
+        }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("Ollama tags parse failed: {error}"))?;
+        Ok(body
+            .get("models")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
+    async fn call_model(
+        &self,
+        model: &str,
+        prompt: &MeetingLlmPromptInput,
+    ) -> Result<String, String> {
+        let payload = json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "options": {
+                "temperature": 0.0,
+                "num_ctx": 16384
+            },
+            "messages": [
+                {"role": "system", "content": meeting_llm_system_prompt()},
+                {"role": "user", "content": prompt.prompt}
+            ]
+        });
+
+        let response = self
+            .client
+            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|error| format!("Ollama meeting intelligence request failed: {error}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Ollama meeting intelligence HTTP error {status}: {}",
+                bounded_error_message(body)
+            ));
+        }
+        let body: Value = response.json().await.map_err(|error| {
+            format!("Ollama meeting intelligence response parse failed: {error}")
+        })?;
+        let content = body
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Ollama meeting intelligence returned an empty response".to_string())?;
+        extract_json_object(content)
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                "meeting intelligence response did not contain a JSON object".to_string()
+            })
+    }
+}
+
+impl Default for OllamaMeetingIntelligenceLlm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MeetingIntelligenceLlm for OllamaMeetingIntelligenceLlm {
+    fn generate_intelligence_json<'a>(
+        &'a self,
+        input: MeetingLlmPromptInput,
+    ) -> MeetingLlmFuture<'a> {
+        Box::pin(async move {
+            let stats = input.stats.clone();
+            let model = match self.select_model().await {
+                Ok(model) => model,
+                Err(error) => {
+                    return Err(MeetingLlmError::unavailable(error, stats));
+                }
+            };
+            let call = self.call_model(&model, &input);
+            match tokio::time::timeout(self.timeout, call).await {
+                Ok(Ok(raw_json)) => Ok(MeetingLlmRawOutput {
+                    raw_json,
+                    provider: "ollama".to_string(),
+                    model,
+                    stats: input.stats,
+                }),
+                Ok(Err(error)) => {
+                    let kind = if error.contains("empty response")
+                        || error.contains("did not contain a JSON object")
+                        || error.contains("response parse failed")
+                    {
+                        MeetingLlmErrorKind::InvalidResponse
+                    } else {
+                        MeetingLlmErrorKind::Http
+                    };
+                    Err(MeetingLlmError::with_kind(
+                        kind,
+                        error,
+                        Some(model),
+                        input.stats,
+                    ))
+                }
+                Err(_) => Err(MeetingLlmError::with_kind(
+                    MeetingLlmErrorKind::Timeout,
+                    "Ollama meeting intelligence request timed out",
+                    Some(model),
+                    input.stats,
+                )),
+            }
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -55,6 +345,20 @@ impl MeetingIntelligenceEngine {
         llm_json: Option<&str>,
         model_name: Option<&str>,
     ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let output = llm_json.map(|raw_json| MeetingLlmRawOutput {
+            raw_json: raw_json.to_string(),
+            provider: "ollama".to_string(),
+            model: model_name.unwrap_or("local").to_string(),
+            stats: prompt_stats_for_input(&input),
+        });
+        Self::generate_with_llm_output_or_rule_based(input, output, None)
+    }
+
+    pub fn generate_with_llm_output_or_rule_based(
+        input: MeetingIntelligenceInput,
+        llm_output: Option<MeetingLlmRawOutput>,
+        llm_error: Option<MeetingLlmError>,
+    ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
         if input.transcript_entries.is_empty() {
             return Err(MeetingRuntimeError::InvalidConfig {
                 message: "meeting intelligence requires at least one transcript segment"
@@ -63,13 +367,35 @@ impl MeetingIntelligenceEngine {
         }
         let input = bounded_input(input);
 
-        let Some(raw_json) = llm_json else {
-            let mut warnings = vec![
-                "Local LLM generation was requested but no governed meeting LLM adapter is connected; rule-based fallback was used".to_string(),
-            ];
-            if !input.generation_options.use_local_llm {
-                warnings.clear();
-            }
+        if let Some(error) = llm_error {
+            let mut fallback = Self::rule_based_result(
+                &input,
+                ArtifactGenerator::RuleBased,
+                MeetingIntelligenceStatus::Degraded,
+                Some(error.reason_code()),
+                vec![format!(
+                    "Local model generation failed ({:?}); rule-based fallback was used",
+                    error.kind
+                )],
+            );
+            fallback.diagnostics.fallback_used = true;
+            fallback.diagnostics.degraded_reason = Some(error.message);
+            fallback.diagnostics.model_provider = Some(error.provider);
+            fallback.diagnostics.model_name = error.model;
+            apply_prompt_stats(&mut fallback.diagnostics, &error.stats);
+            return Ok(fallback);
+        }
+
+        let Some(output) = llm_output else {
+            let mut warnings = Vec::new();
+            let unavailable_reason = if input.generation_options.use_local_llm {
+                warnings.push(
+                        "Local LLM generation was requested but no governed meeting LLM adapter is connected; rule-based fallback was used".to_string(),
+                    );
+                Some("meeting_local_llm_adapter_not_connected".to_string())
+            } else {
+                None
+            };
             return Ok(Self::rule_based_result(
                 &input,
                 ArtifactGenerator::RuleBased,
@@ -78,14 +404,26 @@ impl MeetingIntelligenceEngine {
                 } else {
                     MeetingIntelligenceStatus::Degraded
                 },
-                Some("meeting_local_llm_adapter_not_connected".to_string())
-                    .filter(|_| input.generation_options.use_local_llm),
+                unavailable_reason,
                 warnings,
             ));
         };
 
-        match Self::validate_llm_json(raw_json, &input, model_name.unwrap_or("local")) {
-            Ok(result) => Ok(result),
+        let validation_input = input_for_prompt_stats(&input, &output.stats);
+        match Self::validate_llm_json(&output.raw_json, &validation_input, &output.model) {
+            Ok(mut result) => {
+                result.diagnostics.generator = ArtifactGenerator::LocalLlm {
+                    provider: output.provider.clone(),
+                    model: output.model.clone(),
+                };
+                result.diagnostics.model_provider = Some(output.provider);
+                result.diagnostics.model_name = Some(output.model);
+                result.diagnostics.llm_used = true;
+                result.diagnostics.fallback_used = false;
+                apply_prompt_stats(&mut result.diagnostics, &output.stats);
+                result.source_transcript_segment_count = output.stats.input_segment_count;
+                Ok(result)
+            }
             Err(mut diagnostics) => {
                 diagnostics.warnings.push(
                     "Malformed local model output was not stored; rule-based fallback was used"
@@ -102,6 +440,11 @@ impl MeetingIntelligenceEngine {
                 fallback.diagnostics.invalid_evidence_ids = diagnostics.invalid_evidence_ids;
                 fallback.diagnostics.rejected_artifact_count = diagnostics.rejected_artifact_count;
                 fallback.diagnostics.fallback_used = true;
+                fallback.diagnostics.degraded_reason =
+                    Some("local model output failed schema or evidence validation".to_string());
+                fallback.diagnostics.model_provider = Some(output.provider);
+                fallback.diagnostics.model_name = Some(output.model);
+                apply_prompt_stats(&mut fallback.diagnostics, &output.stats);
                 Ok(fallback)
             }
         }
@@ -193,6 +536,7 @@ impl MeetingIntelligenceEngine {
                     generator: generator.clone(),
                 })
             })
+            .take(MAX_DECISIONS)
             .collect::<Vec<_>>();
 
         let action_items = draft
@@ -225,6 +569,7 @@ impl MeetingIntelligenceEngine {
                     generator: generator.clone(),
                 })
             })
+            .take(MAX_ACTION_ITEMS)
             .collect::<Vec<_>>();
 
         let open_questions = draft
@@ -255,6 +600,7 @@ impl MeetingIntelligenceEngine {
                     generator: generator.clone(),
                 })
             })
+            .take(MAX_OPEN_QUESTIONS)
             .collect::<Vec<_>>();
 
         let risks = draft
@@ -278,6 +624,7 @@ impl MeetingIntelligenceEngine {
                     generator: generator.clone(),
                 })
             })
+            .take(MAX_RISKS)
             .collect::<Vec<_>>();
 
         let technical_recap = draft.technical_recap.and_then(|recap| {
@@ -360,7 +707,7 @@ impl MeetingIntelligenceEngine {
                 .collect()
         };
 
-        let diagnostics = base_diagnostics(
+        let mut diagnostics = base_diagnostics(
             MeetingIntelligenceStatus::Generated,
             generator.clone(),
             None,
@@ -370,6 +717,7 @@ impl MeetingIntelligenceEngine {
             false,
             stats.warnings,
         );
+        diagnostics.llm_used = true;
 
         Ok(MeetingIntelligenceResult {
             session_id: input.session_id.clone(),
@@ -455,6 +803,146 @@ fn bounded_input(mut input: MeetingIntelligenceInput) -> MeetingIntelligenceInpu
     input
 }
 
+pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> MeetingLlmPromptInput {
+    let max_segments = input
+        .generation_options
+        .max_transcript_segments
+        .clamp(1, 500);
+    let max_chars_total = configured_usize(
+        "ASTRA_MEETING_INTELLIGENCE_MAX_PROMPT_CHARS",
+        DEFAULT_PROMPT_MAX_CHARS_TOTAL,
+        2_000,
+        120_000,
+    );
+    let max_chars_per_segment = configured_usize(
+        "ASTRA_MEETING_INTELLIGENCE_MAX_CHARS_PER_SEGMENT",
+        DEFAULT_PROMPT_MAX_CHARS_PER_SEGMENT,
+        120,
+        8_000,
+    );
+
+    let mut selected_rev = Vec::new();
+    let mut input_char_count = 0usize;
+    let mut input_truncated = input.transcript_entries.len() > max_segments;
+
+    for entry in input.transcript_entries.iter().rev().take(max_segments) {
+        let original_len = entry.text.trim().chars().count();
+        if original_len == 0 {
+            continue;
+        }
+        let remaining = max_chars_total.saturating_sub(input_char_count);
+        if remaining == 0 {
+            input_truncated = true;
+            break;
+        }
+        let text_limit = remaining.min(max_chars_per_segment);
+        let text = bounded_text(&entry.text, text_limit);
+        let text_len = text.chars().count();
+        if text_len < original_len {
+            input_truncated = true;
+        }
+        input_char_count = input_char_count.saturating_add(text_len);
+        selected_rev.push(MeetingLlmPromptSegment {
+            segment_id: entry.segment_id.clone(),
+            speaker_id: entry.speaker_id.clone(),
+            speaker_label: entry.speaker_display_name().to_string(),
+            source: entry.source,
+            start_ms: entry.start_ms,
+            end_ms: entry.end_ms,
+            text,
+        });
+    }
+
+    selected_rev.reverse();
+    let included_segment_ids = selected_rev
+        .iter()
+        .map(|segment| segment.segment_id.clone())
+        .collect::<Vec<_>>();
+    let stats = MeetingLlmPromptStats {
+        input_segment_count: selected_rev.len(),
+        input_truncated,
+        input_char_count,
+        max_segments,
+        max_chars_total,
+        max_chars_per_segment,
+        included_segment_ids,
+    };
+    let prompt = meeting_llm_user_prompt(input, &selected_rev, &stats);
+    MeetingLlmPromptInput {
+        session_id: input.session_id.clone(),
+        prompt,
+        segments: selected_rev,
+        stats,
+    }
+}
+
+fn prompt_stats_for_input(input: &MeetingIntelligenceInput) -> MeetingLlmPromptStats {
+    let bounded = bounded_input(input.clone());
+    MeetingLlmPromptStats {
+        input_segment_count: bounded.transcript_entries.len(),
+        input_truncated: input.transcript_entries.len() != bounded.transcript_entries.len(),
+        input_char_count: bounded
+            .transcript_entries
+            .iter()
+            .map(|entry| entry.text.chars().count())
+            .sum(),
+        max_segments: input
+            .generation_options
+            .max_transcript_segments
+            .clamp(1, 500),
+        max_chars_total: 0,
+        max_chars_per_segment: 0,
+        included_segment_ids: bounded
+            .transcript_entries
+            .iter()
+            .map(|entry| entry.segment_id.clone())
+            .collect(),
+    }
+}
+
+fn input_for_prompt_stats(
+    input: &MeetingIntelligenceInput,
+    stats: &MeetingLlmPromptStats,
+) -> MeetingIntelligenceInput {
+    if stats.included_segment_ids.is_empty() {
+        return bounded_input(input.clone());
+    }
+    let included = stats
+        .included_segment_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut filtered = input.clone();
+    filtered.transcript_entries = input
+        .transcript_entries
+        .iter()
+        .filter(|entry| included.contains(&entry.segment_id))
+        .cloned()
+        .collect();
+    filtered
+}
+
+fn apply_prompt_stats(
+    diagnostics: &mut MeetingIntelligenceDiagnostics,
+    stats: &MeetingLlmPromptStats,
+) {
+    diagnostics.input_segment_count = stats.input_segment_count;
+    diagnostics.input_truncated = stats.input_truncated;
+    diagnostics.input_char_count = stats.input_char_count;
+    diagnostics.max_segments = stats.max_segments;
+    diagnostics.max_chars_total = stats.max_chars_total;
+    diagnostics.max_chars_per_segment = stats.max_chars_per_segment;
+    if stats.input_truncated
+        && !diagnostics.warnings.iter().any(|warning| {
+            warning == "Local model input was truncated to bounded transcript context"
+        })
+    {
+        diagnostics
+            .warnings
+            .push("Local model input was truncated to bounded transcript context".to_string());
+    }
+}
+
 fn base_diagnostics(
     status: MeetingIntelligenceStatus,
     generator: ArtifactGenerator,
@@ -476,16 +964,218 @@ fn base_diagnostics(
         generator,
         model_provider: provider,
         model_name: model,
+        degraded_reason: unavailable_reason.clone(),
         model_unavailable_reason: unavailable_reason,
+        llm_used: false,
         json_parse_failed,
         invalid_evidence_ids,
         rejected_artifact_count,
         fallback_used,
+        input_segment_count: 0,
+        input_truncated: false,
+        input_char_count: 0,
+        max_segments: 0,
+        max_chars_total: 0,
+        max_chars_per_segment: 0,
+        transcript_changed_during_generation: false,
+        snapshot_transcript_segment_count: 0,
         transcript_text_logged: false,
         audit_redacted: true,
         warnings,
         generated_at: Utc::now(),
     }
+}
+
+fn meeting_llm_system_prompt() -> &'static str {
+    "You are Astra Meeting Intelligence, a local-only model behind a Rust-governed desktop assistant. Return strict JSON only. Do not reveal chain-of-thought. Use only the provided transcript evidence. Do not fabricate speaker identities, people, commitments, due dates, files, commands, errors, or facts. If evidence is missing, omit the artifact."
+}
+
+fn meeting_llm_user_prompt(
+    input: &MeetingIntelligenceInput,
+    segments: &[MeetingLlmPromptSegment],
+    stats: &MeetingLlmPromptStats,
+) -> String {
+    let speaker_registry = input
+        .speakers
+        .iter()
+        .map(|speaker| {
+            json!({
+                "speaker_id": &speaker.speaker_id,
+                "display_name": &speaker.display_name,
+                "source": speaker.source,
+                "attribution_method": speaker.attribution_method,
+                "confidence": speaker.confidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let transcript = segments
+        .iter()
+        .map(|segment| {
+            json!({
+                "segment_id": &segment.segment_id,
+                "speaker_id": &segment.speaker_id,
+                "speaker_label": &segment.speaker_label,
+                "source": segment.source,
+                "start_ms": segment.start_ms,
+                "end_ms": segment.end_ms,
+                "text": &segment.text,
+            })
+        })
+        .collect::<Vec<_>>();
+    let speaker_json =
+        serde_json::to_string_pretty(&speaker_registry).unwrap_or_else(|_| "[]".to_string());
+    let transcript_json =
+        serde_json::to_string_pretty(&transcript).unwrap_or_else(|_| "[]".to_string());
+
+    format!(
+        r#"Generate transcript-backed meeting intelligence for session "{session_id}".
+
+Language:
+- Generate artifacts in the dominant language of the transcript.
+- If mixed, prefer the user's/local microphone language when clear.
+
+Bounded input:
+- input_segment_count: {input_segment_count}
+- input_truncated: {input_truncated}
+- input_char_count: {input_char_count}
+- max_segments: {max_segments}
+- max_chars_total: {max_chars_total}
+- max_chars_per_segment: {max_chars_per_segment}
+
+Speaker registry JSON:
+{speaker_json}
+
+Transcript entries JSON:
+{transcript_json}
+
+Return JSON only, with this exact top-level shape:
+{{
+  "summary": {{
+    "text": "string",
+    "bullets": ["string"],
+    "evidence_segment_ids": ["segment_id"],
+    "confidence": 0.0
+  }},
+  "decisions": [
+    {{
+      "decision": "string",
+      "rationale": "string or null",
+      "made_by_speaker_id": "speaker_id or null",
+      "made_by_display_name": "display name or null",
+      "evidence_segment_ids": ["segment_id"],
+      "confidence": 0.0
+    }}
+  ],
+  "action_items": [
+    {{
+      "task": "string",
+      "assignee_speaker_id": "speaker_id or null",
+      "assignee_display_name": "display name or null",
+      "due_date": "string or null",
+      "evidence_segment_ids": ["segment_id"],
+      "confidence": 0.0
+    }}
+  ],
+  "open_questions": [
+    {{
+      "question": "string",
+      "asked_by_speaker_id": "speaker_id or null",
+      "asked_by_display_name": "display name or null",
+      "evidence_segment_ids": ["segment_id"],
+      "confidence": 0.0
+    }}
+  ],
+  "risks": [
+    {{
+      "risk": "string",
+      "severity": "low|medium|high",
+      "evidence_segment_ids": ["segment_id"],
+      "confidence": 0.0
+    }}
+  ],
+  "technical_recap": {{
+    "bullets": ["string"],
+    "mentioned_files": ["string"],
+    "mentioned_commands": ["string"],
+    "mentioned_errors": ["string"],
+    "evidence_segment_ids": ["segment_id"],
+    "confidence": 0.0
+  }},
+  "follow_up_draft": {{
+    "subject": "string",
+    "body": "string",
+    "evidence_segment_ids": ["segment_id"],
+    "confidence": 0.0
+  }},
+  "timeline": [
+    {{
+      "timestamp_ms": 0,
+      "speaker_id": "speaker_id or null",
+      "speaker_display_name": "display name or null",
+      "title": "string",
+      "detail": "string",
+      "evidence_segment_ids": ["segment_id"]
+    }}
+  ]
+}}
+
+Rules:
+- Every meaningful artifact must include valid evidence_segment_ids from the transcript entries above.
+- Omit decisions/action_items/open_questions/risks that are not directly supported by evidence.
+- Do not invent recipient names. The follow-up draft is draft-only and must not imply sending.
+- Do not include markdown, comments, or explanatory text outside JSON.
+"#,
+        session_id = input.session_id,
+        input_segment_count = stats.input_segment_count,
+        input_truncated = stats.input_truncated,
+        input_char_count = stats.input_char_count,
+        max_segments = stats.max_segments,
+        max_chars_total = stats.max_chars_total,
+        max_chars_per_segment = stats.max_chars_per_segment,
+        speaker_json = speaker_json,
+        transcript_json = transcript_json
+    )
+}
+
+fn configured_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn select_first_available(candidates: &[String], installed_models: &[String]) -> Option<String> {
+    let installed_lower = installed_models
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    candidates.iter().find_map(|candidate| {
+        let exact = candidate.to_ascii_lowercase();
+        if installed_lower.iter().any(|installed| installed == &exact) {
+            return Some(candidate.clone());
+        }
+        let base = exact.split(':').next().unwrap_or(&exact).to_string();
+        installed_models.iter().find_map(|installed| {
+            let installed_lower = installed.to_ascii_lowercase();
+            (installed_lower == base || installed_lower.starts_with(&(base.clone() + ":")))
+                .then(|| installed.clone())
+        })
+    })
+}
+
+fn extract_json_object(content: &str) -> Option<&str> {
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (end > start).then_some(trimmed[start..=end].trim())
+}
+
+fn bounded_error_message(message: String) -> String {
+    message.trim().chars().take(240).collect()
 }
 
 fn rule_based_summary(
@@ -1217,6 +1907,68 @@ mod tests {
             result.summary.unwrap().evidence_segment_ids,
             vec!["seg-1".to_string()]
         );
+    }
+
+    #[test]
+    fn valid_llm_output_can_store_italian_followup() {
+        let raw = r#"{
+            "summary": {"text":"Sintesi fondata","bullets":["Decisione confermata"],"evidence_segment_ids":["seg-1"],"confidence":0.8},
+            "follow_up_draft": {"subject":"Riepilogo incontro","body":"Ciao,\nabbiamo confermato la milestone e i prossimi passi.","evidence_segment_ids":["seg-1"],"confidence":0.82}
+        }"#;
+
+        let output = MeetingLlmRawOutput {
+            raw_json: raw.to_string(),
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            stats: build_meeting_llm_prompt_input(&input()).stats,
+        };
+        let result = MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
+            input(),
+            Some(output),
+            None,
+        )
+        .expect("llm result");
+
+        assert_eq!(result.status, MeetingIntelligenceStatus::Generated);
+        assert!(result.diagnostics.llm_used);
+        assert!(!result.diagnostics.fallback_used);
+        assert!(result
+            .follow_up_draft
+            .as_ref()
+            .is_some_and(|draft| draft.body.starts_with("Ciao")));
+    }
+
+    #[test]
+    fn prompt_snapshot_is_latest_bounded_and_chronological() {
+        let mut input = input();
+        input.generation_options.max_transcript_segments = 2;
+        for index in 3..=5 {
+            let mut entry = TranscriptEntry::sourced(
+                "session",
+                TranscriptSource::Manual,
+                "Simone",
+                format!("Transcript segment {index}"),
+                0.9,
+            );
+            entry.segment_id = format!("seg-{index}");
+            entry.start_ms = Some((index as u64) * 1_000);
+            input.transcript_entries.push(entry);
+        }
+
+        let prompt = build_meeting_llm_prompt_input(&input);
+
+        assert_eq!(
+            prompt
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["seg-4", "seg-5"]
+        );
+        assert!(prompt.stats.input_truncated);
+        assert!(prompt
+            .prompt
+            .contains("Generate artifacts in the dominant language of the transcript"));
     }
 
     #[test]

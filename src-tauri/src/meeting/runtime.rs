@@ -8,6 +8,10 @@ use super::{
     capture_controller::{
         CaptureController, CaptureControllerConfig, CaptureControllerStartRequest,
     },
+    intelligence_engine::{
+        build_meeting_llm_prompt_input, MeetingIntelligenceEngine, MeetingIntelligenceLlm,
+        OllamaMeetingIntelligenceLlm,
+    },
     note_organizer::NoteOrganizer,
     privacy_control::PrivacyState,
     segment_writer::CapturedMeetingSegment,
@@ -45,6 +49,7 @@ pub struct MeetingRuntime {
     capture: Arc<Mutex<CaptureController>>,
     microphone_capture: Arc<Mutex<CaptureController>>,
     stt_adapter: Arc<dyn MeetingFileTranscriber>,
+    intelligence_llm: Arc<dyn MeetingIntelligenceLlm>,
     organizer: NoteOrganizer,
     meeting_storage_dir: PathBuf,
 }
@@ -68,6 +73,18 @@ impl MeetingRuntime {
         project_root: PathBuf,
         stt_adapter: Arc<dyn MeetingFileTranscriber>,
     ) -> Self {
+        Self::with_file_transcriber_and_intelligence_llm(
+            project_root,
+            stt_adapter,
+            Arc::new(OllamaMeetingIntelligenceLlm::new()),
+        )
+    }
+
+    pub fn with_file_transcriber_and_intelligence_llm(
+        project_root: PathBuf,
+        stt_adapter: Arc<dyn MeetingFileTranscriber>,
+        intelligence_llm: Arc<dyn MeetingIntelligenceLlm>,
+    ) -> Self {
         let meeting_storage_dir = project_root.join(".astra/meetings");
         Self {
             registry: Arc::new(Mutex::new(SessionRegistry::new(project_root.clone()))),
@@ -75,6 +92,7 @@ impl MeetingRuntime {
             capture: Arc::new(Mutex::new(CaptureController::new())),
             microphone_capture: Arc::new(Mutex::new(CaptureController::new())),
             stt_adapter,
+            intelligence_llm,
             organizer: NoteOrganizer::new(meeting_storage_dir.clone()),
             meeting_storage_dir,
         }
@@ -675,12 +693,40 @@ impl MeetingRuntime {
         Ok(registry.get_active_state().diagnostics.clone())
     }
 
-    pub fn generate_intelligence(
+    pub async fn generate_intelligence(
         &self,
         options: MeetingIntelligenceGenerationOptions,
     ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let snapshot = {
+            let mut registry = self.lock_registry()?;
+            registry.begin_intelligence_generation(options)?
+        };
+        let input = snapshot.input.clone();
+
+        let result = if input.generation_options.use_local_llm {
+            let prompt_input = build_meeting_llm_prompt_input(&input);
+            match self
+                .intelligence_llm
+                .generate_intelligence_json(prompt_input)
+                .await
+            {
+                Ok(output) => MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
+                    input,
+                    Some(output),
+                    None,
+                )?,
+                Err(error) => MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
+                    input,
+                    None,
+                    Some(error),
+                )?,
+            }
+        } else {
+            MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(input, None, None)?
+        };
+
         let mut registry = self.lock_registry()?;
-        registry.generate_intelligence(options)
+        registry.store_intelligence_result(&snapshot, result)
     }
 
     pub fn read_intelligence(
@@ -1800,17 +1846,28 @@ fn capture_status_message(
 mod tests {
     use super::*;
     use crate::meeting::types::{
-        ActionItemStatus, ClearMeetingDataRequest, MeetingClearScope,
+        ActionItemStatus, ArtifactGenerator, ClearMeetingDataRequest, MeetingClearScope,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus, MeetingStatus,
         TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE, LOCAL_USER_SPEAKER_ID,
         REMOTE_SPEAKER_1_ID,
     };
     use crate::meeting::{
+        intelligence_engine::{
+            MeetingIntelligenceLlm, MeetingLlmError, MeetingLlmErrorKind, MeetingLlmFuture,
+            MeetingLlmPromptInput, MeetingLlmRawOutput,
+        },
         segment_writer::{SegmentWriter, SegmentWriterConfig},
         stt_adapter::{MeetingFileTranscriber, MeetingFileTranscriptionFuture},
     };
     use chrono::Utc;
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use uuid::Uuid;
 
     struct FixedTranscriber;
@@ -1857,6 +1914,68 @@ mod tests {
                 Ok(format!(
                     "We decided to ship this segment. Please follow up on {stem} by tomorrow."
                 ))
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedMeetingLlm {
+        response: Result<String, MeetingLlmErrorKind>,
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    impl FixedMeetingLlm {
+        fn json(raw: impl Into<String>) -> Self {
+            Self {
+                response: Ok(raw.into()),
+                calls: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::from_millis(0),
+            }
+        }
+
+        fn error(kind: MeetingLlmErrorKind) -> Self {
+            Self {
+                response: Err(kind),
+                calls: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::from_millis(0),
+            }
+        }
+
+        fn with_delay(mut self, delay: Duration) -> Self {
+            self.delay = delay;
+            self
+        }
+    }
+
+    impl MeetingIntelligenceLlm for FixedMeetingLlm {
+        fn generate_intelligence_json<'a>(
+            &'a self,
+            input: MeetingLlmPromptInput,
+        ) -> MeetingLlmFuture<'a> {
+            let response = self.response.clone();
+            let calls = self.calls.clone();
+            let delay = self.delay;
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                match response {
+                    Ok(raw_json) => Ok(MeetingLlmRawOutput {
+                        raw_json,
+                        provider: "ollama".to_string(),
+                        model: "mock-meeting-model".to_string(),
+                        stats: input.stats,
+                    }),
+                    Err(kind) => Err(MeetingLlmError {
+                        kind,
+                        message: "mock local model unavailable".to_string(),
+                        provider: "ollama".to_string(),
+                        model: Some("mock-meeting-model".to_string()),
+                        stats: input.stats,
+                    }),
+                }
             })
         }
     }
@@ -2134,8 +2253,8 @@ mod tests {
             .any(|diagnostic| diagnostic.code == "speaker_label_renamed"));
     }
 
-    #[test]
-    fn generated_intelligence_is_evidence_linked_and_does_not_mutate_transcript() {
+    #[tokio::test]
+    async fn generated_intelligence_is_evidence_linked_and_does_not_mutate_transcript() {
         let runtime = MeetingRuntime::new(temp_root());
         runtime.grant_consent("teams").expect("grant consent");
         runtime
@@ -2162,6 +2281,7 @@ mod tests {
         let before_segment_id = before.transcript[0].segment_id.clone();
         let result = runtime
             .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .await
             .expect("generate intelligence");
 
         assert_eq!(result.status, MeetingIntelligenceStatus::Generated);
@@ -2185,8 +2305,8 @@ mod tests {
         assert!(after.intelligence.is_some());
     }
 
-    #[test]
-    fn clear_intelligence_removes_derived_intelligence_only() {
+    #[tokio::test]
+    async fn clear_intelligence_removes_derived_intelligence_only() {
         let runtime = MeetingRuntime::new(temp_root());
         runtime.grant_consent("teams").expect("grant consent");
         runtime
@@ -2209,6 +2329,7 @@ mod tests {
             .expect("add transcript");
         runtime
             .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .await
             .expect("generate intelligence");
         runtime.clear_intelligence().expect("clear intelligence");
 
@@ -2219,6 +2340,227 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "meeting_intelligence_cleared"));
+    }
+
+    #[tokio::test]
+    async fn local_llm_success_stores_validated_artifacts() {
+        let raw = r#"{
+            "summary": {
+                "text": "Abbiamo deciso di collegare il modello locale.",
+                "bullets": ["Adapter Ollama collegato"],
+                "evidence_segment_ids": ["seg-it"],
+                "confidence": 0.91
+            },
+            "follow_up_draft": {
+                "subject": "Riepilogo riunione Astra",
+                "body": "Ciao,\nabbiamo deciso di collegare il modello locale e validare gli output con evidenza.",
+                "evidence_segment_ids": ["seg-it"],
+                "confidence": 0.88
+            }
+        }"#;
+        let llm = FixedMeetingLlm::json(raw);
+        let calls = llm.calls.clone();
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let mut entry = TranscriptEntry::sourced(
+            "",
+            TranscriptSource::Manual,
+            "Simone",
+            "Abbiamo deciso di collegare il modello locale Ollama alla meeting intelligence.",
+            0.9,
+        );
+        entry.segment_id = "seg-it".to_string();
+        runtime.add_transcript(entry).expect("add transcript");
+
+        let result = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions {
+                use_local_llm: true,
+                max_transcript_segments: 120,
+            })
+            .await
+            .expect("generate");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.status, MeetingIntelligenceStatus::Generated);
+        assert!(result.diagnostics.llm_used);
+        assert!(!result.diagnostics.fallback_used);
+        assert!(matches!(
+            result.summary.as_ref().map(|summary| &summary.generator),
+            Some(ArtifactGenerator::LocalLlm { model, .. }) if model == "mock-meeting-model"
+        ));
+        assert!(result
+            .follow_up_draft
+            .as_ref()
+            .is_some_and(|draft| draft.body.contains("Ciao")));
+    }
+
+    #[tokio::test]
+    async fn local_llm_error_falls_back_truthfully() {
+        let llm = FixedMeetingLlm::error(MeetingLlmErrorKind::Unavailable);
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        runtime
+            .add_transcript(TranscriptEntry::sourced(
+                "",
+                TranscriptSource::Manual,
+                "Simone",
+                "Please generate grounded intelligence from this transcript.",
+                0.9,
+            ))
+            .expect("add transcript");
+
+        let result = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions {
+                use_local_llm: true,
+                max_transcript_segments: 120,
+            })
+            .await
+            .expect("fallback");
+
+        assert_eq!(result.status, MeetingIntelligenceStatus::Degraded);
+        assert!(!result.diagnostics.llm_used);
+        assert!(result.diagnostics.fallback_used);
+        assert_eq!(
+            result.diagnostics.model_unavailable_reason.as_deref(),
+            Some("local_llm_unavailable")
+        );
+        assert!(result.summary.is_some());
+    }
+
+    #[tokio::test]
+    async fn rule_based_generation_does_not_call_llm_when_disabled() {
+        let llm = FixedMeetingLlm::json("{}");
+        let calls = llm.calls.clone();
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        runtime
+            .add_transcript(TranscriptEntry::sourced(
+                "",
+                TranscriptSource::Manual,
+                "Simone",
+                "Please follow up on the local model adapter.",
+                0.9,
+            ))
+            .expect("add transcript");
+
+        let result = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions {
+                use_local_llm: false,
+                max_transcript_segments: 120,
+            })
+            .await
+            .expect("generate");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(!result.diagnostics.llm_used);
+        assert!(!result.diagnostics.fallback_used);
+        assert!(matches!(
+            result.diagnostics.generator,
+            ArtifactGenerator::RuleBased
+        ));
+    }
+
+    #[tokio::test]
+    async fn intelligence_generation_does_not_hold_registry_lock_during_llm_call() {
+        let raw = r#"{
+            "summary": {
+                "text": "Generated from the first snapshot.",
+                "bullets": ["Snapshot one"],
+                "evidence_segment_ids": ["seg-lock-1"],
+                "confidence": 0.8
+            }
+        }"#;
+        let llm = FixedMeetingLlm::json(raw).with_delay(Duration::from_millis(150));
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let mut first = TranscriptEntry::sourced(
+            "",
+            TranscriptSource::Manual,
+            "Simone",
+            "The first snapshot should be enough for the model.",
+            0.9,
+        );
+        first.segment_id = "seg-lock-1".to_string();
+        runtime.add_transcript(first).expect("add first transcript");
+
+        let generator_runtime = runtime.clone();
+        let task = tokio::spawn(async move {
+            generator_runtime
+                .generate_intelligence(MeetingIntelligenceGenerationOptions {
+                    use_local_llm: true,
+                    max_transcript_segments: 120,
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let add_result = tokio::time::timeout(Duration::from_millis(100), async {
+            runtime.add_transcript(TranscriptEntry::sourced(
+                "",
+                TranscriptSource::Manual,
+                "Simone",
+                "This transcript arrives while the local model is still generating.",
+                0.9,
+            ))
+        })
+        .await;
+        assert!(add_result.is_ok(), "registry lock was held during LLM call");
+        assert!(add_result.expect("timeout result").is_ok());
+
+        let result = task.await.expect("join").expect("generate");
+        assert!(result.diagnostics.transcript_changed_during_generation);
+        assert_eq!(result.diagnostics.snapshot_transcript_segment_count, 1);
     }
 
     #[tokio::test]
@@ -2257,6 +2599,7 @@ mod tests {
 
         let generated = runtime
             .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .await
             .expect("generate intelligence");
         let evidence_before = generated
             .timeline

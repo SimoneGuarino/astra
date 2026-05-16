@@ -2191,12 +2191,13 @@ fn read_meeting_diagnostics(
 }
 
 #[tauri::command]
-fn generate_meeting_intelligence(
+async fn generate_meeting_intelligence(
     window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
     options: MeetingIntelligenceGenerationOptions,
 ) -> Result<MeetingIntelligenceResult, String> {
     let meeting = state.meeting_runtime.clone();
+    let desktop_agent = state.desktop_agent.clone();
     let params = serde_json::json!({
         "artifact_types_requested": [
             "summary",
@@ -2215,18 +2216,22 @@ fn generate_meeting_intelligence(
         "generated_text_included": false,
         "audit_redacted": true,
     });
-    let value = governed_meeting_command(
-        state.inner(),
-        "meeting.intelligence.generate",
-        params,
-        move || {
-            meeting_value(
-                meeting
-                    .generate_intelligence(options)
-                    .map_err(|error| error.to_string())?,
-            )
-        },
-    )?;
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.intelligence.generate",
+            params,
+            false,
+            move || async move {
+                meeting_value(
+                    meeting
+                        .generate_intelligence(options)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
     let result = meeting_from_value(value)?;
     emit_meeting_update_events(
         &window,
@@ -2297,33 +2302,38 @@ fn clear_meeting_intelligence(
 }
 
 #[tauri::command]
-fn draft_meeting_followup(
+async fn draft_meeting_followup(
     window: WebviewWindow,
     state: State<'_, AssistantRuntime>,
 ) -> Result<Option<MeetingFollowUpDraft>, String> {
     let meeting = state.meeting_runtime.clone();
-    let value = governed_meeting_command(
-        state.inner(),
-        "meeting.followup.draft",
-        serde_json::json!({
+    let desktop_agent = state.desktop_agent.clone();
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.followup.draft",
+            serde_json::json!({
             "metadata_only": true,
             "transcript_text_included": false,
             "generated_text_included": false,
             "send_email": false,
-        }),
-        move || {
-            let existing = meeting
-                .read_intelligence()
-                .map_err(|error| error.to_string())?;
-            let intelligence = match existing {
-                Some(result) if result.follow_up_draft.is_some() => result,
-                _ => meeting
-                    .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
-                    .map_err(|error| error.to_string())?,
-            };
-            meeting_value(intelligence.follow_up_draft)
-        },
-    )?;
+            }),
+            false,
+            move || async move {
+                let existing = meeting
+                    .read_intelligence()
+                    .map_err(|error| error.to_string())?;
+                let intelligence = match existing {
+                    Some(result) if result.follow_up_draft.is_some() => result,
+                    _ => meeting
+                        .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+                        .await
+                        .map_err(|error| error.to_string())?,
+                };
+                meeting_value(intelligence.follow_up_draft)
+            },
+        )
+        .await?;
     let draft = meeting_from_value(value)?;
     emit_meeting_update_events(
         &window,

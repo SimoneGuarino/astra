@@ -845,11 +845,31 @@ pub struct MeetingIntelligenceDiagnostics {
     #[serde(default)]
     pub model_name: Option<String>,
     #[serde(default)]
+    pub degraded_reason: Option<String>,
+    #[serde(default)]
     pub model_unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub llm_used: bool,
     pub json_parse_failed: bool,
     pub invalid_evidence_ids: usize,
     pub rejected_artifact_count: usize,
     pub fallback_used: bool,
+    #[serde(default)]
+    pub input_segment_count: usize,
+    #[serde(default)]
+    pub input_truncated: bool,
+    #[serde(default)]
+    pub input_char_count: usize,
+    #[serde(default)]
+    pub max_segments: usize,
+    #[serde(default)]
+    pub max_chars_total: usize,
+    #[serde(default)]
+    pub max_chars_per_segment: usize,
+    #[serde(default)]
+    pub transcript_changed_during_generation: bool,
+    #[serde(default)]
+    pub snapshot_transcript_segment_count: usize,
     pub transcript_text_logged: bool,
     pub audit_redacted: bool,
     #[serde(default)]

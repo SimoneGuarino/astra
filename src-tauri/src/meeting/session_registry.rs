@@ -76,6 +76,14 @@ pub struct SessionRegistry {
     pub paused_from: Option<MeetingStatus>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MeetingIntelligenceSnapshot {
+    pub input: MeetingIntelligenceInput,
+    pub transcription_model: String,
+    pub transcript_signature: Vec<String>,
+    pub source_transcript_segment_count: usize,
+}
+
 impl SessionRegistry {
     pub fn new(project_root: PathBuf) -> Self {
         let storage_dir = project_root.join(".astra/meetings");
@@ -384,6 +392,19 @@ impl SessionRegistry {
         &mut self,
         options: MeetingIntelligenceGenerationOptions,
     ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let snapshot = self.begin_intelligence_generation(options)?;
+        let result = MeetingIntelligenceEngine::generate_with_llm_json_or_rule_based(
+            snapshot.input.clone(),
+            None,
+            Some(&snapshot.transcription_model),
+        )?;
+        self.store_intelligence_result(&snapshot, result)
+    }
+
+    pub fn begin_intelligence_generation(
+        &mut self,
+        options: MeetingIntelligenceGenerationOptions,
+    ) -> Result<MeetingIntelligenceSnapshot, MeetingRuntimeError> {
         let storage_dir = self.storage_dir.clone();
         let target = self.current_or_completed_state_mut()?;
         if target.transcript.is_empty() {
@@ -395,21 +416,60 @@ impl SessionRegistry {
         target.diagnostics.push(MeetingDiagnostic {
             code: "meeting_intelligence_generation_started".to_string(),
             severity: MeetingDiagnosticSeverity::Info,
-            message: "Meeting intelligence generation started; transcript text is not written to audit logs".to_string(),
-            created_at: Utc::now(),
-        });
+                message: "Meeting intelligence generation started; transcript text is not written to audit logs".to_string(),
+                created_at: Utc::now(),
+            });
 
-        let input = MeetingIntelligenceInput {
-            session_id: target.session.session_id.clone(),
-            transcript_entries: target.transcript.clone(),
-            speakers: target.speakers.clone(),
-            generation_options: options.clone(),
+        let transcript_signature = transcript_signature(&target.transcript);
+        let source_transcript_segment_count = target.transcript.len();
+        let snapshot = MeetingIntelligenceSnapshot {
+            input: MeetingIntelligenceInput {
+                session_id: target.session.session_id.clone(),
+                transcript_entries: target.transcript.clone(),
+                speakers: target.speakers.clone(),
+                generation_options: options,
+            },
+            transcription_model: target.session.config.transcription_model.clone(),
+            transcript_signature,
+            source_transcript_segment_count,
         };
-        let result = MeetingIntelligenceEngine::generate_with_llm_json_or_rule_based(
-            input,
-            None,
-            Some(&target.session.config.transcription_model),
-        )?;
+        save_partial_state(&storage_dir, target)?;
+        Ok(snapshot)
+    }
+
+    pub fn store_intelligence_result(
+        &mut self,
+        snapshot: &MeetingIntelligenceSnapshot,
+        mut result: MeetingIntelligenceResult,
+    ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let storage_dir = self.storage_dir.clone();
+        let target = self.current_or_completed_state_mut()?;
+        if target.session.session_id != snapshot.input.session_id {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "meeting intelligence session changed before generation completed"
+                    .to_string(),
+            });
+        }
+
+        result.diagnostics.snapshot_transcript_segment_count =
+            snapshot.source_transcript_segment_count;
+        if transcript_signature(&target.transcript) != snapshot.transcript_signature {
+            result.diagnostics.transcript_changed_during_generation = true;
+            if !result.diagnostics.warnings.iter().any(|warning| {
+                warning == "Transcript changed during generation; regenerate for latest context"
+            }) {
+                result.diagnostics.warnings.push(
+                    "Transcript changed during generation; regenerate for latest context"
+                        .to_string(),
+                );
+            }
+            target.diagnostics.push(MeetingDiagnostic {
+                code: "meeting_intelligence_snapshot_stale".to_string(),
+                severity: MeetingDiagnosticSeverity::Warning,
+                message: "Meeting intelligence was stored against a bounded transcript snapshot that changed during generation".to_string(),
+                created_at: Utc::now(),
+            });
+        }
 
         target.intelligence = Some(result.clone());
         target.last_updated_at = Utc::now();
@@ -429,14 +489,34 @@ impl SessionRegistry {
                 MeetingDiagnosticSeverity::Warning
             },
             message: format!(
-                "Meeting intelligence generated from {} transcript segment(s); fallback_used={}; audit_redacted=true; transcript_text_logged=false",
+                "Meeting intelligence generated from {} transcript segment(s); fallback_used={}; llm_used={}; audit_redacted=true; transcript_text_logged=false",
                 result.source_transcript_segment_count,
-                result.diagnostics.fallback_used
+                result.diagnostics.fallback_used,
+                result.diagnostics.llm_used
             ),
             created_at: Utc::now(),
         });
         save_partial_state(&storage_dir, target)?;
         Ok(result)
+    }
+
+    #[allow(dead_code)]
+    pub fn build_intelligence_input(
+        &mut self,
+        options: MeetingIntelligenceGenerationOptions,
+    ) -> Result<MeetingIntelligenceInput, MeetingRuntimeError> {
+        let target = self.current_or_completed_state_mut()?;
+        if target.transcript.is_empty() {
+            return Err(MeetingRuntimeError::InvalidConfig {
+                message: "meeting intelligence requires transcript evidence".to_string(),
+            });
+        }
+        Ok(MeetingIntelligenceInput {
+            session_id: target.session.session_id.clone(),
+            transcript_entries: target.transcript.clone(),
+            speakers: target.speakers.clone(),
+            generation_options: options,
+        })
     }
 
     pub fn clear_intelligence(&mut self) -> Result<(), MeetingRuntimeError> {
@@ -739,6 +819,21 @@ fn transcript_order(left: &TranscriptEntry, right: &TranscriptEntry) -> std::cmp
             right.created_at,
             right.segment_id.as_str(),
         ))
+}
+
+fn transcript_signature(transcript: &[TranscriptEntry]) -> Vec<String> {
+    transcript
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}:{}:{}:{}",
+                entry.segment_id,
+                entry.source.as_str(),
+                entry.created_at.timestamp_millis(),
+                entry.text.chars().count()
+            )
+        })
+        .collect()
 }
 
 fn transcript_source_rank(source: TranscriptSource) -> u8 {
