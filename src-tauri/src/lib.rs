@@ -74,7 +74,8 @@ use model_routing::resolve_ollama_request;
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use speech_events::{
-    AssistantErrorEvent, AssistantInterruptedEvent, AssistantRequestFinishedEvent,
+    resolve_audio_response_enabled, AssistantAudioResponsePolicy, AssistantErrorEvent,
+    AssistantInputModality, AssistantInterruptedEvent, AssistantRequestFinishedEvent,
     AssistantRequestSettledEvent, AssistantRequestStartedEvent, AudioPlaybackEvent,
     AudioSegmentFailedEvent, AudioSessionCompletedRequest, ChatStartRequest,
     SpeechSegmentQueuedEvent, StartChatResponse, StreamChunkEvent, VoiceSessionAudioChunk,
@@ -108,6 +109,51 @@ struct OllamaMessage {
 struct OllamaStreamChunk {
     message: Option<OllamaMessage>,
     done: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AssistantResponseOptions {
+    speech_enabled: bool,
+    tts_skip_reason: Option<&'static str>,
+}
+
+impl AssistantResponseOptions {
+    fn from_chat_request(request: &ChatStartRequest) -> Self {
+        let speech_enabled = should_generate_tts(
+            request.input_modality,
+            request.audio_response,
+            typed_tts_enabled(),
+        );
+        Self {
+            speech_enabled,
+            tts_skip_reason: (!speech_enabled).then_some(match request.input_modality {
+                AssistantInputModality::Typed => "typed_input",
+                AssistantInputModality::Voice => "audio_response_disabled",
+            }),
+        }
+    }
+
+    fn voice() -> Self {
+        Self {
+            speech_enabled: true,
+            tts_skip_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TtsSegmentPlan {
+    queued: Vec<SpeechSegment>,
+    chars_requested: usize,
+    chars_queued: usize,
+    skipped_budget: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TtsBudget {
+    max_segments_per_request: usize,
+    max_chars_per_request: usize,
+    max_chars_per_segment: usize,
 }
 
 #[derive(Clone)]
@@ -298,13 +344,15 @@ async fn start_chat_message_stream(
     if message.is_empty() {
         return Err("Message is empty".to_string());
     }
+    let response_options = AssistantResponseOptions::from_chat_request(&payload);
 
     start_assistant_response(
         window,
         state.inner().clone(),
         message.clone(),
         Some(message),
-        "typed",
+        payload.input_modality.as_source(),
+        response_options,
     )
     .await
 }
@@ -315,6 +363,7 @@ async fn start_assistant_response(
     message: String,
     display_user_message: Option<String>,
     source: &str,
+    response_options: AssistantResponseOptions,
 ) -> Result<StartChatResponse, String> {
     if let Some(previous_request_id) = runtime.interrupt_active_for_replacement() {
         let _ = window.emit(
@@ -342,6 +391,7 @@ async fn start_assistant_response(
                 source,
                 RenderedAssistantResponse::from_display(response_text),
                 "capability-router",
+                response_options,
             )
             .await;
         }
@@ -358,6 +408,7 @@ async fn start_assistant_response(
                 source,
                 rendered,
                 "desktop-agent",
+                response_options,
             )
             .await;
         }
@@ -373,6 +424,7 @@ async fn start_assistant_response(
                 source,
                 RenderedAssistantResponse::from_display(result.response_text),
                 "screen-vision",
+                response_options,
             )
             .await;
         }
@@ -392,6 +444,7 @@ async fn start_assistant_response(
             source,
             RenderedAssistantResponse::from_display(memory_response),
             "artifact-memory",
+            response_options,
         )
         .await;
     }
@@ -410,10 +463,12 @@ async fn start_assistant_response(
         .conversation_history
         .begin_turn(request_id.clone(), &history_user_message);
 
-    let metrics_snapshot =
-        runtime
-            .metrics
-            .start_request(request_id.clone(), model.clone(), message.chars().count());
+    let metrics_snapshot = runtime.metrics.start_request(
+        request_id.clone(),
+        model.clone(),
+        message.chars().count(),
+        response_options.speech_enabled,
+    );
 
     emit_request_started(
         &window,
@@ -421,6 +476,7 @@ async fn start_assistant_response(
         &model,
         source,
         display_user_message.clone(),
+        response_options.speech_enabled,
     )?;
     emit_metrics_update(&window, &metrics_snapshot);
     window
@@ -437,6 +493,7 @@ async fn start_assistant_response(
             task_request_id.clone(),
             message.clone(),
             resolved,
+            response_options,
         )
         .await;
         if let Err(message) = result {
@@ -450,7 +507,11 @@ async fn start_assistant_response(
         }
     });
 
-    Ok(StartChatResponse { request_id, model })
+    Ok(StartChatResponse {
+        request_id,
+        model,
+        audio_response_enabled: response_options.speech_enabled,
+    })
 }
 
 async fn start_grounded_response(
@@ -461,6 +522,7 @@ async fn start_grounded_response(
     source: &str,
     rendered: RenderedAssistantResponse,
     model_label: &str,
+    response_options: AssistantResponseOptions,
 ) -> Result<StartChatResponse, String> {
     let display_text = rendered.display_text;
     let speech_text = rendered.speech_text;
@@ -476,6 +538,7 @@ async fn start_grounded_response(
         request_id.clone(),
         model_label.to_string(),
         original_message.chars().count(),
+        response_options.speech_enabled,
     );
     emit_request_started(
         &window,
@@ -483,6 +546,7 @@ async fn start_grounded_response(
         model_label,
         source,
         display_user_message,
+        response_options.speech_enabled,
     )?;
     emit_metrics_update(&window, &metrics_snapshot);
     window
@@ -506,13 +570,25 @@ async fn start_grounded_response(
     if let Some(snapshot) = runtime.metrics.mark_llm_completed(&request_id) {
         emit_metrics_update(&window, &snapshot);
     }
-    let mut segmenter = SentenceSegmenter::new();
-    for segment in segmenter.push(&speech_text) {
-        spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
-    }
-    for segment in segmenter.flush() {
-        spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
-    }
+    let audio_phase_has_tts = if response_options.speech_enabled {
+        queue_tts_segments_for_text(
+            &window,
+            &runtime,
+            &request_id,
+            &speech_text,
+            tts_budget_from_env(),
+        )
+    } else {
+        mark_tts_skipped(
+            &window,
+            &runtime,
+            &request_id,
+            response_options
+                .tts_skip_reason
+                .unwrap_or("audio_response_disabled"),
+        );
+        false
+    };
     window
         .emit(
             "assistant-request-finished",
@@ -522,12 +598,11 @@ async fn start_grounded_response(
             },
         )
         .map_err(|error| format!("assistant-request-finished emit failed: {error}"))?;
-    window
-        .emit("assistant-status", "settling")
-        .map_err(|error| format!("assistant-status settling emit failed: {error}"))?;
+    finish_response_audio_phase(&window, &runtime, &request_id, audio_phase_has_tts)?;
     Ok(StartChatResponse {
         request_id,
         model: model_label.to_string(),
+        audio_response_enabled: response_options.speech_enabled,
     })
 }
 
@@ -567,6 +642,7 @@ async fn run_ollama_stream(
     request_id: String,
     original_message: String,
     resolved: model_routing::ResolvedOllamaRequest,
+    response_options: AssistantResponseOptions,
 ) -> Result<(), String> {
     let client = Client::new();
     let response = client
@@ -596,6 +672,7 @@ async fn run_ollama_stream(
     let mut full_text = String::new();
     let mut presentation = StreamPresentationState::new();
     let mut emitted_display_text = false;
+    let mut completed_response = false;
 
     while let Some(item) = stream.next().await {
         if !runtime.is_active(&request_id) {
@@ -699,16 +776,26 @@ async fn run_ollama_stream(
             emit_metrics_update(&window, &snapshot);
         }
 
-        let mut segmenter = SentenceSegmenter::new();
         let speech_text = speech_safe_text(&final_text);
-        if !speech_text.trim().is_empty() {
-            for segment in segmenter.push(&speech_text) {
-                spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
-            }
-        }
-        for segment in segmenter.flush() {
-            spawn_tts_segment(window.clone(), runtime.clone(), request_id.clone(), segment);
-        }
+        let audio_phase_has_tts = if response_options.speech_enabled {
+            queue_tts_segments_for_text(
+                &window,
+                &runtime,
+                &request_id,
+                &speech_text,
+                tts_budget_from_env(),
+            )
+        } else {
+            mark_tts_skipped(
+                &window,
+                &runtime,
+                &request_id,
+                response_options
+                    .tts_skip_reason
+                    .unwrap_or("audio_response_disabled"),
+            );
+            false
+        };
 
         window
             .emit(
@@ -719,13 +806,11 @@ async fn run_ollama_stream(
                 },
             )
             .map_err(|error| format!("assistant-request-finished emit failed: {error}"))?;
-
-        window
-            .emit("assistant-status", "settling")
-            .map_err(|error| format!("assistant-status settling emit failed: {error}"))?;
+        completed_response = true;
+        finish_response_audio_phase(&window, &runtime, &request_id, audio_phase_has_tts)?;
     }
 
-    if !runtime.is_active(&request_id) {
+    if !completed_response && !runtime.is_active(&request_id) {
         runtime.conversation_history.discard_turn(&request_id);
     }
 
@@ -798,12 +883,12 @@ fn spawn_tts_segment(
     runtime: AssistantRuntime,
     request_id: String,
     segment: SpeechSegment,
-) {
+) -> bool {
     if !runtime.is_active(&request_id) {
-        return;
+        return false;
     }
     if !runtime.should_synthesize_segment(&request_id, &segment.text) {
-        return;
+        return false;
     }
 
     if let Some(snapshot) = runtime.metrics.mark_first_segment_queued(&request_id) {
@@ -870,6 +955,9 @@ fn spawn_tts_segment(
             Err(error) if error.is_cancelled() => {}
             Err(error) => {
                 if runtime.is_active(&request_id) {
+                    if let Some(snapshot) = runtime.metrics.mark_tts_segment_failed(&request_id) {
+                        emit_metrics_update(&window, &snapshot);
+                    }
                     let failed = AudioSegmentFailedEvent {
                         request_id: request_id.clone(),
                         segment_id: segment.segment_id,
@@ -886,6 +974,229 @@ fn spawn_tts_segment(
             }
         }
     });
+    true
+}
+
+fn queue_tts_segments_for_text(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+    request_id: &str,
+    speech_text: &str,
+    budget: TtsBudget,
+) -> bool {
+    let segments = tts_segments_from_text(speech_text);
+    let plan = plan_tts_segments(segments, budget);
+    if let Some(snapshot) = runtime.metrics.mark_tts_budget(
+        request_id,
+        plan.chars_requested,
+        plan.chars_queued,
+        plan.skipped_budget,
+    ) {
+        emit_metrics_update(window, &snapshot);
+    }
+    if plan.skipped_budget > 0 {
+        log_tts_budget_exceeded(request_id, &plan);
+    }
+    if plan.queued.is_empty() {
+        mark_tts_skipped(window, runtime, request_id, "no_speakable_tts_segments");
+        return false;
+    }
+    let mut queued_any = false;
+    for segment in plan.queued {
+        queued_any |= spawn_tts_segment(
+            window.clone(),
+            runtime.clone(),
+            request_id.to_string(),
+            segment,
+        );
+    }
+    if !queued_any {
+        mark_tts_skipped(window, runtime, request_id, "no_speakable_tts_segments");
+    }
+    queued_any
+}
+
+fn tts_segments_from_text(speech_text: &str) -> Vec<SpeechSegment> {
+    let mut segmenter = SentenceSegmenter::new();
+    let mut segments = Vec::new();
+    if !speech_text.trim().is_empty() {
+        segments.extend(segmenter.push(speech_text));
+    }
+    segments.extend(segmenter.flush());
+    segments
+}
+
+fn plan_tts_segments(segments: Vec<SpeechSegment>, budget: TtsBudget) -> TtsSegmentPlan {
+    let mut queued = Vec::new();
+    let mut chars_requested = 0usize;
+    let mut chars_queued = 0usize;
+    let mut skipped_budget = 0usize;
+
+    for mut segment in segments {
+        let requested_len = segment.text.chars().count();
+        chars_requested = chars_requested.saturating_add(requested_len);
+
+        if queued.len() >= budget.max_segments_per_request
+            || chars_queued >= budget.max_chars_per_request
+        {
+            skipped_budget = skipped_budget.saturating_add(1);
+            continue;
+        }
+
+        let remaining_request_chars = budget.max_chars_per_request.saturating_sub(chars_queued);
+        let segment_limit = budget
+            .max_chars_per_segment
+            .min(remaining_request_chars)
+            .max(1);
+        if requested_len > segment_limit {
+            segment.text = bounded_tts_text(&segment.text, segment_limit);
+            skipped_budget = skipped_budget.saturating_add(1);
+        }
+
+        let queued_len = segment.text.chars().count();
+        if queued_len == 0 {
+            skipped_budget = skipped_budget.saturating_add(1);
+            continue;
+        }
+
+        chars_queued = chars_queued.saturating_add(queued_len);
+        queued.push(segment);
+    }
+
+    TtsSegmentPlan {
+        queued,
+        chars_requested,
+        chars_queued,
+        skipped_budget,
+    }
+}
+
+fn bounded_tts_text(text: &str, max_chars: usize) -> String {
+    let mut bounded = text.chars().take(max_chars).collect::<String>();
+    bounded = bounded.trim().to_string();
+    if bounded.is_empty() {
+        return bounded;
+    }
+    if !bounded
+        .chars()
+        .last()
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ';' | ':'))
+    {
+        bounded.push('.');
+    }
+    bounded
+}
+
+fn tts_budget_from_env() -> TtsBudget {
+    TtsBudget {
+        max_segments_per_request: env_usize("ASTRA_TTS_MAX_SEGMENTS_PER_REQUEST", 4, 1, 24),
+        max_chars_per_request: env_usize("ASTRA_TTS_MAX_CHARS_PER_REQUEST", 700, 80, 4_000),
+        max_chars_per_segment: env_usize("ASTRA_TTS_MAX_CHARS_PER_SEGMENT", 220, 40, 1_000),
+    }
+}
+
+fn env_usize(key: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(min, max))
+        .unwrap_or(default)
+}
+
+fn typed_tts_enabled() -> bool {
+    matches!(
+        std::env::var("ASTRA_TTS_ENABLED_FOR_TYPED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn should_generate_tts(
+    input_modality: AssistantInputModality,
+    audio_response: AssistantAudioResponsePolicy,
+    allow_typed_audio: bool,
+) -> bool {
+    resolve_audio_response_enabled(input_modality, audio_response, allow_typed_audio)
+}
+
+fn mark_tts_skipped(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+    request_id: &str,
+    reason: &'static str,
+) {
+    if let Some(snapshot) = runtime.metrics.mark_tts_skipped(request_id, reason) {
+        emit_metrics_update(window, &snapshot);
+    }
+    log_tts_skipped(request_id, reason);
+}
+
+fn finish_response_audio_phase(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+    request_id: &str,
+    speech_enabled: bool,
+) -> Result<(), String> {
+    if speech_enabled {
+        window
+            .emit("assistant-status", "settling")
+            .map_err(|error| format!("assistant-status settling emit failed: {error}"))?;
+        return Ok(());
+    }
+
+    if let Some(snapshot) = runtime.metrics.mark_audio_completed(request_id) {
+        emit_metrics_update(window, &snapshot);
+        log_metrics_completed(&snapshot);
+    }
+    runtime.audio_files.cleanup_request(request_id);
+    runtime.finish_request(request_id);
+    window
+        .emit(
+            "assistant-request-settled",
+            AssistantRequestSettledEvent {
+                request_id: request_id.to_string(),
+                had_tts_failures: false,
+            },
+        )
+        .map_err(|error| format!("assistant-request-settled emit failed: {error}"))?;
+    window
+        .emit("assistant-status", "idle")
+        .map_err(|error| format!("assistant-status idle emit failed: {error}"))?;
+    let voice_snapshot = runtime.voice_session.mark_assistant_idle();
+    emit_voice_session_state(window, &voice_snapshot);
+    Ok(())
+}
+
+fn log_tts_skipped(request_id: &str, reason: &str) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "type": "tts",
+            "event": "tts_skipped",
+            "reason": reason,
+            "request_id": request_id,
+            "metadata_only": true,
+        })
+    );
+}
+
+fn log_tts_budget_exceeded(request_id: &str, plan: &TtsSegmentPlan) {
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "type": "tts",
+            "event": "tts_budget_exceeded",
+            "request_id": request_id,
+            "segments_queued": plan.queued.len(),
+            "segments_skipped_budget": plan.skipped_budget,
+            "chars_requested": plan.chars_requested,
+            "chars_queued": plan.chars_queued,
+            "metadata_only": true,
+        })
+    );
 }
 
 fn tts_segment_fingerprint(text: &str) -> String {
@@ -902,6 +1213,7 @@ fn emit_request_started(
     model: &str,
     source: &str,
     user_message: Option<String>,
+    audio_response_enabled: bool,
 ) -> Result<(), String> {
     window
         .emit(
@@ -911,6 +1223,7 @@ fn emit_request_started(
                 model: model.to_string(),
                 source: source.to_string(),
                 user_message,
+                audio_response_enabled,
             },
         )
         .map_err(|error| format!("assistant-request-started emit failed: {error}"))?;
@@ -1390,6 +1703,7 @@ fn voice_session_audio_chunk(
                             response_text,
                             Some(text),
                             "voice_session",
+                            AssistantResponseOptions::voice(),
                         )
                         .await
                         {
@@ -2854,6 +3168,81 @@ mod tests {
         config.capture_options.segment_transcription = false;
         config.live_transcription_enabled = true;
         assert!(meeting_segment_transcription_requested(&config));
+    }
+
+    #[test]
+    fn typed_chat_policy_defaults_to_text_only() {
+        let request: ChatStartRequest =
+            serde_json::from_value(serde_json::json!({"message": "hello"})).expect("request");
+        let options = AssistantResponseOptions::from_chat_request(&request);
+
+        assert!(!options.speech_enabled);
+        assert_eq!(options.tts_skip_reason, Some("typed_input"));
+    }
+
+    #[test]
+    fn voice_chat_policy_defaults_to_speech_enabled() {
+        let request = ChatStartRequest {
+            message: "hello".to_string(),
+            input_modality: AssistantInputModality::Voice,
+            audio_response: AssistantAudioResponsePolicy::Auto,
+        };
+        let options = AssistantResponseOptions::from_chat_request(&request);
+
+        assert!(options.speech_enabled);
+        assert_eq!(options.tts_skip_reason, None);
+    }
+
+    #[test]
+    fn tts_budget_limits_segments_and_total_chars() {
+        let segments = vec![
+            SpeechSegment {
+                segment_id: "1".to_string(),
+                sequence: 1,
+                text: "a".repeat(30),
+            },
+            SpeechSegment {
+                segment_id: "2".to_string(),
+                sequence: 2,
+                text: "b".repeat(30),
+            },
+            SpeechSegment {
+                segment_id: "3".to_string(),
+                sequence: 3,
+                text: "c".repeat(30),
+            },
+        ];
+
+        let plan = plan_tts_segments(
+            segments,
+            TtsBudget {
+                max_segments_per_request: 2,
+                max_chars_per_request: 45,
+                max_chars_per_segment: 20,
+            },
+        );
+
+        assert_eq!(plan.queued.len(), 2);
+        assert!(plan.chars_queued <= 45);
+        assert_eq!(plan.chars_requested, 90);
+        assert!(plan.skipped_budget >= 2);
+        assert!(plan
+            .queued
+            .iter()
+            .all(|segment| segment.text.chars().count() <= 21));
+    }
+
+    #[test]
+    fn tts_disabled_metric_records_skip_reason() {
+        let metrics = MetricsTracker::new();
+        let request_id = "typed-request".to_string();
+        metrics.start_request(request_id.clone(), "model".to_string(), 5, false);
+        let snapshot = metrics
+            .mark_tts_skipped(&request_id, "typed_input")
+            .expect("metrics snapshot");
+
+        assert!(!snapshot.tts_enabled);
+        assert_eq!(snapshot.tts_skipped_reason.as_deref(), Some("typed_input"));
     }
 
     #[test]

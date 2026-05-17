@@ -390,3 +390,15 @@ struct WorkerResponse {
     output_path: Option<String>,
     error: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_failed_does_not_restart_worker() {
+        assert!(!TtsClientError::WorkerFailed("invalid input".to_string()).should_restart_worker());
+        assert!(TtsClientError::Timeout.should_restart_worker());
+        assert!(TtsClientError::WorkerUnavailable.should_restart_worker());
+    }
+}

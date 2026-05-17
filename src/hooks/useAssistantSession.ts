@@ -228,9 +228,14 @@ export function useAssistantSession() {
     );
 
     const submitMessage = useCallback(
-        async (messageOverride?: string) => {
+        async (
+            messageOverride?: string,
+            options: { inputModality?: "typed" | "voice"; audioResponse?: "auto" | "enabled" | "disabled" } = {}
+        ) => {
             const trimmed = (messageOverride ?? inputValue).trim();
             if (!trimmed) return;
+            const inputModality = options.inputModality ?? "typed";
+            const audioResponse = options.audioResponse ?? "auto";
 
             stopAllAudio();
             startedAudioSessionRequestIdsRef.current.clear();
@@ -260,7 +265,11 @@ export function useAssistantSession() {
 
             try {
                 const started = await invoke<StartChatResponse>("start_chat_message_stream", {
-                    payload: { message: trimmed },
+                    payload: {
+                        message: trimmed,
+                        input_modality: inputModality,
+                        audio_response: audioResponse,
+                    },
                 });
 
                 const alreadyActive = activeRequestIdRef.current === started.request_id;
@@ -274,7 +283,7 @@ export function useAssistantSession() {
                 failedAudioSessionsRef.current.delete(started.request_id);
                 setActiveModel(started.model);
 
-                if (!alreadyActive && !alreadyFinished) {
+                if (!alreadyActive && !alreadyFinished && started.audio_response_enabled) {
                     startAudioSessionOnce(started.request_id);
                 }
             } catch (error) {
@@ -304,7 +313,7 @@ export function useAssistantSession() {
         (text: string, shouldAutoSubmit: boolean) => {
             setInputValue(text);
             if (shouldAutoSubmit) {
-                void submitMessage(text);
+                void submitMessage(text, { inputModality: "voice", audioResponse: "auto" });
             }
         },
         [submitMessage]
@@ -338,7 +347,7 @@ export function useAssistantSession() {
     });
 
     const handleRequestStarted = useCallback(
-        ({ request_id, model, user_message }: AssistantRequestStartedEvent) => {
+        ({ request_id, model, user_message, audio_response_enabled }: AssistantRequestStartedEvent) => {
             const alreadyActive = activeRequestIdRef.current === request_id;
             let assistantMessageId =
                 pendingAssistantMessageIdRef.current ?? activeAssistantMessageId.current;
@@ -377,7 +386,7 @@ export function useAssistantSession() {
                 setStatus("thinking");
             }
 
-            if (!alreadyActive && !alreadyFinished) {
+            if (!alreadyActive && !alreadyFinished && audio_response_enabled) {
                 startAudioSessionOnce(request_id);
             }
         },

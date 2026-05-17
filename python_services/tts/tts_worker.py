@@ -127,6 +127,63 @@ class SynthesisResult:
     engine: str
 
 
+class ControlledTtsInputError(RuntimeError):
+    """Input was invalid after sanitization; do not retry with another engine."""
+
+
+@dataclass(frozen=True)
+class SanitizedText:
+    text: str
+    removed_chars: int
+
+
+def sanitize_tts_input_with_stats(value: Any) -> SanitizedText:
+    if value is None:
+        return SanitizedText("", 0)
+    if not isinstance(value, str):
+        value = str(value)
+
+    before_len = len(value)
+    value = unicodedata.normalize("NFC", value)
+    safe_chars: list[str] = []
+    removed = 0
+    for ch in value:
+        codepoint = ord(ch)
+        category = unicodedata.category(ch)
+        if 0xD800 <= codepoint <= 0xDFFF or ch == "\x00":
+            removed += 1
+            continue
+        if ch in "\n\t\r":
+            safe_chars.append(ch)
+            continue
+        if category.startswith("C"):
+            removed += 1
+            continue
+        if category == "So":
+            safe_chars.append(" ")
+            removed += 1
+            continue
+        safe_chars.append(ch)
+
+    text = "".join(safe_chars)
+    text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    text = re.sub(r"\s+", " ", text).strip()
+    removed += max(0, before_len - len(value))
+    return SanitizedText(text, removed)
+
+
+def sanitize_tts_input(value: Any) -> str:
+    return sanitize_tts_input_with_stats(value).text
+
+
+def validate_speakable_text(value: Any, stage: str) -> str:
+    text = sanitize_tts_input(value)
+    if not isinstance(text, str) or not text.strip():
+        raise ControlledTtsInputError(f"No speakable text after sanitization at {stage}")
+    text.encode("utf-8", "strict")
+    return text
+
+
 class ItalianNumberNormalizer:
     _units = [
         "zero",
@@ -270,6 +327,7 @@ class TextPreprocessor:
         self.number_normalizer = ItalianNumberNormalizer()
 
     def normalize(self, text: str, pronunciation_mode: PronunciationMode = "plain") -> str:
+        text = sanitize_tts_input(text)
         text = self._normalize_unicode(text)
         text = text.strip()
         if not text:
@@ -405,7 +463,13 @@ def select_device(device: str) -> str:
             return "cuda"
         return "cpu"
 
-    # auto
+    # auto defaults to CPU to avoid competing with local LLM VRAM. Users can
+    # explicitly opt into CUDA with ASTRA_TTS_DEVICE=cuda, or restore legacy
+    # auto-CUDA behavior with ASTRA_TTS_SAFE_AUTO_CPU=false.
+    safe_auto_cpu = os.environ.get("ASTRA_TTS_SAFE_AUTO_CPU", "true").strip().lower()
+    if safe_auto_cpu not in {"0", "false", "no", "off"}:
+        return "cpu"
+
     if torch is not None and torch.cuda.is_available():
         return "cuda"
     return "cpu"
@@ -436,7 +500,9 @@ class KokoroEngine(BaseEngine):
         self.preprocessor = preprocessor
 
     def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        text = validate_speakable_text(text, "kokoro_input")
         normalized_text = self.preprocessor.normalize(text, pronunciation_mode=self.pronunciation_mode)
+        normalized_text = validate_speakable_text(normalized_text, "kokoro_normalized")
         if normalized_text is None:
             raise RuntimeError("TTS preprocessing returned None")
 
@@ -446,7 +512,7 @@ class KokoroEngine(BaseEngine):
         if not isinstance(normalized_text, str):
             normalized_text = str(normalized_text)
 
-        normalized_text = normalized_text.strip()
+        normalized_text = validate_speakable_text(normalized_text, "kokoro_ready")
 
         if not normalized_text:
             raise RuntimeError("No speakable text after preprocessing")
@@ -497,6 +563,7 @@ class ChatterboxMultilingualEngine(BaseEngine):
 
     @staticmethod
     def split_for_chatterbox(text: str, max_chars: int = 110) -> list[str]:
+        text = sanitize_tts_input(text)
         if text is None:
             return []
 
@@ -555,7 +622,9 @@ class ChatterboxMultilingualEngine(BaseEngine):
         return [str(p).strip() for p in parts if isinstance(p, str) and p.strip()]
 
     def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        text = validate_speakable_text(text, "chatterbox_input")
         normalized_text = self.preprocessor.normalize(text, pronunciation_mode=self.pronunciation_mode)
+        normalized_text = validate_speakable_text(normalized_text, "chatterbox_normalized")
         if not normalized_text:
             raise RuntimeError("No speakable text after preprocessing")
 
@@ -583,7 +652,7 @@ class ChatterboxMultilingualEngine(BaseEngine):
             if not isinstance(part, str):
                 part = str(part)
 
-            part = part.strip()
+            part = validate_speakable_text(part, "chatterbox_part")
             if not part:
                 continue
 
@@ -624,6 +693,8 @@ class ChatterboxMultilingualEngine(BaseEngine):
     ) -> list[np.ndarray]:
         try:
             return [self._generate_one_part(part, generate_kwargs)]
+        except ControlledTtsInputError:
+            raise
         except Exception as first_error:
             fallback_parts = self.split_for_chatterbox(
                 stabilize_tts_text(part),
@@ -644,11 +715,13 @@ class ChatterboxMultilingualEngine(BaseEngine):
 
             recovered: list[np.ndarray] = []
             for retry_index, retry_part in enumerate(fallback_parts):
-                retry_part = retry_part.strip()
+                retry_part = validate_speakable_text(retry_part, "chatterbox_retry")
                 if not retry_part:
                     continue
                 try:
                     recovered.append(self._generate_one_part(retry_part, generate_kwargs))
+                except ControlledTtsInputError:
+                    raise
                 except Exception as retry_error:
                     raise RuntimeError(
                         "Chatterbox failed on retry "
@@ -667,7 +740,7 @@ class ChatterboxMultilingualEngine(BaseEngine):
             return recovered
 
     def _generate_one_part(self, part: str, generate_kwargs: dict[str, Any]) -> np.ndarray:
-        stabilized = stabilize_tts_text(part)
+        stabilized = validate_speakable_text(stabilize_tts_text(part), "chatterbox_generate")
         wav = self.model.generate(stabilized, **generate_kwargs)
         chunk = tensor_to_numpy(wav)
         chunk = normalize_audio(chunk)
@@ -695,7 +768,9 @@ class ChatterboxTurboEngine(BaseEngine):
                 "Chatterbox Turbo requires ASTRA_TTS_AUDIO_PROMPT_PATH pointing to a short reference clip"
             )
 
+        text = validate_speakable_text(text, "chatterbox_turbo_input")
         normalized_text = self.preprocessor.normalize(text, pronunciation_mode=self.pronunciation_mode)
+        normalized_text = validate_speakable_text(normalized_text, "chatterbox_turbo_normalized")
         if not normalized_text:
             raise RuntimeError("No speakable text after preprocessing")
 
@@ -720,7 +795,8 @@ class ChatterboxTurboEngine(BaseEngine):
 
 
 def stabilize_tts_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", str(text)).strip()
+    text = sanitize_tts_input(text)
+    text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"([!?]){2,}", r"\1", text)
     text = re.sub(r"\.{3,}", ".", text)
     text = text.strip(" \t\r\n")
@@ -730,14 +806,14 @@ def stabilize_tts_text(text: str) -> str:
 
 
 def prepare_worker_tts_text(text: str) -> str:
-    text = str(text)
+    text = sanitize_tts_input(text)
     text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
     text = re.sub(r"(?m)^\s*\+[-+=]+\+\s*$", " ", text)
     text = re.sub(r"(?m)^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", " ", text)
     text = re.sub(r"[{}\[\]`|]", " ", text)
     text = re.sub(r"\b(tool_name|parameters|arguments|browser\.open|browser\.search|screen\.analyze)\b", " ", text, flags=re.IGNORECASE)
     text = collapse_repeated_sentences(text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = sanitize_tts_input(text)
     if is_degenerate_tts_text(text):
         log_tts_event("tts_degenerate_text_suppressed", chars=len(text))
         return ""
@@ -829,9 +905,15 @@ class TtsEngine:
         raise RuntimeError(f"Unsupported TTS engine: {engine_name}")
 
     def synthesize(self, text: str, output_path: str, voice: str = DEFAULT_VOICE, speed: float = DEFAULT_SPEED) -> SynthesisResult:
+        text = validate_speakable_text(text, "tts_engine_input")
         try:
             return self.engine.synthesize(text=text, output_path=output_path, voice=voice, speed=speed)
+        except ControlledTtsInputError:
+            self._empty_cuda_cache_on_failure()
+            log_tts_event("tts_invalid_input_suppressed", engine=self.engine.engine_name)
+            raise
         except Exception as primary_error:
+            self._empty_cuda_cache_on_failure()
             if self.engine.engine_name == "kokoro":
                 raise
 
@@ -840,10 +922,16 @@ class TtsEngine:
                 engine=self.engine.engine_name,
                 error=f"{type(primary_error).__name__}: {primary_error}",
             )
+            fallback_text = validate_speakable_text(text, "kokoro_fallback_input")
             fallback = self._get_kokoro_fallback()
             try:
-                return fallback.synthesize(text=text, output_path=output_path, voice=voice, speed=speed)
+                return fallback.synthesize(text=fallback_text, output_path=output_path, voice=voice, speed=speed)
+            except ControlledTtsInputError:
+                self._empty_cuda_cache_on_failure()
+                log_tts_event("tts_invalid_input_suppressed", engine="kokoro")
+                raise
             except Exception as fallback_error:
+                self._empty_cuda_cache_on_failure()
                 raise RuntimeError(
                     "Primary TTS engine failed and Kokoro fallback also failed: "
                     f"primary={type(primary_error).__name__}: {primary_error}; "
@@ -854,6 +942,13 @@ class TtsEngine:
         if self._kokoro_fallback is None:
             self._kokoro_fallback = KokoroEngine(self.preprocessor)
         return self._kokoro_fallback
+
+    def _empty_cuda_cache_on_failure(self) -> None:
+        enabled = os.environ.get("ASTRA_TTS_CUDA_EMPTY_CACHE_ON_FAILURE", "true").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return
+        if self.device == "cuda" and torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def auto_engine_candidates() -> list[EngineName]:
@@ -891,6 +986,15 @@ def run_server() -> None:
         try:
             request = json.loads(line)
             response = handle_request(engine, request)
+        except ControlledTtsInputError as exc:
+            log_tts_event("tts_invalid_input_controlled_failure", error=str(exc))
+            response = {
+                "ok": False,
+                "request_id": safe_get(locals().get("request"), "request_id"),
+                "segment_id": safe_get(locals().get("request"), "segment_id"),
+                "sequence": safe_get(locals().get("request"), "sequence"),
+                "error": f"ControlledTtsInputError: {exc}",
+            }
         except Exception as exc:
             traceback.print_exc(file=sys.stderr)
             response = {
@@ -908,7 +1012,17 @@ def handle_request(engine: TtsEngine, request: dict[str, Any]) -> dict[str, Any]
     request_id = str(request["request_id"])
     segment_id = str(request["segment_id"])
     sequence = int(request.get("sequence", 0))
-    text = prepare_worker_tts_text(str(request["text"]))
+    sanitized = sanitize_tts_input_with_stats(request.get("text", ""))
+    if sanitized.removed_chars:
+        log_tts_event(
+            "tts_input_sanitized",
+            request_id=request_id,
+            segment_id=segment_id,
+            sequence=sequence,
+            unicode_sanitized_chars_removed=sanitized.removed_chars,
+            metadata_only=True,
+        )
+    text = prepare_worker_tts_text(sanitized.text)
     if not text:
         raise RuntimeError("No stable speakable text after worker safety filtering")
     output_path = str(request["output_path"])

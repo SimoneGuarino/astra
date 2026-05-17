@@ -16,6 +16,7 @@ export type ChatMessage = {
 export type StartChatResponse = {
     request_id: string;
     model: string;
+    audio_response_enabled: boolean;
 };
 
 export type AssistantRequestStartedEvent = {
@@ -23,6 +24,7 @@ export type AssistantRequestStartedEvent = {
     model: string;
     source: "typed" | "voice_session" | string;
     user_message: string | null;
+    audio_response_enabled: boolean;
 };
 
 export type AssistantRequestFinishedEvent = {
@@ -70,6 +72,14 @@ export type RequestMetricsSnapshot = {
     time_to_first_segment_queued_ms: number | null;
     time_to_first_audio_ready_ms: number | null;
     time_to_first_audio_play_ms: number | null;
+    tts_enabled: boolean;
+    tts_skipped_reason: string | null;
+    tts_segments_queued: number;
+    tts_segments_synthesized: number;
+    tts_segments_failed: number;
+    tts_segments_skipped_budget: number;
+    tts_chars_requested: number;
+    tts_chars_queued: number;
 };
 
 export type VoiceTranscriptionResponse = {

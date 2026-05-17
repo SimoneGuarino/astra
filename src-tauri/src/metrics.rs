@@ -25,6 +25,14 @@ pub struct RequestMetricsSnapshot {
     pub time_to_first_segment_queued_ms: Option<u128>,
     pub time_to_first_audio_ready_ms: Option<u128>,
     pub time_to_first_audio_play_ms: Option<u128>,
+    pub tts_enabled: bool,
+    pub tts_skipped_reason: Option<String>,
+    pub tts_segments_queued: usize,
+    pub tts_segments_synthesized: usize,
+    pub tts_segments_failed: usize,
+    pub tts_segments_skipped_budget: usize,
+    pub tts_chars_requested: usize,
+    pub tts_chars_queued: usize,
 }
 
 #[derive(Clone)]
@@ -49,6 +57,14 @@ struct RequestMetrics {
     first_audio_ready_at: Option<u128>,
     first_audio_play_at: Option<u128>,
     audio_completed_at: Option<u128>,
+    tts_enabled: bool,
+    tts_skipped_reason: Option<String>,
+    tts_segments_queued: usize,
+    tts_segments_synthesized: usize,
+    tts_segments_failed: usize,
+    tts_segments_skipped_budget: usize,
+    tts_chars_requested: usize,
+    tts_chars_queued: usize,
 }
 
 impl MetricsTracker {
@@ -63,6 +79,7 @@ impl MetricsTracker {
         request_id: String,
         selected_model: String,
         user_message_length: usize,
+        tts_enabled: bool,
     ) -> RequestMetricsSnapshot {
         let metrics = RequestMetrics {
             request_id: request_id.clone(),
@@ -75,6 +92,14 @@ impl MetricsTracker {
             first_audio_ready_at: None,
             first_audio_play_at: None,
             audio_completed_at: None,
+            tts_enabled,
+            tts_skipped_reason: None,
+            tts_segments_queued: 0,
+            tts_segments_synthesized: 0,
+            tts_segments_failed: 0,
+            tts_segments_skipped_budget: 0,
+            tts_chars_requested: 0,
+            tts_chars_queued: 0,
         };
 
         let snapshot = metrics.snapshot();
@@ -97,14 +122,54 @@ impl MetricsTracker {
 
     pub fn mark_first_segment_queued(&self, request_id: &str) -> Option<RequestMetricsSnapshot> {
         self.mark_once(request_id, |metrics, now| {
+            metrics.tts_segments_queued = metrics.tts_segments_queued.saturating_add(1);
             set_once(&mut metrics.first_segment_queued_at, now)
         })
     }
 
+    pub fn mark_tts_budget(
+        &self,
+        request_id: &str,
+        chars_requested: usize,
+        chars_queued: usize,
+        skipped_budget: usize,
+    ) -> Option<RequestMetricsSnapshot> {
+        let mut state = self.inner.lock().expect("metrics mutex poisoned");
+        let metrics = state.active.get_mut(request_id)?;
+        metrics.tts_chars_requested = metrics.tts_chars_requested.saturating_add(chars_requested);
+        metrics.tts_chars_queued = metrics.tts_chars_queued.saturating_add(chars_queued);
+        metrics.tts_segments_skipped_budget = metrics
+            .tts_segments_skipped_budget
+            .saturating_add(skipped_budget);
+        Some(metrics.snapshot())
+    }
+
+    pub fn mark_tts_skipped(
+        &self,
+        request_id: &str,
+        reason: &str,
+    ) -> Option<RequestMetricsSnapshot> {
+        let mut state = self.inner.lock().expect("metrics mutex poisoned");
+        let metrics = state.active.get_mut(request_id)?;
+        metrics.tts_enabled = false;
+        metrics.tts_skipped_reason = Some(reason.to_string());
+        Some(metrics.snapshot())
+    }
+
     pub fn mark_first_audio_ready(&self, request_id: &str) -> Option<RequestMetricsSnapshot> {
-        self.mark_once(request_id, |metrics, now| {
-            set_once(&mut metrics.first_audio_ready_at, now)
-        })
+        let now = now_epoch_ms();
+        let mut state = self.inner.lock().expect("metrics mutex poisoned");
+        let metrics = state.active.get_mut(request_id)?;
+        metrics.tts_segments_synthesized = metrics.tts_segments_synthesized.saturating_add(1);
+        let _ = set_once(&mut metrics.first_audio_ready_at, now);
+        Some(metrics.snapshot())
+    }
+
+    pub fn mark_tts_segment_failed(&self, request_id: &str) -> Option<RequestMetricsSnapshot> {
+        let mut state = self.inner.lock().expect("metrics mutex poisoned");
+        let metrics = state.active.get_mut(request_id)?;
+        metrics.tts_segments_failed = metrics.tts_segments_failed.saturating_add(1);
+        Some(metrics.snapshot())
     }
 
     pub fn mark_first_audio_play(&self, request_id: &str) -> Option<RequestMetricsSnapshot> {
@@ -167,6 +232,14 @@ impl RequestMetrics {
             ),
             time_to_first_audio_ready_ms: delta(self.request_started_at, self.first_audio_ready_at),
             time_to_first_audio_play_ms: delta(self.request_started_at, self.first_audio_play_at),
+            tts_enabled: self.tts_enabled,
+            tts_skipped_reason: self.tts_skipped_reason.clone(),
+            tts_segments_queued: self.tts_segments_queued,
+            tts_segments_synthesized: self.tts_segments_synthesized,
+            tts_segments_failed: self.tts_segments_failed,
+            tts_segments_skipped_budget: self.tts_segments_skipped_budget,
+            tts_chars_requested: self.tts_chars_requested,
+            tts_chars_queued: self.tts_chars_queued,
         }
     }
 }
