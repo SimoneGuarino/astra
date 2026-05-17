@@ -44,49 +44,118 @@ def _bootstrap_cuda_dlls() -> None:
 
 _bootstrap_cuda_dlls()
 
-from faster_whisper import WhisperModel  # noqa: E402
+try:
+    from faster_whisper import WhisperModel  # noqa: E402
+except Exception as import_error:  # pragma: no cover - exercised only without optional deps
+    WhisperModel = None  # type: ignore[assignment]
+    FASTER_WHISPER_IMPORT_ERROR = import_error
+else:
+    FASTER_WHISPER_IMPORT_ERROR = None
 
 
 MODEL_SIZE = os.environ.get("ASTRA_STT_MODEL", "small")
 DEFAULT_LANGUAGE = os.environ.get("ASTRA_STT_LANGUAGE", "it")
+DEFAULT_DEVICE = os.environ.get("ASTRA_STT_DEVICE", "auto")
+DEFAULT_COMPUTE_TYPE = os.environ.get("ASTRA_STT_COMPUTE_TYPE", "").strip()
 
 
-def _create_model() -> WhisperModel:
-    try:
-        with contextlib.redirect_stdout(sys.stderr):
-            return WhisperModel(
-                MODEL_SIZE,
-                device="cuda",
-                compute_type="float16",
-                cpu_threads=4,
-            )
-    except Exception as gpu_error:
-        print(
-            json.dumps(
-                {
-                    "warning": "GPU init failed, falling back to CPU",
-                    "gpu_error": str(gpu_error),
-                },
-                ensure_ascii=False,
-            ),
-            file=sys.stderr,
-            flush=True,
+def _normalize_stt_device(value: str | None) -> str:
+    requested = (value or "auto").strip().lower()
+    if requested in {"auto", "cuda", "cpu"}:
+        return requested
+    return "auto"
+
+
+def _default_compute_type(device: str) -> str:
+    if DEFAULT_COMPUTE_TYPE:
+        return DEFAULT_COMPUTE_TYPE
+    return "float16" if device == "cuda" else "int8"
+
+
+def _log_stt_event(event: str, **fields: Any) -> None:
+    payload = {
+        "type": "stt",
+        "event": event,
+        "metadata_only": True,
+        **fields,
+    }
+    print(json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def _new_whisper_model(device: str, compute_type: str) -> Any:
+    if WhisperModel is None:
+        raise RuntimeError(f"faster_whisper import failed: {FASTER_WHISPER_IMPORT_ERROR}")
+    with contextlib.redirect_stdout(sys.stderr):
+        return WhisperModel(
+            MODEL_SIZE,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=4 if device == "cuda" else max(2, (os.cpu_count() or 4) // 2),
         )
-        with contextlib.redirect_stdout(sys.stderr):
-            return WhisperModel(
-                MODEL_SIZE,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=max(2, (os.cpu_count() or 4) // 2),
-            )
 
 
-MODEL = _create_model()
+def _create_model() -> Any:
+    requested_device = _normalize_stt_device(DEFAULT_DEVICE)
+    if requested_device == "cpu":
+        compute_type = _default_compute_type("cpu")
+        _log_stt_event(
+            "stt_model_init",
+            requested_device=requested_device,
+            resolved_device="cpu",
+            compute_type=compute_type,
+            model=MODEL_SIZE,
+        )
+        return _new_whisper_model("cpu", compute_type)
+
+    if requested_device == "cuda":
+        compute_type = _default_compute_type("cuda")
+        _log_stt_event(
+            "stt_model_init",
+            requested_device=requested_device,
+            resolved_device="cuda",
+            compute_type=compute_type,
+            model=MODEL_SIZE,
+        )
+        return _new_whisper_model("cuda", compute_type)
+
+    try:
+        compute_type = _default_compute_type("cuda")
+        model = _new_whisper_model("cuda", compute_type)
+        _log_stt_event(
+            "stt_model_init",
+            requested_device=requested_device,
+            resolved_device="cuda",
+            compute_type=compute_type,
+            model=MODEL_SIZE,
+        )
+        return model
+    except Exception as gpu_error:
+        compute_type = _default_compute_type("cpu")
+        _log_stt_event(
+            "stt_model_init_fallback",
+            requested_device=requested_device,
+            resolved_device="cpu",
+            compute_type=compute_type,
+            model=MODEL_SIZE,
+            fallback_reason=type(gpu_error).__name__,
+        )
+        return _new_whisper_model("cpu", compute_type)
+
+
+MODEL: Any | None = None
+
+
+def _get_model() -> Any:
+    global MODEL
+    if MODEL is None:
+        MODEL = _create_model()
+    return MODEL
 
 
 def transcribe(audio_path: str) -> dict[str, Any]:
+    model = _get_model()
     with contextlib.redirect_stdout(sys.stderr):
-        segments, info = MODEL.transcribe(
+        segments, info = model.transcribe(
             audio_path,
             language=DEFAULT_LANGUAGE,
             vad_filter=True,
@@ -131,7 +200,13 @@ def safe_get(value: Any, key: str) -> Any:
 
 
 def run_server() -> None:
-    print("STT worker ready", file=sys.stderr, flush=True)
+    _get_model()
+    _log_stt_event(
+        "stt_worker_ready",
+        requested_device=_normalize_stt_device(DEFAULT_DEVICE),
+        model=MODEL_SIZE,
+        language=DEFAULT_LANGUAGE,
+    )
 
     for raw_line in sys.stdin:
         line = raw_line.strip()

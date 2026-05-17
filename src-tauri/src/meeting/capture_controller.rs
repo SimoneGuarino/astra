@@ -271,6 +271,14 @@ impl CaptureController {
         self.refresh_health(self.health.status.clone(), self.health.last_error.clone())
     }
 
+    pub fn record_segment_transcribed_with_id(
+        &mut self,
+        segment_id: Option<&str>,
+    ) -> CaptureHealth {
+        self.metrics.record_segment_transcribed_with_id(segment_id);
+        self.refresh_health(self.health.status.clone(), self.health.last_error.clone())
+    }
+
     pub fn record_segment_write_failure(&mut self, error_class: &str) -> CaptureHealth {
         self.metrics.record_segment_write_failure(error_class);
         self.state = CaptureControllerState::Failed;
@@ -283,6 +291,16 @@ impl CaptureController {
     pub fn record_segment_transcription_failure(&mut self, error_class: &str) -> CaptureHealth {
         self.metrics
             .record_segment_transcription_failure(error_class);
+        self.refresh_health(self.health.status.clone(), self.health.last_error.clone())
+    }
+
+    pub fn record_segment_transcription_failure_with_id(
+        &mut self,
+        error_class: &str,
+        segment_id: Option<&str>,
+    ) -> CaptureHealth {
+        self.metrics
+            .record_segment_transcription_failure_with_id(error_class, segment_id);
         self.refresh_health(self.health.status.clone(), self.health.last_error.clone())
     }
 
@@ -407,6 +425,7 @@ impl Default for CaptureController {
 
 struct AudioCaptureHandle {
     inner: AudioCaptureHandleInner,
+    segment_sender: Option<CapturedSegmentSender>,
     segment_task: Option<tauri::async_runtime::JoinHandle<()>>,
     metrics: CaptureMetricsReporter,
     #[cfg(test)]
@@ -437,6 +456,7 @@ impl AudioCaptureHandle {
                 config.device_id,
                 config.sample_rate,
             )),
+            segment_sender: None,
             segment_task,
             metrics,
             #[cfg(test)]
@@ -455,6 +475,7 @@ impl AudioCaptureHandle {
                 config.device_id,
                 config.sample_rate,
             )),
+            segment_sender: None,
             segment_task: None,
             metrics,
             stop_error: Some(MeetingRuntimeError::CaptureStreamError {
@@ -477,6 +498,7 @@ impl AudioCaptureHandle {
                 stop_acknowledges,
                 stop_timeout,
             }),
+            segment_sender: None,
             segment_task: None,
             metrics,
             #[cfg(test)]
@@ -499,6 +521,7 @@ impl AudioCaptureHandle {
         let AudioCaptureHandleInner::Real(capture) = &mut self.inner else {
             return Ok(());
         };
+        self.segment_sender = request.segment_sender.clone();
         capture.start_loopback_capture(
             AudioCaptureStartRequest {
                 session_id: request.session_id,
@@ -570,7 +593,7 @@ impl AudioCaptureHandle {
                 }
             }
         };
-        self.abort_segment_task();
+        self.close_and_drain_segment_task();
         result
     }
 
@@ -582,10 +605,44 @@ impl AudioCaptureHandle {
     }
 
     fn abort_segment_task(&mut self) {
+        if let Some(sender) = self.segment_sender.take() {
+            sender.close();
+        }
         if let Some(task) = self.segment_task.take() {
             task.abort();
         }
     }
+
+    fn close_and_drain_segment_task(&mut self) {
+        let timeout = meeting_stt_drain_timeout();
+        let mut drained = true;
+        if let Some(sender) = self.segment_sender.take() {
+            sender.close();
+            let outcome =
+                tauri::async_runtime::block_on(async { sender.wait_drained(timeout).await });
+            drained = outcome.drained;
+        }
+
+        if let Some(task) = self.segment_task.take() {
+            if drained {
+                let join_result = tauri::async_runtime::block_on(async { task.await });
+                if join_result.is_err() {
+                    self.metrics.record_drain_timed_out(0, 0);
+                }
+            } else {
+                task.abort();
+            }
+        }
+    }
+}
+
+fn meeting_stt_drain_timeout() -> Duration {
+    let seconds = std::env::var("ASTRA_MEETING_STT_DRAIN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(1, 300);
+    Duration::from_secs(seconds)
 }
 
 fn default_channels_for_backend(

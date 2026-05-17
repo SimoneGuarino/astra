@@ -11,6 +11,7 @@ use super::{
         MeetingRuntimeError, TranscriptSource,
     },
 };
+use chrono::{DateTime, Utc};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 use std::{
@@ -23,7 +24,7 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use tokio::sync::Notify;
+use tokio::{sync::Notify, time};
 
 #[cfg(target_os = "windows")]
 use super::wasapi_loopback;
@@ -64,12 +65,19 @@ impl CaptureMetricsReporter {
     }
 
     pub fn record_segment_transcribed(&self) {
+        self.record_segment_transcribed_with_id(None);
+    }
+
+    pub fn record_segment_transcribed_with_id(&self, segment_id: Option<&str>) {
         self.with_metrics(|metrics| {
             metrics.segments_transcribed = metrics.segments_transcribed.saturating_add(1);
             metrics.chunks_transcribed = metrics.chunks_transcribed.saturating_add(1);
             metrics.segment_transcription_failures_consecutive = 0;
             metrics.last_segment_status = Some("segment_transcribed".to_string());
             metrics.last_successful_segment_at = Some(chrono::Utc::now());
+            if let Some(segment_id) = segment_id {
+                metrics.last_transcription_completed_segment_id = Some(segment_id.to_string());
+            }
             metrics.backpressure_active = false;
         });
     }
@@ -82,7 +90,16 @@ impl CaptureMetricsReporter {
     }
 
     pub fn record_segment_transcription_failure(&self, error_class: &str) {
+        self.record_segment_transcription_failure_with_id(error_class, None);
+    }
+
+    pub fn record_segment_transcription_failure_with_id(
+        &self,
+        error_class: &str,
+        segment_id: Option<&str>,
+    ) {
         self.with_metrics(|metrics| {
+            metrics.segments_failed = metrics.segments_failed.saturating_add(1);
             metrics.segment_transcription_failures =
                 metrics.segment_transcription_failures.saturating_add(1);
             metrics.segment_transcription_failures_total = metrics
@@ -95,6 +112,13 @@ impl CaptureMetricsReporter {
                 Some(format!("segment_transcription_failed:{error_class}"));
             metrics.last_segment_transcription_error_kind = Some(error_class.to_string());
             metrics.last_segment_transcription_failure_at = Some(chrono::Utc::now());
+            if error_class == "stt_timeout" || error_class.contains("timeout") {
+                metrics.segment_transcription_timeouts =
+                    metrics.segment_transcription_timeouts.saturating_add(1);
+            }
+            if let Some(segment_id) = segment_id {
+                metrics.last_transcription_failed_segment_id = Some(segment_id.to_string());
+            }
         });
     }
 
@@ -222,6 +246,7 @@ impl CaptureMetricsReporter {
 
     pub fn record_queue_depth(&self, depth: usize, bytes_queued: u64, max_depth: usize) {
         self.with_metrics(|metrics| {
+            metrics.current_queue_depth = depth;
             metrics.bytes_queued = bytes_queued;
             metrics.max_queue_depth_seen = metrics.max_queue_depth_seen.max(depth);
             if depth < max_depth {
@@ -233,6 +258,66 @@ impl CaptureMetricsReporter {
     pub fn record_segment_queued(&self) {
         self.with_metrics(|metrics| {
             metrics.segments_queued = metrics.segments_queued.saturating_add(1);
+            metrics.segments_queued_total = metrics.segments_queued_total.saturating_add(1);
+        });
+    }
+
+    pub fn record_segment_dequeued_for_transcription(&self, segment_id: &str, in_flight: usize) {
+        self.with_metrics(|metrics| {
+            metrics.segments_dequeued_total = metrics.segments_dequeued_total.saturating_add(1);
+            metrics.segments_in_flight = in_flight as u64;
+            metrics.last_transcription_started_segment_id = Some(segment_id.to_string());
+            metrics.last_segment_status = Some("segment_transcription_started".to_string());
+        });
+    }
+
+    pub fn record_segment_processing_finished(&self, in_flight: usize) {
+        self.with_metrics(|metrics| {
+            metrics.segments_in_flight = in_flight as u64;
+        });
+    }
+
+    pub fn record_queue_closed(&self, depth: usize, in_flight: usize) {
+        self.with_metrics(|metrics| {
+            metrics.current_queue_depth = depth;
+            metrics.segments_in_flight = in_flight as u64;
+            metrics.segment_transcription_drain_status = Some("closed".to_string());
+            metrics.last_segment_status = Some("segment_queue_closed".to_string());
+        });
+    }
+
+    pub fn record_drain_started(&self, depth: usize, in_flight: usize) {
+        self.with_metrics(|metrics| {
+            metrics.current_queue_depth = depth;
+            metrics.segments_in_flight = in_flight as u64;
+            metrics.drain_started_at = Some(Utc::now());
+            metrics.drain_completed_at = None;
+            metrics.drain_timeout = false;
+            metrics.segment_transcription_drain_status = Some("running".to_string());
+            metrics.last_segment_status = Some("segment_transcription_drain_started".to_string());
+        });
+    }
+
+    pub fn record_drain_completed(&self, depth: usize, in_flight: usize) {
+        self.with_metrics(|metrics| {
+            metrics.current_queue_depth = depth;
+            metrics.segments_in_flight = in_flight as u64;
+            metrics.drain_completed_at = Some(Utc::now());
+            metrics.drain_timeout = false;
+            metrics.segment_transcription_drain_status = Some("completed".to_string());
+            metrics.last_segment_status = Some("segment_transcription_drain_completed".to_string());
+        });
+    }
+
+    pub fn record_drain_timed_out(&self, depth: usize, in_flight: usize) {
+        self.with_metrics(|metrics| {
+            metrics.current_queue_depth = depth;
+            metrics.segments_in_flight = in_flight as u64;
+            metrics.drain_timeout = true;
+            metrics.segment_transcription_timeouts =
+                metrics.segment_transcription_timeouts.saturating_add(1);
+            metrics.segment_transcription_drain_status = Some("timed_out".to_string());
+            metrics.last_segment_status = Some("segment_transcription_drain_timed_out".to_string());
         });
     }
 
@@ -292,13 +377,30 @@ pub enum CapturedSegmentEnqueueOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedSegmentDrainOutcome {
+    pub drained: bool,
+    pub timed_out: bool,
+    pub queue_depth: usize,
+    pub in_flight: usize,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub struct CapturedSegmentQueue {
-    inner: Mutex<VecDeque<CapturedMeetingSegment>>,
+    inner: Mutex<CapturedSegmentQueueState>,
     notify: Notify,
     max_depth: usize,
     overflow_policy: CaptureOverflowPolicy,
     metrics: CaptureMetricsReporter,
+}
+
+#[derive(Debug, Default)]
+struct CapturedSegmentQueueState {
+    queue: VecDeque<CapturedMeetingSegment>,
+    closed: bool,
+    in_flight: usize,
 }
 
 impl CapturedSegmentQueue {
@@ -308,7 +410,7 @@ impl CapturedSegmentQueue {
         metrics: CaptureMetricsReporter,
     ) -> CapturedSegmentSender {
         Arc::new(Self {
-            inner: Mutex::new(VecDeque::new()),
+            inner: Mutex::new(CapturedSegmentQueueState::default()),
             notify: Notify::new(),
             max_depth: max_depth.max(1),
             overflow_policy,
@@ -326,10 +428,15 @@ impl CapturedSegmentQueue {
             }
         };
 
-        if queue.len() < self.max_depth {
-            queue.push_back(segment);
-            let depth = queue.len();
-            let bytes_queued = queue.iter().map(|segment| segment.byte_length).sum();
+        if queue.closed {
+            self.metrics.record_segment_dropped(self.overflow_policy);
+            return CapturedSegmentEnqueueOutcome::DroppedNewest { segment };
+        }
+
+        if queue.queue.len() < self.max_depth {
+            queue.queue.push_back(segment);
+            let depth = queue.queue.len();
+            let bytes_queued = queued_bytes(&queue.queue);
             self.metrics.record_segment_queued();
             self.metrics
                 .record_queue_depth(depth, bytes_queued, self.max_depth);
@@ -345,14 +452,14 @@ impl CapturedSegmentQueue {
                 CapturedSegmentEnqueueOutcome::DroppedNewest { segment }
             }
             CaptureOverflowPolicy::DropOldestAndReport => {
-                let Some(dropped_segment) = queue.pop_front() else {
+                let Some(dropped_segment) = queue.queue.pop_front() else {
                     self.metrics
                         .record_segment_dropped(CaptureOverflowPolicy::RejectNewest);
                     return CapturedSegmentEnqueueOutcome::DroppedNewest { segment };
                 };
-                queue.push_back(segment);
-                let depth = queue.len();
-                let bytes_queued = queue.iter().map(|segment| segment.byte_length).sum();
+                queue.queue.push_back(segment);
+                let depth = queue.queue.len();
+                let bytes_queued = queued_bytes(&queue.queue);
                 self.metrics
                     .record_segment_dropped(CaptureOverflowPolicy::DropOldestAndReport);
                 self.metrics.record_segment_queued();
@@ -374,22 +481,143 @@ impl CapturedSegmentQueue {
 
     pub async fn recv(&self) -> Option<CapturedMeetingSegment> {
         loop {
-            if let Ok(mut queue) = self.inner.lock() {
-                if let Some(segment) = queue.pop_front() {
-                    let depth = queue.len();
-                    let bytes_queued = queue.iter().map(|segment| segment.byte_length).sum();
+            let notified = self.notify.notified();
+            if let Ok(mut state) = self.inner.lock() {
+                if let Some(segment) = state.queue.pop_front() {
+                    state.in_flight = state.in_flight.saturating_add(1);
+                    let depth = state.queue.len();
+                    let in_flight = state.in_flight;
+                    let bytes_queued = queued_bytes(&state.queue);
+                    let segment_id = segment_identifier(&segment);
                     self.metrics
                         .record_queue_depth(depth, bytes_queued, self.max_depth);
+                    self.metrics
+                        .record_segment_dequeued_for_transcription(&segment_id, in_flight);
                     return Some(segment);
                 }
+                if state.closed {
+                    return None;
+                }
             }
-            self.notify.notified().await;
+            notified.await;
+        }
+    }
+
+    pub fn finish_in_flight(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            let in_flight = state.in_flight;
+            self.metrics.record_segment_processing_finished(in_flight);
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn close(&self) {
+        if let Ok(mut state) = self.inner.lock() {
+            state.closed = true;
+            let depth = state.queue.len();
+            let in_flight = state.in_flight;
+            self.metrics.record_queue_closed(depth, in_flight);
+        }
+        self.notify.notify_waiters();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.lock().map(|state| state.closed).unwrap_or(true)
+    }
+
+    pub fn current_depth(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.queue.len())
+            .unwrap_or_default()
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.inner
+            .lock()
+            .map(|state| state.in_flight)
+            .unwrap_or_default()
+    }
+
+    pub async fn wait_drained(&self, timeout: Duration) -> CapturedSegmentDrainOutcome {
+        let started_at = Utc::now();
+        let (initial_depth, initial_in_flight) = self.depth_and_in_flight();
+        self.metrics
+            .record_drain_started(initial_depth, initial_in_flight);
+
+        let wait_result = time::timeout(timeout, async {
+            loop {
+                let notified = self.notify.notified();
+                let (depth, in_flight, closed) = self.depth_in_flight_closed();
+                if depth == 0 && in_flight == 0 {
+                    return (depth, in_flight, closed);
+                }
+                if closed && depth == 0 && in_flight == 0 {
+                    return (depth, in_flight, closed);
+                }
+                notified.await;
+            }
+        })
+        .await;
+
+        match wait_result {
+            Ok((depth, in_flight, _)) => {
+                self.metrics.record_drain_completed(depth, in_flight);
+                CapturedSegmentDrainOutcome {
+                    drained: true,
+                    timed_out: false,
+                    queue_depth: depth,
+                    in_flight,
+                    started_at,
+                    completed_at: Utc::now(),
+                }
+            }
+            Err(_) => {
+                let (depth, in_flight) = self.depth_and_in_flight();
+                self.metrics.record_drain_timed_out(depth, in_flight);
+                CapturedSegmentDrainOutcome {
+                    drained: false,
+                    timed_out: true,
+                    queue_depth: depth,
+                    in_flight,
+                    started_at,
+                    completed_at: Utc::now(),
+                }
+            }
         }
     }
 
     pub fn metrics(&self) -> CaptureMetrics {
         self.metrics.snapshot()
     }
+
+    fn depth_and_in_flight(&self) -> (usize, usize) {
+        self.inner
+            .lock()
+            .map(|state| (state.queue.len(), state.in_flight))
+            .unwrap_or_default()
+    }
+
+    fn depth_in_flight_closed(&self) -> (usize, usize, bool) {
+        self.inner
+            .lock()
+            .map(|state| (state.queue.len(), state.in_flight, state.closed))
+            .unwrap_or((0, 0, true))
+    }
+}
+
+fn queued_bytes(queue: &VecDeque<CapturedMeetingSegment>) -> u64 {
+    queue.iter().map(|segment| segment.byte_length).sum()
+}
+
+fn segment_identifier(segment: &CapturedMeetingSegment) -> String {
+    segment
+        .path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("segment_{}", segment.sequence_number))
 }
 
 #[derive(Debug)]
@@ -803,7 +1031,104 @@ fn size_bucket(byte_length: u64) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioCapture, CaptureBackend};
+    use super::*;
+
+    fn segment(sequence_number: u64) -> CapturedMeetingSegment {
+        CapturedMeetingSegment {
+            session_id: "test-session".to_string(),
+            path: PathBuf::from(format!("{sequence_number}.wav")),
+            sequence_number,
+            start_ms: Some(sequence_number.saturating_mul(1_000)),
+            end_ms: Some(sequence_number.saturating_mul(1_000).saturating_add(500)),
+            duration_ms: 500,
+            byte_length: 44,
+            sample_rate: 16_000,
+            channels: 1,
+            source_backend: CaptureBackend::Wasapi,
+            transcript_source: TranscriptSource::SystemAudio,
+            source_path_redacted: true,
+            managed_path_redacted: true,
+            capture_metrics_recorded: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_close_returns_none_after_pending_segments_drain() {
+        let metrics = CaptureMetricsReporter::new();
+        let queue = CapturedSegmentQueue::new(4, CaptureOverflowPolicy::RejectNewest, metrics);
+        assert!(matches!(
+            queue.try_send(segment(1)),
+            CapturedSegmentEnqueueOutcome::Enqueued { depth: 1 }
+        ));
+        queue.close();
+
+        let received = queue.recv().await.expect("pending segment");
+        assert_eq!(received.sequence_number, 1);
+        assert_eq!(queue.in_flight(), 1);
+        queue.finish_in_flight();
+
+        let outcome = queue.wait_drained(Duration::from_millis(25)).await;
+        assert!(outcome.drained);
+        assert!(!outcome.timed_out);
+        assert_eq!(queue.recv().await, None);
+        let snapshot = queue.metrics();
+        assert_eq!(snapshot.segments_queued_total, 1);
+        assert_eq!(snapshot.segments_dequeued_total, 1);
+        assert_eq!(snapshot.current_queue_depth, 0);
+        assert_eq!(snapshot.segments_in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_drain_timeout_records_depth_and_in_flight() {
+        let metrics = CaptureMetricsReporter::new();
+        let queue = CapturedSegmentQueue::new(4, CaptureOverflowPolicy::RejectNewest, metrics);
+        assert!(matches!(
+            queue.try_send(segment(1)),
+            CapturedSegmentEnqueueOutcome::Enqueued { depth: 1 }
+        ));
+        let _received = queue.recv().await.expect("in-flight segment");
+        queue.close();
+
+        let outcome = queue.wait_drained(Duration::from_millis(1)).await;
+        assert!(!outcome.drained);
+        assert!(outcome.timed_out);
+        assert_eq!(outcome.in_flight, 1);
+        let snapshot = queue.metrics();
+        assert!(snapshot.drain_timeout);
+        assert_eq!(
+            snapshot.segment_transcription_drain_status.as_deref(),
+            Some("timed_out")
+        );
+        assert_eq!(snapshot.segments_in_flight, 1);
+    }
+
+    #[tokio::test]
+    async fn queued_total_differs_from_current_depth_after_dequeue() {
+        let metrics = CaptureMetricsReporter::new();
+        let queue = CapturedSegmentQueue::new(4, CaptureOverflowPolicy::RejectNewest, metrics);
+        let _ = queue.try_send(segment(1));
+        let _ = queue.try_send(segment(2));
+
+        let _received = queue.recv().await.expect("segment");
+        let snapshot = queue.metrics();
+        assert_eq!(snapshot.segments_queued_total, 2);
+        assert_eq!(snapshot.current_queue_depth, 1);
+        assert_eq!(snapshot.segments_dequeued_total, 1);
+    }
+
+    #[test]
+    fn capture_metrics_serializes_queue_drain_fields_with_defaults() {
+        let value = serde_json::to_value(CaptureMetrics::default()).expect("serialize metrics");
+
+        assert_eq!(value["segments_queued_total"], 0);
+        assert_eq!(value["current_queue_depth"], 0);
+        assert_eq!(value["segments_dequeued_total"], 0);
+        assert_eq!(value["segments_in_flight"], 0);
+        assert_eq!(value["segments_failed"], 0);
+        assert_eq!(value["segment_transcription_timeouts"], 0);
+        assert_eq!(value["drain_timeout"], false);
+        assert!(value["segment_transcription_drain_status"].is_null());
+    }
 
     #[test]
     fn unsupported_audio_capture_does_not_mark_capture_running() {

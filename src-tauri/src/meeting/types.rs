@@ -472,7 +472,19 @@ pub struct CaptureMetrics {
     pub segments_written: u64,
     #[serde(default)]
     pub segments_queued: u64,
+    #[serde(default)]
+    pub segments_queued_total: u64,
+    #[serde(default)]
+    pub current_queue_depth: usize,
+    #[serde(default)]
+    pub segments_dequeued_total: u64,
+    #[serde(default)]
+    pub segments_in_flight: u64,
     pub segments_transcribed: u64,
+    #[serde(default)]
+    pub segments_failed: u64,
+    #[serde(default)]
+    pub segment_transcription_timeouts: u64,
     pub segments_dropped: u64,
     #[serde(default)]
     pub dropped_silence_segments: u64,
@@ -494,6 +506,20 @@ pub struct CaptureMetrics {
     pub last_segment_transcription_error_kind: Option<String>,
     #[serde(default)]
     pub last_segment_transcription_failure_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_transcription_started_segment_id: Option<String>,
+    #[serde(default)]
+    pub last_transcription_completed_segment_id: Option<String>,
+    #[serde(default)]
+    pub last_transcription_failed_segment_id: Option<String>,
+    #[serde(default)]
+    pub drain_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub drain_completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub drain_timeout: bool,
+    #[serde(default)]
+    pub segment_transcription_drain_status: Option<String>,
     #[serde(default)]
     pub vad_speech_frames: u64,
     #[serde(default)]
@@ -681,6 +707,26 @@ pub enum MeetingLanguage {
 pub enum MeetingLanguageSource {
     TranscriptHeuristic,
     UserSourceWeighted,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSessionType {
+    TechnicalDebugging,
+    WorkMeeting,
+    Planning,
+    DecisionReview,
+    SupportCall,
+    #[default]
+    General,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSessionTypeSource {
+    TranscriptHeuristic,
     #[default]
     Unknown,
 }
@@ -893,6 +939,20 @@ pub struct MeetingIntelligenceDiagnostics {
     pub language_confidence: f32,
     #[serde(default)]
     pub language_source: MeetingLanguageSource,
+    #[serde(default)]
+    pub output_language: MeetingLanguage,
+    #[serde(default)]
+    pub output_language_mismatch: bool,
+    #[serde(default)]
+    pub language_retry_attempted: bool,
+    #[serde(default)]
+    pub language_retry_succeeded: bool,
+    #[serde(default)]
+    pub session_type: MeetingSessionType,
+    #[serde(default)]
+    pub session_type_confidence: f32,
+    #[serde(default)]
+    pub session_type_source: MeetingSessionTypeSource,
     #[serde(default)]
     pub llm_generation_duration_ms: Option<u64>,
     #[serde(default)]

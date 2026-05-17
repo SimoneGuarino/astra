@@ -59,10 +59,113 @@ const ITALIAN_LANGUAGE_MARKERS: &[&str] = &[
     "ciao",
     "buongiorno",
     "allora",
+    "durante",
+    "sessione",
+    "riunione",
+    "riepilogo",
+    "italiano",
+    "italiana",
+    "bozza",
+    "punti",
+    "principali",
+    "emersi",
+    "decisione",
+    "azioni",
+    "rischi",
+    "errore",
 ];
 const ENGLISH_LANGUAGE_MARKERS: &[&str] = &[
     "the", "and", "that", "this", "with", "for", "not", "we", "you", "should", "need", "because",
-    "about", "then", "also", "thanks", "hello", "meeting", "please",
+    "about", "then", "also", "thanks", "hello", "meeting", "please", "summary", "decided",
+    "follow", "up", "risk", "issue", "build",
+];
+const TECHNICAL_DEBUGGING_MARKERS: &[&str] = &[
+    "error",
+    "errore",
+    "bug",
+    "test",
+    "cargo",
+    "npm",
+    "build",
+    "compile",
+    "compilazione",
+    "stack",
+    "trace",
+    "endpoint",
+    "module",
+    "modulo",
+    "file",
+    "runtime",
+    "config",
+    "env",
+    "gpu",
+    "vram",
+    "cuda",
+    "tts",
+    "stt",
+    "ollama",
+];
+const PLANNING_MARKERS: &[&str] = &[
+    "roadmap",
+    "milestone",
+    "fase",
+    "phase",
+    "next",
+    "step",
+    "priorita",
+    "priorità",
+    "plan",
+    "piano",
+    "planning",
+    "sprint",
+    "prossimo",
+    "prossima",
+];
+const DECISION_REVIEW_MARKERS: &[&str] = &[
+    "decided",
+    "deciso",
+    "decisione",
+    "confirmed",
+    "confermato",
+    "approved",
+    "approvato",
+    "rejected",
+    "respinto",
+    "proceed",
+    "procedere",
+    "accept",
+    "accettare",
+    "validate",
+    "validare",
+];
+const SUPPORT_CALL_MARKERS: &[&str] = &[
+    "issue",
+    "problema",
+    "ticket",
+    "customer",
+    "cliente",
+    "support",
+    "assistenza",
+    "user",
+    "utente",
+    "report",
+    "segnalazione",
+    "reproduce",
+    "riprodurre",
+];
+const WORK_MEETING_MARKERS: &[&str] = &[
+    "meeting",
+    "riunione",
+    "sessione",
+    "agenda",
+    "follow",
+    "stakeholder",
+    "azione",
+    "azioni",
+    "action",
+    "allineamento",
+    "work",
+    "lavoro",
 ];
 
 #[derive(Debug, Clone)]
@@ -85,6 +188,9 @@ pub struct MeetingLlmPromptStats {
     pub detected_language: MeetingLanguage,
     pub language_confidence: f32,
     pub language_source: MeetingLanguageSource,
+    pub session_type: MeetingSessionType,
+    pub session_type_confidence: f32,
+    pub session_type_source: MeetingSessionTypeSource,
 }
 
 #[derive(Debug, Clone)]
@@ -167,7 +273,7 @@ impl MeetingLlmError {
         }
     }
 
-    fn reason_code(&self) -> String {
+    pub(crate) fn reason_code(&self) -> String {
         match self.kind {
             MeetingLlmErrorKind::Unavailable => "local_llm_unavailable",
             MeetingLlmErrorKind::Timeout => "local_llm_timeout",
@@ -451,6 +557,7 @@ impl MeetingIntelligenceEngine {
             fallback.diagnostics.llm_endpoint = error.endpoint;
             fallback.diagnostics.llm_generation_duration_ms = error.llm_generation_duration_ms;
             apply_prompt_stats(&mut fallback.diagnostics, &error.stats);
+            refresh_output_language_diagnostics(&mut fallback);
             return Ok(fallback);
         }
 
@@ -491,6 +598,7 @@ impl MeetingIntelligenceEngine {
                 result.diagnostics.llm_used = true;
                 result.diagnostics.fallback_used = false;
                 apply_prompt_stats(&mut result.diagnostics, &output.stats);
+                refresh_output_language_diagnostics(&mut result);
                 result.source_transcript_segment_count = output.stats.input_segment_count;
                 Ok(result)
             }
@@ -517,6 +625,7 @@ impl MeetingIntelligenceEngine {
                 fallback.diagnostics.llm_endpoint = output.endpoint;
                 fallback.diagnostics.llm_generation_duration_ms = output.llm_generation_duration_ms;
                 apply_prompt_stats(&mut fallback.diagnostics, &output.stats);
+                refresh_output_language_diagnostics(&mut fallback);
                 Ok(fallback)
             }
         }
@@ -545,6 +654,8 @@ impl MeetingIntelligenceEngine {
                 );
                 let language_detection = detect_meeting_language(&input.transcript_entries);
                 apply_language_detection(&mut diagnostics, &language_detection);
+                let session_type_detection = detect_meeting_session_type(&input.transcript_entries);
+                apply_session_type_detection(&mut diagnostics, &session_type_detection);
                 return Err(diagnostics);
             }
         };
@@ -795,8 +906,10 @@ impl MeetingIntelligenceEngine {
         diagnostics.llm_used = true;
         let language_detection = detect_meeting_language(&input.transcript_entries);
         apply_language_detection(&mut diagnostics, &language_detection);
+        let session_type_detection = detect_meeting_session_type(&input.transcript_entries);
+        apply_session_type_detection(&mut diagnostics, &session_type_detection);
 
-        Ok(MeetingIntelligenceResult {
+        let mut result = MeetingIntelligenceResult {
             session_id: input.session_id.clone(),
             status: MeetingIntelligenceStatus::Generated,
             summary,
@@ -810,7 +923,9 @@ impl MeetingIntelligenceEngine {
             diagnostics,
             source_transcript_segment_count: input.transcript_entries.len(),
             generated_at: now,
-        })
+        };
+        refresh_output_language_diagnostics(&mut result);
+        Ok(result)
     }
 
     fn rule_based_result(
@@ -851,8 +966,10 @@ impl MeetingIntelligenceEngine {
         );
         let language_detection = detect_meeting_language(&input.transcript_entries);
         apply_language_detection(&mut diagnostics, &language_detection);
+        let session_type_detection = detect_meeting_session_type(&input.transcript_entries);
+        apply_session_type_detection(&mut diagnostics, &session_type_detection);
 
-        MeetingIntelligenceResult {
+        let mut result = MeetingIntelligenceResult {
             session_id: input.session_id.clone(),
             status,
             summary,
@@ -866,7 +983,9 @@ impl MeetingIntelligenceEngine {
             diagnostics,
             source_transcript_segment_count: input.transcript_entries.len(),
             generated_at: now,
-        }
+        };
+        refresh_output_language_diagnostics(&mut result);
+        result
     }
 }
 
@@ -934,6 +1053,7 @@ pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> Meeti
 
     selected_rev.reverse();
     let language_detection = detect_prompt_language(&selected_rev);
+    let session_type_detection = detect_prompt_session_type(&selected_rev);
     let included_segment_ids = selected_rev
         .iter()
         .map(|segment| segment.segment_id.clone())
@@ -949,6 +1069,9 @@ pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> Meeti
         detected_language: language_detection.language,
         language_confidence: language_detection.confidence,
         language_source: language_detection.source,
+        session_type: session_type_detection.session_type,
+        session_type_confidence: session_type_detection.confidence,
+        session_type_source: session_type_detection.source,
     };
     let prompt = meeting_llm_user_prompt(input, &selected_rev, &stats);
     MeetingLlmPromptInput {
@@ -959,9 +1082,31 @@ pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> Meeti
     }
 }
 
+pub fn build_meeting_llm_language_retry_prompt_input(
+    previous: &MeetingLlmPromptInput,
+) -> MeetingLlmPromptInput {
+    let mut retry = previous.clone();
+    let language = meeting_language_label(previous.stats.detected_language);
+    retry.prompt.push_str(&format!(
+        r#"
+
+LANGUAGE CORRECTION RETRY:
+- The previous model output did not match the detected transcript language.
+- Return the same strict JSON schema and the same evidence_segment_ids rules.
+- Keep every JSON key exactly as specified in English.
+- Rewrite every user-facing string value in {language}.
+- For Italian, use natural professional Italian. Do not use English greetings such as "Hi" or sign-offs such as "Best".
+- Do not add unsupported facts, names, due dates, commitments, or recipients.
+- Return JSON only.
+"#
+    ));
+    retry
+}
+
 fn prompt_stats_for_input(input: &MeetingIntelligenceInput) -> MeetingLlmPromptStats {
     let bounded = bounded_input(input.clone());
     let language_detection = detect_meeting_language(&bounded.transcript_entries);
+    let session_type_detection = detect_meeting_session_type(&bounded.transcript_entries);
     MeetingLlmPromptStats {
         input_segment_count: bounded.transcript_entries.len(),
         input_truncated: input.transcript_entries.len() != bounded.transcript_entries.len(),
@@ -984,6 +1129,9 @@ fn prompt_stats_for_input(input: &MeetingIntelligenceInput) -> MeetingLlmPromptS
         detected_language: language_detection.language,
         language_confidence: language_detection.confidence,
         language_source: language_detection.source,
+        session_type: session_type_detection.session_type,
+        session_type_confidence: session_type_detection.confidence,
+        session_type_source: session_type_detection.source,
     }
 }
 
@@ -1022,6 +1170,9 @@ fn apply_prompt_stats(
     diagnostics.detected_language = stats.detected_language;
     diagnostics.language_confidence = stats.language_confidence;
     diagnostics.language_source = stats.language_source;
+    diagnostics.session_type = stats.session_type;
+    diagnostics.session_type_confidence = stats.session_type_confidence;
+    diagnostics.session_type_source = stats.session_type_source;
     if stats.input_truncated
         && !diagnostics.warnings.iter().any(|warning| {
             warning == "Local model input was truncated to bounded transcript context"
@@ -1071,6 +1222,13 @@ fn base_diagnostics(
         detected_language: MeetingLanguage::Unknown,
         language_confidence: 0.0,
         language_source: MeetingLanguageSource::Unknown,
+        output_language: MeetingLanguage::Unknown,
+        output_language_mismatch: false,
+        language_retry_attempted: false,
+        language_retry_succeeded: false,
+        session_type: MeetingSessionType::General,
+        session_type_confidence: 0.0,
+        session_type_source: MeetingSessionTypeSource::Unknown,
         llm_generation_duration_ms: None,
         total_generation_duration_ms: None,
         transcript_changed_during_generation: false,
@@ -1123,6 +1281,7 @@ fn meeting_llm_user_prompt(
     let transcript_json =
         serde_json::to_string_pretty(&transcript).unwrap_or_else(|_| "[]".to_string());
     let language_instruction = meeting_language_instruction(stats.detected_language);
+    let session_type_instruction = meeting_session_type_instruction(stats.session_type);
 
     format!(
         r#"Generate transcript-backed meeting intelligence for session "{session_id}".
@@ -1140,6 +1299,10 @@ Bounded input:
 - max_segments: {max_segments}
 - max_chars_total: {max_chars_total}
 - max_chars_per_segment: {max_chars_per_segment}
+
+Session type:
+- Detected session type: {session_type} (confidence {session_type_confidence}, source {session_type_source}).
+{session_type_instruction}
 
 Speaker registry JSON:
 {speaker_json}
@@ -1221,6 +1384,14 @@ Return JSON only, with this exact top-level shape:
 Rules:
 - Every meaningful artifact must include valid evidence_segment_ids from the transcript entries above.
 - Omit decisions/action_items/open_questions/risks that are not directly supported by evidence.
+- Summary: write a natural professional recap of what happened, what was discussed, and why it matters. Do not write a mechanical segment-count summary unless forced into rule-based fallback.
+- Decisions: include only real commitments, conclusions, confirmations, approvals, or rejections. Do not classify "we talked about X" as a decision.
+- Action items: make tasks concrete and actionable. Do not invent assignees or dates; leave them null when absent.
+- Open questions: include unresolved points only; do not list questions that the transcript later answers.
+- Risks/blockers: include actual concerns grounded in transcript evidence, not generic project risks.
+- Technical recap: extract files/modules, commands, errors, architecture choices, config/env vars, runtime behavior, tests, validation, and limitations when present.
+- Follow-up draft: professional, concise, copy-only, no fabricated recipients, no sending implied.
+- Timeline: compactly group meaningful events; do not duplicate every transcript line.
 - Do not invent recipient names. The follow-up draft is draft-only and must not imply sending.
 - Do not include markdown, comments, or explanatory text outside JSON.
 "#,
@@ -1231,6 +1402,10 @@ Rules:
         max_segments = stats.max_segments,
         max_chars_total = stats.max_chars_total,
         max_chars_per_segment = stats.max_chars_per_segment,
+        session_type = meeting_session_type_label(stats.session_type),
+        session_type_confidence = format!("{:.2}", stats.session_type_confidence),
+        session_type_source = meeting_session_type_source_label(stats.session_type_source),
+        session_type_instruction = session_type_instruction,
         detected_language = meeting_language_label(stats.detected_language),
         language_confidence = format!("{:.2}", stats.language_confidence),
         language_source = meeting_language_source_label(stats.language_source),
@@ -1314,6 +1489,23 @@ impl Default for MeetingLanguageDetection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeetingSessionTypeDetection {
+    session_type: MeetingSessionType,
+    confidence: f32,
+    source: MeetingSessionTypeSource,
+}
+
+impl Default for MeetingSessionTypeDetection {
+    fn default() -> Self {
+        Self {
+            session_type: MeetingSessionType::General,
+            confidence: 0.0,
+            source: MeetingSessionTypeSource::Unknown,
+        }
+    }
+}
+
 fn detect_meeting_language(entries: &[TranscriptEntry]) -> MeetingLanguageDetection {
     let mut total_italian = 0.0f32;
     let mut total_english = 0.0f32;
@@ -1356,6 +1548,113 @@ fn detect_prompt_language(segments: &[MeetingLlmPromptSegment]) -> MeetingLangua
     }
 
     choose_language_detection(total_italian, total_english, local_italian, local_english)
+}
+
+fn detect_meeting_session_type(entries: &[TranscriptEntry]) -> MeetingSessionTypeDetection {
+    let scores = entries
+        .iter()
+        .map(|entry| {
+            let weight = if entry.source == TranscriptSource::Microphone
+                || entry.speaker_id.as_deref() == Some(LOCAL_USER_SPEAKER_ID)
+            {
+                1.25
+            } else {
+                1.0
+            };
+            session_type_scores(&entry.text, weight)
+        })
+        .fold([0.0f32; 5], |mut totals, scores| {
+            for (index, score) in scores.into_iter().enumerate() {
+                totals[index] += score;
+            }
+            totals
+        });
+    choose_session_type(scores)
+}
+
+fn detect_prompt_session_type(segments: &[MeetingLlmPromptSegment]) -> MeetingSessionTypeDetection {
+    let scores = segments
+        .iter()
+        .map(|segment| {
+            let weight = if segment.source == TranscriptSource::Microphone
+                || segment.speaker_id.as_deref() == Some(LOCAL_USER_SPEAKER_ID)
+            {
+                1.25
+            } else {
+                1.0
+            };
+            session_type_scores(&segment.text, weight)
+        })
+        .fold([0.0f32; 5], |mut totals, scores| {
+            for (index, score) in scores.into_iter().enumerate() {
+                totals[index] += score;
+            }
+            totals
+        });
+    choose_session_type(scores)
+}
+
+fn session_type_scores(text: &str, weight: f32) -> [f32; 5] {
+    let mut scores = [0.0f32; 5];
+    for token in text
+        .to_lowercase()
+        .split(|character: char| {
+            !character.is_alphanumeric() && character != '_' && character != '-'
+        })
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if TECHNICAL_DEBUGGING_MARKERS.contains(&token) {
+            scores[0] += weight;
+        }
+        if PLANNING_MARKERS.contains(&token) {
+            scores[1] += weight;
+        }
+        if DECISION_REVIEW_MARKERS.contains(&token) {
+            scores[2] += weight;
+        }
+        if SUPPORT_CALL_MARKERS.contains(&token) {
+            scores[3] += weight;
+        }
+        if WORK_MEETING_MARKERS.contains(&token) {
+            scores[4] += weight;
+        }
+    }
+    scores
+}
+
+fn choose_session_type(scores: [f32; 5]) -> MeetingSessionTypeDetection {
+    let total = scores.iter().sum::<f32>();
+    if total < 1.5 {
+        return MeetingSessionTypeDetection::default();
+    }
+
+    let mut best_index = 0usize;
+    let mut best_score = 0.0f32;
+    for (index, score) in scores.iter().enumerate() {
+        if *score > best_score {
+            best_score = *score;
+            best_index = index;
+        }
+    }
+
+    if best_score < 1.5 {
+        return MeetingSessionTypeDetection::default();
+    }
+
+    let session_type = match best_index {
+        0 => MeetingSessionType::TechnicalDebugging,
+        1 => MeetingSessionType::Planning,
+        2 => MeetingSessionType::DecisionReview,
+        3 => MeetingSessionType::SupportCall,
+        4 => MeetingSessionType::WorkMeeting,
+        _ => MeetingSessionType::General,
+    };
+    MeetingSessionTypeDetection {
+        session_type,
+        confidence: (best_score / total.max(1.0)).clamp(0.0, 1.0),
+        source: MeetingSessionTypeSource::TranscriptHeuristic,
+    }
 }
 
 fn choose_language_detection(
@@ -1450,6 +1749,102 @@ fn apply_language_detection(
     diagnostics.language_source = detection.source;
 }
 
+fn apply_session_type_detection(
+    diagnostics: &mut MeetingIntelligenceDiagnostics,
+    detection: &MeetingSessionTypeDetection,
+) {
+    diagnostics.session_type = detection.session_type;
+    diagnostics.session_type_confidence = detection.confidence;
+    diagnostics.session_type_source = detection.source;
+}
+
+fn refresh_output_language_diagnostics(result: &mut MeetingIntelligenceResult) {
+    let detection = detect_result_output_language(result);
+    result.diagnostics.output_language = detection.language;
+    result.diagnostics.output_language_mismatch =
+        output_language_mismatch(result.diagnostics.detected_language, detection.language);
+    if result.diagnostics.output_language_mismatch
+        && !result
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning == "Generated output language did not match transcript language")
+    {
+        result
+            .diagnostics
+            .warnings
+            .push("Generated output language did not match transcript language".to_string());
+    }
+}
+
+fn output_language_mismatch(expected: MeetingLanguage, actual: MeetingLanguage) -> bool {
+    matches!(
+        (expected, actual),
+        (MeetingLanguage::Italian, MeetingLanguage::English)
+            | (MeetingLanguage::English, MeetingLanguage::Italian)
+    )
+}
+
+fn detect_result_output_language(result: &MeetingIntelligenceResult) -> MeetingLanguageDetection {
+    let mut text = Vec::new();
+    if let Some(summary) = &result.summary {
+        text.push(summary.text.as_str());
+        text.extend(summary.bullets.iter().map(String::as_str));
+    }
+    text.extend(
+        result
+            .decisions
+            .iter()
+            .flat_map(|decision| {
+                [
+                    Some(decision.decision.as_str()),
+                    decision.rationale.as_deref(),
+                    decision.made_by_display_name.as_deref(),
+                ]
+            })
+            .flatten(),
+    );
+    text.extend(
+        result
+            .action_items
+            .iter()
+            .flat_map(|item| {
+                [
+                    Some(item.task.as_str()),
+                    item.assignee_display_name.as_deref(),
+                    item.due_date.as_deref(),
+                ]
+            })
+            .flatten(),
+    );
+    text.extend(
+        result
+            .open_questions
+            .iter()
+            .flat_map(|question| {
+                [
+                    Some(question.question.as_str()),
+                    question.asked_by_display_name.as_deref(),
+                ]
+            })
+            .flatten(),
+    );
+    text.extend(result.risks.iter().map(|risk| risk.risk.as_str()));
+    if let Some(recap) = &result.technical_recap {
+        text.extend(recap.bullets.iter().map(String::as_str));
+        text.extend(recap.mentioned_files.iter().map(String::as_str));
+        text.extend(recap.mentioned_commands.iter().map(String::as_str));
+        text.extend(recap.mentioned_errors.iter().map(String::as_str));
+    }
+    if let Some(draft) = &result.follow_up_draft {
+        text.push(draft.subject.as_str());
+        text.push(draft.body.as_str());
+    }
+    let joined = text.join(" ");
+    let (italian, english) = score_language_markers(&joined);
+    choose_language_detection(italian, english, 0.0, 0.0)
+}
+
 fn meeting_language_label(language: MeetingLanguage) -> &'static str {
     match language {
         MeetingLanguage::Italian => "Italian",
@@ -1464,6 +1859,47 @@ fn meeting_language_source_label(source: MeetingLanguageSource) -> &'static str 
         MeetingLanguageSource::TranscriptHeuristic => "transcript_heuristic",
         MeetingLanguageSource::UserSourceWeighted => "user_source_weighted",
         MeetingLanguageSource::Unknown => "unknown",
+    }
+}
+
+fn meeting_session_type_label(session_type: MeetingSessionType) -> &'static str {
+    match session_type {
+        MeetingSessionType::TechnicalDebugging => "TechnicalDebugging",
+        MeetingSessionType::WorkMeeting => "WorkMeeting",
+        MeetingSessionType::Planning => "Planning",
+        MeetingSessionType::DecisionReview => "DecisionReview",
+        MeetingSessionType::SupportCall => "SupportCall",
+        MeetingSessionType::General => "General",
+    }
+}
+
+fn meeting_session_type_source_label(source: MeetingSessionTypeSource) -> &'static str {
+    match source {
+        MeetingSessionTypeSource::TranscriptHeuristic => "transcript_heuristic",
+        MeetingSessionTypeSource::Unknown => "unknown",
+    }
+}
+
+fn meeting_session_type_instruction(session_type: MeetingSessionType) -> &'static str {
+    match session_type {
+        MeetingSessionType::TechnicalDebugging => {
+            "- This looks like a technical debugging session: emphasize concrete errors, files/modules, commands, configuration, runtime behavior, fixes, tests, and validation outcomes.\n- The technical_recap should be especially useful for engineering follow-up."
+        }
+        MeetingSessionType::Planning => {
+            "- This looks like a planning session: emphasize roadmap, priorities, next steps, dependencies, owners, and sequencing.\n- Do not turn loose ideas into decisions unless the transcript confirms them."
+        }
+        MeetingSessionType::DecisionReview => {
+            "- This looks like a decision review: emphasize real decisions, rationale, confirmations, rejected options, owners, and evidence.\n- Generic discussion is not a decision."
+        }
+        MeetingSessionType::SupportCall => {
+            "- This looks like a support call: emphasize the reported issue, user/customer impact, reproduction details, blockers, next support steps, and validation."
+        }
+        MeetingSessionType::WorkMeeting => {
+            "- This looks like a work meeting: emphasize agenda progress, decisions, action items, open questions, blockers, and follow-up."
+        }
+        MeetingSessionType::General => {
+            "- Session type is general or unclear: keep artifacts concise and grounded, and omit categories without clear evidence."
+        }
     }
 }
 
@@ -1525,41 +1961,72 @@ fn rule_based_summary(
     let evidence = all_evidence(input);
     let speakers = speaker_names(input);
     let topics = extract_topics(&input.transcript_entries);
-    let italian = matches!(
-        detect_meeting_language(&input.transcript_entries).language,
-        MeetingLanguage::Italian
-    );
+    let language = detect_meeting_language(&input.transcript_entries).language;
+    let italian = matches!(language, MeetingLanguage::Italian);
+    let session_type = detect_meeting_session_type(&input.transcript_entries).session_type;
     let mut bullets = Vec::new();
-    bullets.push(format!(
-        "{} {} {} {}.",
+    let speaker_phrase = if speakers.is_empty() {
         if italian {
-            "La trascrizione contiene"
+            "speaker non identificati".to_string()
         } else {
-            "Transcript contains"
-        },
-        input.transcript_entries.len(),
-        if italian {
-            "segmenti verificati da"
-        } else {
-            "grounded segments from"
-        },
-        if speakers.is_empty() {
-            if italian {
-                "speaker sconosciuti".to_string()
-            } else {
-                "unknown speakers".to_string()
-            }
-        } else {
-            speakers.join(", ")
+            "unidentified speakers".to_string()
         }
-    ));
+    } else {
+        speakers.join(", ")
+    };
+    let topic_phrase = if topics.is_empty() {
+        if italian {
+            "i punti principali della sessione".to_string()
+        } else {
+            "the main session points".to_string()
+        }
+    } else {
+        topics.join(", ")
+    };
+    bullets.push(if italian {
+        format!("Durante la sessione, {speaker_phrase} hanno discusso {topic_phrase}.")
+    } else {
+        format!("During the session, {speaker_phrase} discussed {topic_phrase}.")
+    });
+    bullets.push(match (italian, session_type) {
+        (true, MeetingSessionType::TechnicalDebugging) => {
+            "Il recap privilegia errori, comandi, moduli, configurazione e verifiche citate nella trascrizione.".to_string()
+        }
+        (false, MeetingSessionType::TechnicalDebugging) => {
+            "The recap emphasizes errors, commands, modules, configuration, and validation mentioned in the transcript.".to_string()
+        }
+        (true, MeetingSessionType::Planning) => {
+            "Il recap mette in evidenza priorita, prossimi passi, dipendenze e sequenza operativa.".to_string()
+        }
+        (false, MeetingSessionType::Planning) => {
+            "The recap emphasizes priorities, next steps, dependencies, and sequencing.".to_string()
+        }
+        (true, MeetingSessionType::DecisionReview) => {
+            "Il recap distingue le decisioni confermate dalla semplice discussione.".to_string()
+        }
+        (false, MeetingSessionType::DecisionReview) => {
+            "The recap separates confirmed decisions from general discussion.".to_string()
+        }
+        (true, MeetingSessionType::SupportCall) => {
+            "Il recap mette in evidenza problema segnalato, impatto, riproduzione e prossimi passi di supporto.".to_string()
+        }
+        (false, MeetingSessionType::SupportCall) => {
+            "The recap emphasizes reported issue, impact, reproduction, and support next steps.".to_string()
+        }
+        (true, _) => {
+            "Gli elementi derivati sono stati sintetizzati solo quando supportati dalla trascrizione.".to_string()
+        }
+        (false, _) => {
+            "Derived items were summarized only when backed by transcript evidence.".to_string()
+        }
+    });
     if !topics.is_empty() {
         bullets.push(format!(
             "{}: {}.",
             if italian {
-                "Termini principali ricorrenti"
+                "Argomenti ricorrenti"
             } else {
-                "Main repeated terms"
+                "Recurring topics"
             },
             topics.join(", ")
         ));
@@ -1567,7 +2034,7 @@ fn rule_based_summary(
     bullets.push(format!(
         "{} {} {}.",
         if italian {
-            "Gli artefatti derivati sono collegati a"
+            "Gli artifact derivati restano collegati a"
         } else {
             "Derived artifacts are evidence-linked to"
         },
@@ -1582,7 +2049,12 @@ fn rule_based_summary(
     MeetingSummary {
         id: new_meeting_artifact_id(),
         session_id: input.session_id.clone(),
-        text: bullets.join(" "),
+        text: bullets
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" "),
         bullets,
         evidence_segment_ids: evidence,
         generated_at: now,
@@ -1766,8 +2238,8 @@ fn rule_based_follow_up_draft(
     let italian = matches!(language, MeetingLanguage::Italian);
     let mut body = if italian {
         String::from(
-            "Ciao,\n\n\
-             di seguito trovi un riepilogo basato sulla trascrizione della sessione.\n\n",
+            "Buongiorno,\n\n\
+             di seguito il riepilogo dei punti principali emersi dalla trascrizione della sessione.\n\n",
         )
     } else {
         String::from("Hi,\n\nHere is the transcript-backed recap from the work session.\n\n")
@@ -1848,7 +2320,7 @@ fn rule_based_follow_up_draft(
         id: new_meeting_artifact_id(),
         session_id: input.session_id.clone(),
         subject: if italian {
-            "Riepilogo della sessione".to_string()
+            "Riepilogo sessione".to_string()
         } else {
             "Follow-up: meeting recap".to_string()
         },
@@ -1865,16 +2337,17 @@ fn rule_based_timeline(input: &MeetingIntelligenceInput) -> Vec<MeetingTimelineI
     input
         .transcript_entries
         .iter()
-        .take(MAX_TIMELINE_ITEMS)
+        .filter(|entry| entry.text.trim().chars().count() >= 18)
+        .take(12.min(MAX_TIMELINE_ITEMS))
         .map(|entry| MeetingTimelineItem {
             id: new_meeting_artifact_id(),
             timestamp_ms: entry.start_ms,
             speaker_id: entry.speaker_id.clone(),
             speaker_display_name: Some(entry.speaker_display_name().to_string()),
             title: format!(
-                "{}: {}",
+                "{} - {}",
                 entry.speaker_display_name(),
-                bounded_text(&entry.text, 80)
+                bounded_text(&entry.text, 72)
             ),
             detail: bounded_text(&entry.text, 260),
             evidence_segment_ids: vec![entry.segment_id.clone()],
@@ -2449,6 +2922,83 @@ mod tests {
         assert_eq!(detection.source, MeetingLanguageSource::UserSourceWeighted);
     }
 
+    fn session_type_input(text: &str) -> Vec<TranscriptEntry> {
+        let mut entry =
+            TranscriptEntry::sourced("session", TranscriptSource::Microphone, "You", text, 0.9);
+        entry.segment_id = "seg-session-type".to_string();
+        entry.speaker_id = Some(LOCAL_USER_SPEAKER_ID.to_string());
+        vec![entry]
+    }
+
+    #[test]
+    fn detects_technical_debugging_session_type() {
+        let entries = session_type_input(
+            "The build has an error in src-tauri/src/meeting/runtime.rs and cargo test fails with a stack trace.",
+        );
+        let detection = detect_meeting_session_type(&entries);
+
+        assert_eq!(
+            detection.session_type,
+            MeetingSessionType::TechnicalDebugging
+        );
+        assert!(detection.confidence > 0.4);
+    }
+
+    #[test]
+    fn detects_planning_session_type() {
+        let entries = session_type_input(
+            "We need the roadmap, milestone, next step, sprint priority, and planning sequence.",
+        );
+        let detection = detect_meeting_session_type(&entries);
+
+        assert_eq!(detection.session_type, MeetingSessionType::Planning);
+    }
+
+    #[test]
+    fn detects_decision_review_session_type() {
+        let entries = session_type_input(
+            "We decided and confirmed the approved path, rejected the alternative, and will proceed after validation.",
+        );
+        let detection = detect_meeting_session_type(&entries);
+
+        assert_eq!(detection.session_type, MeetingSessionType::DecisionReview);
+    }
+
+    #[test]
+    fn detects_support_call_session_type() {
+        let entries = session_type_input(
+            "The customer reported an issue in the support ticket and the user problem must be reproduced.",
+        );
+        let detection = detect_meeting_session_type(&entries);
+
+        assert_eq!(detection.session_type, MeetingSessionType::SupportCall);
+    }
+
+    #[test]
+    fn detects_general_session_type_fallback() {
+        let entries = session_type_input("Hello and thanks for the short conversation.");
+        let detection = detect_meeting_session_type(&entries);
+
+        assert_eq!(detection.session_type, MeetingSessionType::General);
+    }
+
+    #[test]
+    fn prompt_includes_session_type_specific_instruction() {
+        let prompt = build_meeting_llm_prompt_input(&input());
+
+        assert_eq!(
+            prompt.stats.session_type,
+            MeetingSessionType::TechnicalDebugging
+        );
+        assert!(prompt
+            .prompt
+            .contains("Detected session type: TechnicalDebugging"));
+        assert!(prompt.prompt.contains("technical debugging session"));
+        assert!(prompt
+            .prompt
+            .contains("Summary: write a natural professional recap"));
+    }
+
     #[test]
     fn prompt_instructs_language_without_changing_json_keys() {
         let prompt = build_meeting_llm_prompt_input(&italian_input());
@@ -2462,6 +3012,46 @@ mod tests {
     }
 
     #[test]
+    fn detects_output_language_mismatch_for_italian_expected_english_output() {
+        let raw = r#"{
+            "summary": {"text":"Here is the meeting summary and follow up from the session.","bullets":["The team decided the next step."],"evidence_segment_ids":["seg-it-1"],"confidence":0.8}
+        }"#;
+        let result = MeetingIntelligenceEngine::validate_llm_json(raw, &italian_input(), "test")
+            .expect("validated");
+
+        assert_eq!(
+            result.diagnostics.detected_language,
+            MeetingLanguage::Italian
+        );
+        assert_eq!(result.diagnostics.output_language, MeetingLanguage::English);
+        assert!(result.diagnostics.output_language_mismatch);
+    }
+
+    #[test]
+    fn accepts_italian_output_for_italian_transcript() {
+        let raw = r#"{
+            "summary": {"text":"Durante la sessione abbiamo confermato il riepilogo italiano.","bullets":["Sintesi professionale in italiano"],"evidence_segment_ids":["seg-it-1"],"confidence":0.8}
+        }"#;
+        let result = MeetingIntelligenceEngine::validate_llm_json(raw, &italian_input(), "test")
+            .expect("validated");
+
+        assert_eq!(result.diagnostics.output_language, MeetingLanguage::Italian);
+        assert!(!result.diagnostics.output_language_mismatch);
+    }
+
+    #[test]
+    fn accepts_english_output_for_english_transcript() {
+        let raw = r#"{
+            "summary": {"text":"The team decided the meeting intelligence module is ready.","bullets":["The next step is validation."],"evidence_segment_ids":["seg-1"],"confidence":0.8}
+        }"#;
+        let result =
+            MeetingIntelligenceEngine::validate_llm_json(raw, &input(), "test").expect("validated");
+
+        assert_eq!(result.diagnostics.output_language, MeetingLanguage::English);
+        assert!(!result.diagnostics.output_language_mismatch);
+    }
+
+    #[test]
     fn rule_based_followup_uses_italian_template_for_italian_transcript() {
         let result = MeetingIntelligenceEngine::generate(italian_input()).expect("rule based");
         let draft = result.follow_up_draft.expect("draft");
@@ -2470,8 +3060,8 @@ mod tests {
             result.diagnostics.detected_language,
             MeetingLanguage::Italian
         );
-        assert_eq!(draft.subject, "Riepilogo della sessione");
-        assert!(draft.body.starts_with("Ciao,"));
+        assert_eq!(draft.subject, "Riepilogo sessione");
+        assert!(draft.body.starts_with("Buongiorno,"));
         assert!(draft.body.contains("Riepilogo:"));
         assert!(!draft.body.contains("Hi,"));
         assert!(!draft.body.contains("Best,"));

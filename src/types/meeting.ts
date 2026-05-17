@@ -208,6 +208,14 @@ export type RiskSeverity = "low" | "medium" | "high";
 export type FollowUpTone = "professional";
 export type MeetingLanguage = "italian" | "english" | "mixed" | "unknown";
 export type MeetingLanguageSource = "transcript_heuristic" | "user_source_weighted" | "unknown";
+export type MeetingSessionType =
+    | "technical_debugging"
+    | "work_meeting"
+    | "planning"
+    | "decision_review"
+    | "support_call"
+    | "general";
+export type MeetingSessionTypeSource = "transcript_heuristic" | "unknown";
 
 export type MeetingIntelligenceGenerationOptions = {
     use_local_llm: boolean;
@@ -332,6 +340,13 @@ export type MeetingIntelligenceDiagnostics = {
     detected_language: MeetingLanguage;
     language_confidence: number;
     language_source: MeetingLanguageSource;
+    output_language?: MeetingLanguage;
+    output_language_mismatch?: boolean;
+    language_retry_attempted?: boolean;
+    language_retry_succeeded?: boolean;
+    session_type?: MeetingSessionType;
+    session_type_confidence?: number;
+    session_type_source?: MeetingSessionTypeSource;
     llm_generation_duration_ms?: number | null;
     total_generation_duration_ms?: number | null;
     transcript_changed_during_generation: boolean;
@@ -486,7 +501,13 @@ export type CaptureMetrics = {
     silence_frames_skipped: number;
     segments_written: number;
     segments_queued: number;
+    segments_queued_total?: number;
+    current_queue_depth?: number;
+    segments_dequeued_total?: number;
+    segments_in_flight?: number;
     segments_transcribed: number;
+    segments_failed?: number;
+    segment_transcription_timeouts?: number;
     segments_dropped: number;
     dropped_silence_segments: number;
     segment_write_failures: number;
@@ -501,6 +522,13 @@ export type CaptureMetrics = {
     last_overflow_policy_applied?: CaptureOverflowPolicy | null;
     last_segment_transcription_error_kind?: string | null;
     last_segment_transcription_failure_at?: string | null;
+    last_transcription_started_segment_id?: string | null;
+    last_transcription_completed_segment_id?: string | null;
+    last_transcription_failed_segment_id?: string | null;
+    drain_started_at?: string | null;
+    drain_completed_at?: string | null;
+    drain_timeout?: boolean;
+    segment_transcription_drain_status?: string | null;
     vad_speech_frames: number;
     vad_silence_frames: number;
     last_speech_ratio_bps: number;

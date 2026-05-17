@@ -9,8 +9,8 @@ use super::{
         CaptureController, CaptureControllerConfig, CaptureControllerStartRequest,
     },
     intelligence_engine::{
-        build_meeting_llm_prompt_input, MeetingIntelligenceEngine, MeetingIntelligenceLlm,
-        OllamaMeetingIntelligenceLlm,
+        build_meeting_llm_language_retry_prompt_input, build_meeting_llm_prompt_input,
+        MeetingIntelligenceEngine, MeetingIntelligenceLlm, OllamaMeetingIntelligenceLlm,
     },
     note_organizer::NoteOrganizer,
     privacy_control::PrivacyState,
@@ -23,9 +23,10 @@ use super::{
         MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
         MeetingCapabilityReadiness, MeetingCapabilityState, MeetingConfig, MeetingDataClearPreview,
         MeetingDataClearResult, MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode, MeetingSessionState,
-        MeetingStatus, RenameSpeakerRequest, RenameSpeakerResult, SpeakerAttributionMethod,
-        TranscriptEntry, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingLanguage, MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode,
+        MeetingSessionState, MeetingStatus, RenameSpeakerRequest, RenameSpeakerResult,
+        SpeakerAttributionMethod, TranscriptEntry, TranscriptSource,
+        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
 };
 use crate::stt_client::SttClient;
@@ -292,6 +293,7 @@ impl MeetingRuntime {
                     let result = runtime
                         .transcribe_captured_segment(segment, None, true)
                         .await;
+                    receiver.finish_in_flight();
                     if let Err(error) = result {
                         log::warn!("managed meeting capture segment transcription failed: {error}");
                         if matches!(
@@ -392,6 +394,11 @@ impl MeetingRuntime {
                 message: "captured segment does not match the active meeting session".to_string(),
             });
         }
+        let segment_id = segment
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string());
 
         if let Err(error) = self.ensure_can_transcribe_platform(&active_session.platform) {
             if matches!(error, MeetingRuntimeError::ConsentRequired { .. }) {
@@ -417,6 +424,7 @@ impl MeetingRuntime {
                 self.record_captured_segment_transcription_failure(
                     &active_session.platform,
                     segment.transcript_source,
+                    segment_id.as_deref(),
                     &error,
                 )?;
                 let cleanup = self.cleanup_managed_segment_after_failure(
@@ -440,11 +448,6 @@ impl MeetingRuntime {
 
         let start_ms = segment.start_ms;
         let end_ms = segment.end_ms;
-        let segment_id = segment
-            .path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .map(|value| value.to_string());
         let result = self
             .transcribe_managed_audio_segment(ManagedAudioTranscriptionInput {
                 active_session: &active_session,
@@ -456,7 +459,7 @@ impl MeetingRuntime {
                 source_is_captured_segment: true,
                 transcript_source: segment.transcript_source,
                 audio_backend: Some(format!("{:?}", segment.source_backend).to_ascii_lowercase()),
-                segment_id,
+                segment_id: segment_id.clone(),
                 start_ms,
                 end_ms,
             })
@@ -465,7 +468,7 @@ impl MeetingRuntime {
         match &result {
             Ok(_) => {
                 self.with_capture_mut_for_source(segment.transcript_source, |capture| {
-                    capture.record_segment_transcribed();
+                    capture.record_segment_transcribed_with_id(segment_id.as_deref());
                 })?;
             }
             Err(MeetingRuntimeError::ConsentRequired { .. })
@@ -478,6 +481,7 @@ impl MeetingRuntime {
                 self.record_captured_segment_transcription_failure(
                     &active_session.platform,
                     segment.transcript_source,
+                    segment_id.as_deref(),
                     error,
                 )?;
             }
@@ -708,14 +712,62 @@ impl MeetingRuntime {
             let prompt_input = build_meeting_llm_prompt_input(&input);
             match self
                 .intelligence_llm
-                .generate_intelligence_json(prompt_input)
+                .generate_intelligence_json(prompt_input.clone())
                 .await
             {
-                Ok(output) => MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
-                    input,
-                    Some(output),
-                    None,
-                )?,
+                Ok(output) => {
+                    let mut first_result =
+                        MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
+                            input.clone(),
+                            Some(output),
+                            None,
+                        )?;
+                    if should_retry_meeting_output_language(&first_result) {
+                        first_result.diagnostics.language_retry_attempted = true;
+                        first_result.diagnostics.warnings.push(
+                            "Output language did not match transcript language; one local model retry was attempted".to_string(),
+                        );
+                        let retry_prompt =
+                            build_meeting_llm_language_retry_prompt_input(&prompt_input);
+                        match self
+                            .intelligence_llm
+                            .generate_intelligence_json(retry_prompt)
+                            .await
+                        {
+                            Ok(retry_output) => {
+                                let mut retry_result =
+                                    MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
+                                        input.clone(),
+                                        Some(retry_output),
+                                        None,
+                                    )?;
+                                retry_result.diagnostics.language_retry_attempted = true;
+                                if !retry_result.diagnostics.output_language_mismatch
+                                    && !retry_result.diagnostics.fallback_used
+                                {
+                                    retry_result.diagnostics.language_retry_succeeded = true;
+                                    retry_result
+                                } else {
+                                    first_result.diagnostics.language_retry_succeeded = false;
+                                    first_result.diagnostics.warnings.push(
+                                        "Language retry did not produce an acceptable corrected local model result; first valid output was kept with mismatch diagnostics".to_string(),
+                                    );
+                                    first_result
+                                }
+                            }
+                            Err(error) => {
+                                first_result.diagnostics.language_retry_succeeded = false;
+                                first_result.diagnostics.warnings.push(format!(
+                                    "Language retry failed with {}; first valid output was kept",
+                                    error.reason_code()
+                                ));
+                                first_result
+                            }
+                        }
+                    } else {
+                        first_result
+                    }
+                }
                 Err(error) => MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
                     input,
                     None,
@@ -796,10 +848,21 @@ impl MeetingRuntime {
             }
             return Err(error);
         }
-        let exported = {
+        let system_capture_health = self.capture_health()?;
+        let microphone_capture_health = self.microphone_capture_health()?;
+        self.record_segment_stt_stop_diagnostics(
+            &system_capture_health,
+            &microphone_capture_health,
+        )?;
+        let mut exported = {
             let mut registry = self.lock_registry()?;
             registry.stop()?
         };
+        apply_segment_stt_export_metadata(
+            &mut exported,
+            &system_capture_health,
+            &microphone_capture_health,
+        );
         self.organizer
             .save_meeting_data(&exported)
             .map_err(|message| MeetingRuntimeError::StorageError { message })?;
@@ -1044,9 +1107,10 @@ impl MeetingRuntime {
         &self,
         platform: &str,
         source: TranscriptSource,
+        segment_id: Option<&str>,
         error: &MeetingRuntimeError,
     ) -> Result<(), MeetingRuntimeError> {
-        let error_kind = captured_segment_error_kind(error).to_string();
+        let error_kind = captured_segment_error_kind(error);
         let immediate_failure = captured_segment_error_fails_capture_immediately(error);
         let terminal_reason = {
             self.with_capture_mut_for_source(source, |capture| {
@@ -1057,7 +1121,8 @@ impl MeetingRuntime {
                         source.as_str()
                     ))
                 } else {
-                    let health = capture.record_segment_transcription_failure(&error_kind);
+                    let health = capture
+                        .record_segment_transcription_failure_with_id(&error_kind, segment_id);
                     let threshold = health
                         .pipeline
                         .max_consecutive_transcription_failures
@@ -1267,6 +1332,71 @@ impl MeetingRuntime {
         };
         system_result?;
         microphone_result?;
+        Ok(())
+    }
+
+    fn record_segment_stt_stop_diagnostics(
+        &self,
+        system_health: &CaptureHealth,
+        microphone_health: &CaptureHealth,
+    ) -> Result<(), MeetingRuntimeError> {
+        let aggregate = aggregate_capture_health(system_health.clone(), microphone_health.clone());
+        let metrics = &aggregate.metrics;
+        let mut registry = self.lock_registry()?;
+        if registry.get_active_session().is_none() {
+            return Ok(());
+        }
+
+        if matches!(
+            metrics.segment_transcription_drain_status.as_deref(),
+            Some("running") | Some("completed") | Some("timed_out")
+        ) {
+            let severity = if metrics.drain_timeout {
+                super::types::MeetingDiagnosticSeverity::Warning
+            } else {
+                super::types::MeetingDiagnosticSeverity::Info
+            };
+            registry.add_diagnostic(
+                "meeting_segment_stt_drain".to_string(),
+                severity,
+                format!(
+                    "Segment STT drain {}; queued_total={}; current_queue={}; in_flight={}; transcribed={}; failed={}",
+                    metrics
+                        .segment_transcription_drain_status
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    metrics.segments_queued_total,
+                    metrics.current_queue_depth,
+                    metrics.segments_in_flight,
+                    metrics.segments_transcribed,
+                    metrics.segments_failed
+                ),
+            )?;
+        }
+
+        let transcript_count = registry.get_active_state().transcript.len();
+        if metrics.segments_written > 0
+            && metrics.segments_transcribed == 0
+            && transcript_count == 0
+        {
+            registry.add_diagnostic(
+                "meeting_segment_transcription_incomplete".to_string(),
+                super::types::MeetingDiagnosticSeverity::Warning,
+                format!(
+                    "Audio segments were captured, but no transcript was produced before stop/export; segments_written={}; queued_total={}; current_queue={}; in_flight={}; failed={}; timeouts={}; last_error={}",
+                    metrics.segments_written,
+                    metrics.segments_queued_total,
+                    metrics.current_queue_depth,
+                    metrics.segments_in_flight,
+                    metrics.segments_failed,
+                    metrics.segment_transcription_timeouts,
+                    metrics
+                        .last_segment_transcription_error_kind
+                        .as_deref()
+                        .unwrap_or("none")
+                ),
+            )?;
+        }
         Ok(())
     }
 
@@ -1499,40 +1629,75 @@ fn error_with_cleanup_warning(
     }
 }
 
-fn captured_segment_error_kind(error: &MeetingRuntimeError) -> &'static str {
+fn captured_segment_error_kind(error: &MeetingRuntimeError) -> String {
     match error {
-        MeetingRuntimeError::ConsentRequired { .. } => "consent_required",
-        MeetingRuntimeError::ConsentRevoked { .. } => "consent_revoked",
-        MeetingRuntimeError::TranscriptionUnavailable { .. } => "transcription_unavailable",
-        MeetingRuntimeError::SttUnavailable { .. } => "stt_unavailable",
-        MeetingRuntimeError::TranscriptionInactive => "transcription_inactive",
-        MeetingRuntimeError::NoAudioFramesReceived { .. } => "no_audio_frames_received",
-        MeetingRuntimeError::TranscriptionFailedWithCleanupWarning { .. } => {
-            "transcription_cleanup_warning"
+        MeetingRuntimeError::ConsentRequired { .. } => "consent_required".to_string(),
+        MeetingRuntimeError::ConsentRevoked { .. } => "consent_revoked".to_string(),
+        MeetingRuntimeError::TranscriptionUnavailable { reason } => {
+            classify_stt_failure_reason(reason).to_string()
         }
-        MeetingRuntimeError::StorageError { .. } => "storage_error",
-        MeetingRuntimeError::CaptureStreamError { .. } => "capture_stream_error",
-        MeetingRuntimeError::AudioCaptureUnavailable { .. } => "audio_capture_unavailable",
-        MeetingRuntimeError::SegmentWriteFailed { .. } => "segment_write_failed",
-        MeetingRuntimeError::SegmentTooLarge { .. } => "segment_too_large",
-        MeetingRuntimeError::InvalidConfig { .. } => "invalid_segment",
-        MeetingRuntimeError::NoActiveSession => "no_active_session",
-        MeetingRuntimeError::SessionPaused { .. } => "session_paused",
-        MeetingRuntimeError::SessionCompleted => "session_completed",
-        MeetingRuntimeError::InvalidLifecycleTransition { .. } => "invalid_lifecycle",
-        MeetingRuntimeError::ClearAbortedCaptureStopFailed { .. } => "clear_aborted",
-        MeetingRuntimeError::CaptureStopTimedOut { .. } => "capture_stop_timed_out",
-        MeetingRuntimeError::CaptureUnavailable { .. } => "capture_unavailable",
-        MeetingRuntimeError::CaptureStartFailed { .. } => "capture_start_failed",
-        MeetingRuntimeError::CaptureStartupTimeout { .. } => "capture_startup_timeout",
-        MeetingRuntimeError::CaptureStartupChannelClosed { .. } => "capture_startup_closed",
-        MeetingRuntimeError::CaptureDeviceUnavailable { .. } => "capture_device_unavailable",
-        MeetingRuntimeError::PermissionDenied { .. } => "permission_denied",
-        MeetingRuntimeError::UnsupportedCapability { .. } => "unsupported_capability",
-        MeetingRuntimeError::ActiveSessionExists { .. } => "active_session_exists",
-        MeetingRuntimeError::ConfirmationRequired { .. } => "confirmation_required",
-        MeetingRuntimeError::SerializationError { .. } => "serialization_error",
-        MeetingRuntimeError::MutexPoisoned { .. } => "mutex_poisoned",
+        MeetingRuntimeError::SttUnavailable { .. } => "stt_worker_unavailable".to_string(),
+        MeetingRuntimeError::TranscriptionInactive => "transcription_inactive".to_string(),
+        MeetingRuntimeError::NoAudioFramesReceived { .. } => "no_audio_frames_received".to_string(),
+        MeetingRuntimeError::TranscriptionFailedWithCleanupWarning { reason, .. } => {
+            classify_stt_failure_reason(reason).to_string()
+        }
+        MeetingRuntimeError::StorageError { .. } => "storage_error".to_string(),
+        MeetingRuntimeError::CaptureStreamError { .. } => "capture_stream_error".to_string(),
+        MeetingRuntimeError::AudioCaptureUnavailable { .. } => {
+            "audio_capture_unavailable".to_string()
+        }
+        MeetingRuntimeError::SegmentWriteFailed { .. } => "segment_write_failed".to_string(),
+        MeetingRuntimeError::SegmentTooLarge { .. } => "segment_too_large".to_string(),
+        MeetingRuntimeError::InvalidConfig { .. } => "invalid_segment".to_string(),
+        MeetingRuntimeError::NoActiveSession => "no_active_session".to_string(),
+        MeetingRuntimeError::SessionPaused { .. } => "session_paused".to_string(),
+        MeetingRuntimeError::SessionCompleted => "session_completed".to_string(),
+        MeetingRuntimeError::InvalidLifecycleTransition { .. } => "invalid_lifecycle".to_string(),
+        MeetingRuntimeError::ClearAbortedCaptureStopFailed { .. } => "clear_aborted".to_string(),
+        MeetingRuntimeError::CaptureStopTimedOut { .. } => "capture_stop_timed_out".to_string(),
+        MeetingRuntimeError::CaptureUnavailable { .. } => "capture_unavailable".to_string(),
+        MeetingRuntimeError::CaptureStartFailed { .. } => "capture_start_failed".to_string(),
+        MeetingRuntimeError::CaptureStartupTimeout { .. } => "capture_startup_timeout".to_string(),
+        MeetingRuntimeError::CaptureStartupChannelClosed { .. } => {
+            "capture_startup_closed".to_string()
+        }
+        MeetingRuntimeError::CaptureDeviceUnavailable { .. } => {
+            "capture_device_unavailable".to_string()
+        }
+        MeetingRuntimeError::PermissionDenied { .. } => "permission_denied".to_string(),
+        MeetingRuntimeError::UnsupportedCapability { .. } => "unsupported_capability".to_string(),
+        MeetingRuntimeError::ActiveSessionExists { .. } => "active_session_exists".to_string(),
+        MeetingRuntimeError::ConfirmationRequired { .. } => "confirmation_required".to_string(),
+        MeetingRuntimeError::SerializationError { .. } => "serialization_error".to_string(),
+        MeetingRuntimeError::MutexPoisoned { .. } => "mutex_poisoned".to_string(),
+    }
+}
+
+fn classify_stt_failure_reason(reason: &str) -> &'static str {
+    let normalized = reason.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("timeout") {
+        "stt_timeout"
+    } else if normalized.contains("unavailable") {
+        "stt_worker_unavailable"
+    } else if normalized.contains("not configured") || normalized.contains("config") {
+        "stt_worker_unavailable"
+    } else if normalized.contains("empty transcript") {
+        "stt_empty_transcript"
+    } else if normalized.contains("invalid") || normalized.contains("audio") {
+        "stt_invalid_audio"
+    } else if normalized.contains("device")
+        || normalized.contains("cuda")
+        || normalized.contains("cpu")
+    {
+        "stt_device_error"
+    } else if normalized.contains("worker failed")
+        || normalized.contains("protocol")
+        || normalized.contains("i/o")
+    {
+        "stt_worker_failed"
+    } else {
+        "stt_unknown"
     }
 }
 
@@ -1754,6 +1919,17 @@ fn is_system_path(path: &Path) -> bool {
     }
 }
 
+fn should_retry_meeting_output_language(result: &MeetingIntelligenceResult) -> bool {
+    result.diagnostics.llm_used
+        && !result.diagnostics.fallback_used
+        && result.diagnostics.output_language_mismatch
+        && matches!(
+            result.diagnostics.detected_language,
+            MeetingLanguage::Italian | MeetingLanguage::English
+        )
+        && !result.diagnostics.language_retry_attempted
+}
+
 fn readiness(
     capability: &str,
     available: bool,
@@ -1800,10 +1976,34 @@ fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) ->
         .metrics
         .segments_queued
         .saturating_add(microphone.metrics.segments_queued);
+    aggregate.metrics.segments_queued_total = system
+        .metrics
+        .segments_queued_total
+        .saturating_add(microphone.metrics.segments_queued_total);
+    aggregate.metrics.current_queue_depth = system
+        .metrics
+        .current_queue_depth
+        .saturating_add(microphone.metrics.current_queue_depth);
+    aggregate.metrics.segments_dequeued_total = system
+        .metrics
+        .segments_dequeued_total
+        .saturating_add(microphone.metrics.segments_dequeued_total);
+    aggregate.metrics.segments_in_flight = system
+        .metrics
+        .segments_in_flight
+        .saturating_add(microphone.metrics.segments_in_flight);
     aggregate.metrics.segments_transcribed = system
         .metrics
         .segments_transcribed
         .saturating_add(microphone.metrics.segments_transcribed);
+    aggregate.metrics.segments_failed = system
+        .metrics
+        .segments_failed
+        .saturating_add(microphone.metrics.segments_failed);
+    aggregate.metrics.segment_transcription_timeouts = system
+        .metrics
+        .segment_transcription_timeouts
+        .saturating_add(microphone.metrics.segment_transcription_timeouts);
     aggregate.metrics.segments_dropped = system
         .metrics
         .segments_dropped
@@ -1820,7 +2020,83 @@ fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) ->
         .metrics
         .frames_converted
         .saturating_add(microphone.metrics.frames_converted);
+    aggregate.metrics.drain_timeout =
+        system.metrics.drain_timeout || microphone.metrics.drain_timeout;
+    aggregate.metrics.segment_transcription_drain_status =
+        aggregate_drain_status(&system.metrics, &microphone.metrics);
+    aggregate.metrics.last_segment_transcription_error_kind = microphone
+        .metrics
+        .last_segment_transcription_error_kind
+        .clone()
+        .or(system.metrics.last_segment_transcription_error_kind.clone());
     aggregate
+}
+
+fn aggregate_drain_status(
+    system: &super::types::CaptureMetrics,
+    microphone: &super::types::CaptureMetrics,
+) -> Option<String> {
+    if system.drain_timeout || microphone.drain_timeout {
+        Some("timed_out".to_string())
+    } else if matches!(
+        (
+            system.segment_transcription_drain_status.as_deref(),
+            microphone.segment_transcription_drain_status.as_deref(),
+        ),
+        (Some("running"), _) | (_, Some("running"))
+    ) {
+        Some("running".to_string())
+    } else if matches!(
+        system.segment_transcription_drain_status.as_deref(),
+        Some("completed")
+    ) || matches!(
+        microphone.segment_transcription_drain_status.as_deref(),
+        Some("completed")
+    ) {
+        Some("completed".to_string())
+    } else {
+        system
+            .segment_transcription_drain_status
+            .clone()
+            .or_else(|| microphone.segment_transcription_drain_status.clone())
+    }
+}
+
+fn apply_segment_stt_export_metadata(
+    exported: &mut ExportedMeeting,
+    system_health: &CaptureHealth,
+    microphone_health: &CaptureHealth,
+) {
+    let aggregate = aggregate_capture_health(system_health.clone(), microphone_health.clone());
+    let metrics = aggregate.metrics;
+    let incomplete = metrics.segments_written > 0
+        && exported.transcript.is_empty()
+        && metrics.segments_transcribed == 0;
+    if let Some(metadata) = exported.metadata.as_object_mut() {
+        metadata.insert(
+            "meeting_segment_transcription_incomplete".to_string(),
+            serde_json::json!(incomplete),
+        );
+        metadata.insert(
+            "segment_stt_diagnostics".to_string(),
+            serde_json::json!({
+                "segments_written": metrics.segments_written,
+                "segments_queued_total": metrics.segments_queued_total,
+                "current_queue_depth": metrics.current_queue_depth,
+                "segments_dequeued_total": metrics.segments_dequeued_total,
+                "segments_in_flight": metrics.segments_in_flight,
+                "segments_transcribed": metrics.segments_transcribed,
+                "segments_failed": metrics.segments_failed,
+                "segment_transcription_timeouts": metrics.segment_transcription_timeouts,
+                "drain_status": metrics.segment_transcription_drain_status,
+                "drain_timeout": metrics.drain_timeout,
+                "last_stt_error": metrics.last_segment_transcription_error_kind,
+                "last_transcription_started_segment_id": metrics.last_transcription_started_segment_id,
+                "last_transcription_completed_segment_id": metrics.last_transcription_completed_segment_id,
+                "last_transcription_failed_segment_id": metrics.last_transcription_failed_segment_id,
+            }),
+        );
+    }
 }
 
 fn capture_status_message(
@@ -1868,10 +2144,11 @@ mod tests {
     };
     use chrono::Utc;
     use std::{
+        collections::VecDeque,
         path::Path,
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         time::Duration,
     };
@@ -1921,6 +2198,27 @@ mod tests {
                 Ok(format!(
                     "We decided to ship this segment. Please follow up on {stem} by tomorrow."
                 ))
+            })
+        }
+    }
+
+    struct FailingTranscriber {
+        reason: &'static str,
+    }
+
+    impl MeetingFileTranscriber for FailingTranscriber {
+        fn status(&self) -> super::super::types::MeetingSttAdapterStatus {
+            FixedTranscriber.status()
+        }
+
+        fn transcribe_file<'a>(
+            &'a self,
+            _audio_path: &'a Path,
+        ) -> MeetingFileTranscriptionFuture<'a> {
+            Box::pin(async move {
+                Err(MeetingRuntimeError::TranscriptionUnavailable {
+                    reason: self.reason.to_string(),
+                })
             })
         }
     }
@@ -1987,6 +2285,52 @@ mod tests {
                         llm_generation_duration_ms: Some(1),
                     }),
                 }
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct SequencedMeetingLlm {
+        responses: Arc<Mutex<VecDeque<String>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SequencedMeetingLlm {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(ToString::to_string)
+                        .collect::<VecDeque<_>>(),
+                )),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl MeetingIntelligenceLlm for SequencedMeetingLlm {
+        fn generate_intelligence_json<'a>(
+            &'a self,
+            input: MeetingLlmPromptInput,
+        ) -> MeetingLlmFuture<'a> {
+            let calls = self.calls.clone();
+            let responses = self.responses.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let raw_json = responses
+                    .lock()
+                    .expect("responses mutex")
+                    .pop_front()
+                    .unwrap_or_else(|| "{}".to_string());
+                Ok(MeetingLlmRawOutput {
+                    raw_json,
+                    provider: "ollama".to_string(),
+                    model: "mock-meeting-model".to_string(),
+                    stats: input.stats,
+                    endpoint: Some("127.0.0.1:11434".to_string()),
+                    llm_generation_duration_ms: Some(1),
+                })
             })
         }
     }
@@ -2191,6 +2535,194 @@ mod tests {
             note.evidence_segment_ids
                 .contains(&state.transcript[1].segment_id)
         }));
+    }
+
+    #[tokio::test]
+    async fn captured_segment_success_records_completed_segment_metrics() {
+        let root = temp_root();
+        let runtime =
+            MeetingRuntime::with_file_transcriber(root.clone(), Arc::new(FixedTranscriber));
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let storage_dir = root.join(".astra").join("meetings");
+        let writer = SegmentWriter::new(
+            storage_dir,
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let samples = vec![100_i16; 16_000];
+        let segment = writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("segment");
+        let segment_id = segment
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap()
+            .to_string();
+
+        runtime
+            .transcribe_captured_segment(segment, None, false)
+            .await
+            .expect("transcription");
+
+        let health = runtime.capture_health().expect("capture health");
+        assert_eq!(health.metrics.segments_transcribed, 1);
+        assert_eq!(
+            health
+                .metrics
+                .last_transcription_completed_segment_id
+                .as_deref(),
+            Some(segment_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_segment_failure_records_failed_segment_metrics_and_timeout_kind() {
+        let root = temp_root();
+        let runtime = MeetingRuntime::with_file_transcriber(
+            root.clone(),
+            Arc::new(FailingTranscriber {
+                reason: "Existing STT worker timed out",
+            }),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let storage_dir = root.join(".astra").join("meetings");
+        let writer = SegmentWriter::new(
+            storage_dir,
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let samples = vec![100_i16; 16_000];
+        let segment = writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("segment");
+        let segment_id = segment
+            .path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap()
+            .to_string();
+
+        let result = runtime
+            .transcribe_captured_segment(segment, None, false)
+            .await;
+        assert!(result.is_err());
+
+        let health = runtime.capture_health().expect("capture health");
+        assert_eq!(health.metrics.segments_failed, 1);
+        assert_eq!(health.metrics.segment_transcription_timeouts, 1);
+        assert_eq!(
+            health
+                .metrics
+                .last_segment_transcription_error_kind
+                .as_deref(),
+            Some("stt_timeout")
+        );
+        assert_eq!(
+            health
+                .metrics
+                .last_transcription_failed_segment_id
+                .as_deref(),
+            Some(segment_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_export_records_captured_but_untranscribed_segment_diagnostics() {
+        let root = temp_root();
+        let runtime = MeetingRuntime::with_file_transcriber(
+            root.clone(),
+            Arc::new(FailingTranscriber {
+                reason: "Existing STT worker timed out",
+            }),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let storage_dir = root.join(".astra").join("meetings");
+        let writer = SegmentWriter::new(
+            storage_dir,
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let samples = vec![100_i16; 16_000];
+        let segment = writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("segment");
+
+        let result = runtime
+            .transcribe_captured_segment(segment, None, false)
+            .await;
+        assert!(result.is_err());
+
+        let exported = runtime.stop_session().expect("stop session");
+        assert!(exported.transcript.is_empty());
+        assert_eq!(
+            exported
+                .metadata
+                .get("meeting_segment_transcription_incomplete")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        let diagnostics = exported
+            .metadata
+            .get("segment_stt_diagnostics")
+            .expect("segment STT diagnostics");
+        assert_eq!(
+            diagnostics
+                .get("segments_written")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics
+                .get("segments_failed")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            diagnostics
+                .get("last_stt_error")
+                .and_then(|value| value.as_str()),
+            Some("stt_timeout")
+        );
     }
 
     #[tokio::test]
@@ -2416,6 +2948,126 @@ mod tests {
             .follow_up_draft
             .as_ref()
             .is_some_and(|draft| draft.body.contains("Ciao")));
+    }
+
+    #[tokio::test]
+    async fn language_retry_success_stores_corrected_output() {
+        let first = r#"{
+            "summary": {
+                "text": "Here is the meeting summary and follow up from the session.",
+                "bullets": ["The team decided the next step."],
+                "evidence_segment_ids": ["seg-it"],
+                "confidence": 0.8
+            }
+        }"#;
+        let second = r#"{
+            "summary": {
+                "text": "Durante la sessione e stata confermata la sintesi italiana.",
+                "bullets": ["La bozza di follow-up resta in italiano."],
+                "evidence_segment_ids": ["seg-it"],
+                "confidence": 0.86
+            }
+        }"#;
+        let llm = SequencedMeetingLlm::new(vec![first, second]);
+        let calls = llm.calls.clone();
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let mut entry = TranscriptEntry::sourced(
+            "",
+            TranscriptSource::Manual,
+            "Simone",
+            "Abbiamo deciso che il riepilogo e la bozza di follow-up devono essere in italiano.",
+            0.9,
+        );
+        entry.segment_id = "seg-it".to_string();
+        runtime.add_transcript(entry).expect("add transcript");
+
+        let result = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions {
+                use_local_llm: true,
+                max_transcript_segments: 120,
+            })
+            .await
+            .expect("generate");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(result.diagnostics.language_retry_attempted);
+        assert!(result.diagnostics.language_retry_succeeded);
+        assert!(!result.diagnostics.output_language_mismatch);
+        assert_eq!(result.diagnostics.output_language, MeetingLanguage::Italian);
+        assert!(result
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.text.starts_with("Durante")));
+    }
+
+    #[tokio::test]
+    async fn language_retry_invalid_keeps_first_valid_output_with_diagnostic() {
+        let first = r#"{
+            "summary": {
+                "text": "Here is the meeting summary and follow up from the session.",
+                "bullets": ["The team decided the next step."],
+                "evidence_segment_ids": ["seg-it"],
+                "confidence": 0.8
+            }
+        }"#;
+        let llm = SequencedMeetingLlm::new(vec![first, "{not valid json"]);
+        let calls = llm.calls.clone();
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        runtime.grant_consent("teams").expect("grant consent");
+        runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let mut entry = TranscriptEntry::sourced(
+            "",
+            TranscriptSource::Manual,
+            "Simone",
+            "Abbiamo deciso che il riepilogo e la bozza di follow-up devono essere in italiano.",
+            0.9,
+        );
+        entry.segment_id = "seg-it".to_string();
+        runtime.add_transcript(entry).expect("add transcript");
+
+        let result = runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions {
+                use_local_llm: true,
+                max_transcript_segments: 120,
+            })
+            .await
+            .expect("generate");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(result.diagnostics.language_retry_attempted);
+        assert!(!result.diagnostics.language_retry_succeeded);
+        assert!(result.diagnostics.output_language_mismatch);
+        assert!(result
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("first valid output was kept")));
     }
 
     #[tokio::test]

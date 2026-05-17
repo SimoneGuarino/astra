@@ -829,6 +829,51 @@ input {
     line-height: 1.35;
 }
 
+.meeting-evidence {
+    display: grid;
+    gap: 6px;
+}
+
+.meeting-evidence__summary {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.meeting-evidence__toggle {
+    border: 0;
+    background: transparent;
+    color: #3457b1;
+    font-size: 12px;
+    font-weight: 800;
+    padding: 0;
+    cursor: pointer;
+}
+
+.meeting-evidence__list {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid rgba(85, 108, 190, 0.12);
+    border-radius: 10px;
+    background: rgba(245, 248, 255, 0.72);
+    list-style: none;
+}
+
+.meeting-evidence__list li {
+    display: grid;
+    gap: 3px;
+    margin: 0;
+    color: rgba(41, 49, 78, 0.9);
+}
+
+.meeting-evidence__list strong {
+    color: #26335f;
+    font-size: 12px;
+}
+
 .meeting-generated-item {
     display: grid;
     gap: 4px;
@@ -969,6 +1014,32 @@ input {
 
 .meeting-capture-summary {
     grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.meeting-stt-warning {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid rgba(199, 142, 16, 0.25);
+    border-radius: 12px;
+    background: rgba(255, 214, 102, 0.18);
+    color: rgba(88, 65, 19, 0.95);
+}
+
+.meeting-stt-warning p {
+    margin: 4px 0 0;
+    color: rgba(88, 65, 19, 0.8);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.meeting-stt-warning--error {
+    border-color: rgba(255, 89, 94, 0.28);
+    background: rgba(255, 89, 94, 0.1);
+    color: rgba(128, 34, 43, 0.95);
+}
+
+.meeting-stt-warning--error p {
+    color: rgba(128, 34, 43, 0.82);
 }
 
 .meeting-transcript-list {

@@ -136,6 +136,73 @@ function languageLabel(language?: string | null): string {
     }
 }
 
+function sessionTypeLabel(sessionType?: string | null): string {
+    switch (sessionType) {
+        case "technical_debugging":
+            return "Technical debugging";
+        case "planning":
+            return "Planning";
+        case "decision_review":
+            return "Decision review";
+        case "support_call":
+            return "Support call";
+        case "work_meeting":
+            return "Work meeting";
+        case "general":
+        default:
+            return "General";
+    }
+}
+
+function truncateEvidenceText(text: string, maxLength = 170): string {
+    const compact = text.replace(/\s+/g, " ").trim();
+    if (compact.length <= maxLength) return compact;
+    return `${compact.slice(0, maxLength).trim()}...`;
+}
+
+function EvidencePreview({
+    ids,
+    transcriptBySegmentId,
+    expanded,
+    onToggle,
+}: {
+    ids?: string[] | null;
+    transcriptBySegmentId: Map<string, TranscriptEntry>;
+    expanded: boolean;
+    onToggle: () => void;
+}) {
+    const evidenceIds = ids ?? [];
+    const entries = evidenceIds
+        .map((id) => transcriptBySegmentId.get(id))
+        .filter((entry): entry is TranscriptEntry => Boolean(entry));
+
+    return (
+        <div className="meeting-evidence">
+            <div className="meeting-evidence__summary">
+                <span>{evidenceLabel(evidenceIds)}</span>
+                {entries.length ? (
+                    <button type="button" className="meeting-evidence__toggle" onClick={onToggle}>
+                        {expanded ? "Hide evidence" : "Show evidence"}
+                    </button>
+                ) : evidenceIds.length ? (
+                    <span className="desktop-agent-muted">IDs: {evidenceIds.slice(0, 4).join(", ")}</span>
+                ) : null}
+            </div>
+            {expanded && entries.length ? (
+                <ul className="meeting-evidence__list">
+                    {entries.slice(0, 5).map((entry) => (
+                        <li key={entry.segment_id}>
+                            <strong>[{transcriptSourceLabel(entry.source)}] {entry.speaker_label ?? entry.speaker_id ?? "Unknown"}</strong>
+                            <span>{truncateEvidenceText(entry.text)}</span>
+                        </li>
+                    ))}
+                    {entries.length > 5 ? <li>{entries.length - 5} more evidence segment(s)</li> : null}
+                </ul>
+            ) : null}
+        </div>
+    );
+}
+
 function formatDurationMs(durationMs?: number | null): string {
     if (typeof durationMs !== "number") return "not measured";
     if (durationMs < 1000) return `${durationMs}ms`;
@@ -418,6 +485,8 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const [showClearConfirmation, setShowClearConfirmation] = useState(false);
     const [clearPhrase, setClearPhrase] = useState("");
     const [isGeneratingIntelligence, setIsGeneratingIntelligence] = useState(false);
+    const [isStoppingSession, setIsStoppingSession] = useState(false);
+    const [expandedEvidenceKeys, setExpandedEvidenceKeys] = useState<Record<string, boolean>>({});
 
     const meetingTools = useMemo(
         () => capabilities?.tools.filter((tool) => tool.category === "meeting") ?? [],
@@ -445,6 +514,10 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             }),
         [transcriptEntries]
     );
+    const transcriptBySegmentId = useMemo(
+        () => new Map(transcriptEntries.map((entry) => [entry.segment_id, entry])),
+        [transcriptEntries]
+    );
     const speakers = displayedState?.speakers ?? [];
     const notes = displayedState?.notes ?? [];
     const summaries = displayedState?.summary ?? [];
@@ -459,7 +532,17 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const microphoneMetrics = microphoneHealth?.metrics;
     const segmentsWritten = metrics?.segments_written ?? 0;
     const segmentsTranscribed = metrics?.segments_transcribed ?? 0;
-    const pendingSegments = Math.max(0, segmentsWritten - segmentsTranscribed);
+    const segmentsQueuedTotal = metrics?.segments_queued_total ?? metrics?.segments_queued ?? 0;
+    const currentQueueDepth = metrics?.current_queue_depth ?? 0;
+    const segmentsInFlight = metrics?.segments_in_flight ?? 0;
+    const segmentsFailed = metrics?.segments_failed ?? metrics?.segment_transcription_failures_total ?? 0;
+    const segmentTranscriptionTimeouts = metrics?.segment_transcription_timeouts ?? 0;
+    const pendingSegments = currentQueueDepth + segmentsInFlight;
+    const capturedWithoutTranscript =
+        segmentsWritten > 0 && segmentsTranscribed === 0 && transcriptEntries.length === 0;
+    const drainStatus = metrics?.segment_transcription_drain_status ?? "idle";
+    const drainTimedOut = metrics?.drain_timeout === true;
+    const finalizingStt = isStoppingSession || drainStatus === "running";
     const lastTranscriptAt = transcriptEntries.length
         ? displayedTranscriptEntries[0]?.timestamp
         : null;
@@ -597,10 +680,10 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             liveCapabilities?.capture_health.state === "capturing" ||
             currentStatusKind === "capturing";
         const isTranscribing =
-            isRecording &&
+            (isRecording || currentStatusKind === "stopping") &&
             (currentStatusKind === "transcribing" ||
                 pendingSegments > 0 ||
-                (metrics?.segments_queued ?? 0) > 0);
+                drainStatus === "running");
         const failureReason =
             statusFailureReason(currentStatus) ??
             liveCapabilities?.capture_health.last_error ??
@@ -642,7 +725,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 state: "transcribing",
                 title: "Transcribing",
                 description: `Astra is processing captured audio with the existing STT pipeline. Last transcript: ${relativeTimestamp(lastTranscriptAt)}.`,
-                nextAction: pendingSegments > 0 ? "Wait for queued segments to finish." : "Keep recording or stop when finished.",
+                nextAction: pendingSegments > 0 || drainStatus === "running" ? "Wait for queued segments to finish." : "Keep recording or stop when finished.",
                 blockingReasons: [],
                 isRecording,
                 isTranscribing,
@@ -1038,6 +1121,15 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         }
     }, [meeting, runOperation]);
 
+    const handleStopSession = useCallback(async () => {
+        try {
+            setIsStoppingSession(true);
+            await runOperation("stop session", meeting.stopSession);
+        } finally {
+            setIsStoppingSession(false);
+        }
+    }, [meeting, runOperation]);
+
     const handleClearIntelligence = useCallback(
         () => runOperation("clear intelligence", () => meeting.clearIntelligence()),
         [meeting, runOperation]
@@ -1055,6 +1147,23 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             setLastError(`copy follow-up draft: ${errorText(error)}`);
         }
     }, [intelligence]);
+
+    const renderEvidence = useCallback(
+        (key: string, ids?: string[] | null) => (
+            <EvidencePreview
+                ids={ids}
+                transcriptBySegmentId={transcriptBySegmentId}
+                expanded={expandedEvidenceKeys[key] === true}
+                onToggle={() =>
+                    setExpandedEvidenceKeys((prev) => ({
+                        ...prev,
+                        [key]: !prev[key],
+                    }))
+                }
+            />
+        ),
+        [expandedEvidenceKeys, transcriptBySegmentId]
+    );
 
     const scrollToTranscript = useCallback(() => {
         transcriptRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1196,8 +1305,8 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void runOperation("resume session", meeting.resumeSession)}>
                         Resume
                     </Button>
-                    <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void runOperation("stop session", meeting.stopSession)}>
-                        Stop
+                    <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleStopSession()}>
+                        {isStoppingSession ? "Finalizing..." : "Stop"}
                     </Button>
                     <Button variant="text" radius="full" size="xs" onClick={scrollToTranscript}>
                         Open transcript
@@ -1279,9 +1388,34 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <span>Segments transcribed: <strong>{segmentsTranscribed}</strong></span>
                     <span>System segments: <strong>{systemMetrics?.segments_written ?? 0}</strong></span>
                     <span>Mic segments: <strong>{microphoneMetrics?.segments_written ?? 0}</strong></span>
-                    <span>Queued: <strong>{metrics?.segments_queued ?? 0}</strong></span>
+                    <span>Queued total: <strong>{segmentsQueuedTotal}</strong></span>
+                    <span>Current queue: <strong>{currentQueueDepth}</strong></span>
+                    <span>In flight: <strong>{segmentsInFlight}</strong></span>
+                    <span>Failed: <strong>{segmentsFailed}</strong></span>
+                    <span>Drain: <strong>{drainTimedOut ? "timed out" : drainStatus}</strong></span>
                     <span>Silence dropped: <strong>{metrics?.dropped_silence_segments ?? 0}</strong></span>
                 </div>
+                {capturedWithoutTranscript ? (
+                    <div className="meeting-stt-warning">
+                        <strong>Audio segments were captured, but no transcript has been produced yet.</strong>
+                        <p>
+                            STT may be pending, unavailable, failed, or still finalizing. Current queue: {currentQueueDepth};
+                            in flight: {segmentsInFlight}; failures: {segmentsFailed}; timeouts: {segmentTranscriptionTimeouts}.
+                        </p>
+                    </div>
+                ) : null}
+                {finalizingStt ? (
+                    <div className="meeting-stt-warning">
+                        <strong>Finalizing transcription.</strong>
+                        <p>Capture stopped or is stopping; Astra is draining pending segment STT before completion.</p>
+                    </div>
+                ) : null}
+                {drainTimedOut ? (
+                    <div className="meeting-stt-warning meeting-stt-warning--error">
+                        <strong>Segment transcription did not finish before the drain timeout.</strong>
+                        <p>Check STT worker/device diagnostics. Export metadata will include the incomplete transcription state.</p>
+                    </div>
+                ) : null}
                 <div className="desktop-agent-inline-actions">
                     <Button
                         variant="secondary"
@@ -1458,14 +1592,22 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                             <span>Model: <strong>{intelligence.diagnostics.model_name ?? "none"}</strong></span>
                             <span>Endpoint: <strong>{intelligence.diagnostics.llm_endpoint ?? "not used"}</strong></span>
                             <span>Language: <strong>{languageLabel(intelligence.diagnostics.detected_language)}</strong></span>
+                            <span>Output: <strong>{languageLabel(intelligence.diagnostics.output_language)}</strong></span>
+                            <span>Session type: <strong>{sessionTypeLabel(intelligence.diagnostics.session_type)}</strong></span>
                             <span>Generation: <strong>{formatDurationMs(intelligence.diagnostics.total_generation_duration_ms ?? intelligence.diagnostics.llm_generation_duration_ms)}</strong></span>
                             <span>Segments: <strong>{intelligence.source_transcript_segment_count}</strong></span>
                             <span>LLM: <strong>{intelligence.diagnostics.llm_used ? "used" : "not used"}</strong></span>
                             <span>Fallback: <strong>{intelligence.diagnostics.fallback_used ? "yes" : "no"}</strong></span>
+                            <span>Language retry: <strong>{intelligence.diagnostics.language_retry_attempted ? (intelligence.diagnostics.language_retry_succeeded ? "succeeded" : "attempted") : "not needed"}</strong></span>
                             <span>Input: <strong>{intelligence.diagnostics.input_segment_count || intelligence.source_transcript_segment_count}</strong></span>
                             <span>Audit: <strong>{intelligence.diagnostics.audit_redacted ? "redacted" : "not redacted"}</strong></span>
                             <span>Transcript logged: <strong>{intelligence.diagnostics.transcript_text_logged ? "yes" : "no"}</strong></span>
                         </div>
+                        {intelligence.diagnostics.output_language_mismatch ? (
+                            <p className="meeting-intelligence-warning">
+                                Output language did not fully match the detected transcript language. Review the generated text or regenerate.
+                            </p>
+                        ) : null}
                         {intelligence.diagnostics.input_truncated ? (
                             <p className="meeting-intelligence-warning">
                                 Local model input was truncated to {intelligence.diagnostics.input_segment_count} segment(s)
@@ -1510,7 +1652,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                         ))}
                                     </ul>
                                 ) : null}
-                                <span>{evidenceLabel(intelligence.summary.evidence_segment_ids)}</span>
+                                {renderEvidence(`summary-${intelligence.summary.id}`, intelligence.summary.evidence_segment_ids)}
                             </article>
                         ) : null}
 
@@ -1523,8 +1665,10 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                 {intelligence.decisions.length ? intelligence.decisions.map((decision) => (
                                     <div key={decision.id} className="meeting-generated-item">
                                         <p>{decision.decision}</p>
+                                        {decision.rationale ? <span>Rationale: {decision.rationale}</span> : null}
                                         {decision.made_by_display_name ? <span>By: {decision.made_by_display_name}</span> : null}
-                                        <span>{evidenceLabel(decision.evidence_segment_ids)}</span>
+                                        <span>{confidenceLabel(decision.confidence)}</span>
+                                        {renderEvidence(`decision-${decision.id}`, decision.evidence_segment_ids)}
                                     </div>
                                 )) : <p className="desktop-agent-muted">No evidence-backed decisions detected.</p>}
                             </article>
@@ -1539,7 +1683,9 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                         <p>{item.task}</p>
                                         <span>{item.assignee_display_name ? `Assignee: ${item.assignee_display_name}` : "Assignee: not detected"}</span>
                                         {item.due_date ? <span>Due: {item.due_date}</span> : null}
-                                        <span>{evidenceLabel(item.evidence_segment_ids)}</span>
+                                        <span>Status: {item.status}</span>
+                                        <span>{confidenceLabel(item.confidence)}</span>
+                                        {renderEvidence(`action-${item.id}`, item.evidence_segment_ids)}
                                     </div>
                                 )) : <p className="desktop-agent-muted">No evidence-backed action items detected.</p>}
                             </article>
@@ -1555,7 +1701,8 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                     <div key={question.id} className="meeting-generated-item">
                                         <p>{question.question}</p>
                                         {question.asked_by_display_name ? <span>Asked by: {question.asked_by_display_name}</span> : null}
-                                        <span>{evidenceLabel(question.evidence_segment_ids)}</span>
+                                        <span>{confidenceLabel(question.confidence)}</span>
+                                        {renderEvidence(`question-${question.id}`, question.evidence_segment_ids)}
                                     </div>
                                 )) : <p className="desktop-agent-muted">No unresolved questions detected.</p>}
                             </article>
@@ -1569,7 +1716,8 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                     <div key={risk.id} className="meeting-generated-item">
                                         <p>{risk.risk}</p>
                                         <span>Severity: {risk.severity}</span>
-                                        <span>{evidenceLabel(risk.evidence_segment_ids)}</span>
+                                        <span>{confidenceLabel(risk.confidence)}</span>
+                                        {renderEvidence(`risk-${risk.id}`, risk.evidence_segment_ids)}
                                     </div>
                                 )) : <p className="desktop-agent-muted">No grounded risks detected.</p>}
                             </article>
@@ -1594,6 +1742,10 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                         {intelligence.technical_recap.mentioned_commands.length ? (
                                             <span>Commands: {intelligence.technical_recap.mentioned_commands.join(", ")}</span>
                                         ) : null}
+                                        {intelligence.technical_recap.mentioned_errors.length ? (
+                                            <span>Errors: {intelligence.technical_recap.mentioned_errors.join(", ")}</span>
+                                        ) : null}
+                                        {renderEvidence(`technical-${intelligence.technical_recap.id}`, intelligence.technical_recap.evidence_segment_ids)}
                                     </>
                                 ) : <p className="desktop-agent-muted">No grounded technical details detected.</p>}
                             </article>
@@ -1607,7 +1759,8 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                     <div className="meeting-followup-draft">
                                         <strong>{intelligence.follow_up_draft.subject}</strong>
                                         <pre>{intelligence.follow_up_draft.body}</pre>
-                                        <span>{evidenceLabel(intelligence.follow_up_draft.evidence_segment_ids)}</span>
+                                        <span>{confidenceLabel(intelligence.follow_up_draft.confidence)}</span>
+                                        {renderEvidence(`followup-${intelligence.follow_up_draft.id}`, intelligence.follow_up_draft.evidence_segment_ids)}
                                     </div>
                                 ) : <p className="desktop-agent-muted">No follow-up draft generated.</p>}
                             </article>
@@ -1625,6 +1778,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                             <span>{formatTimelineTime(item.timestamp_ms)}</span>
                                             <strong>{item.speaker_display_name ?? "Unknown"}</strong>
                                             <p>{item.detail || item.title}</p>
+                                            {renderEvidence(`timeline-${item.id}`, item.evidence_segment_ids)}
                                         </div>
                                     ))}
                                 </div>
@@ -1908,11 +2062,21 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <p>Segments: <strong>{segmentsWritten}</strong></p>
                         <p>System segments: <strong>{systemMetrics?.segments_written ?? 0} / {systemMetrics?.segments_transcribed ?? 0}</strong></p>
                         <p>Microphone segments: <strong>{microphoneMetrics?.segments_written ?? 0} / {microphoneMetrics?.segments_transcribed ?? 0}</strong></p>
-                        <p>Queued: <strong>{metrics?.segments_queued ?? 0}</strong></p>
+                        <p>Queued total: <strong>{segmentsQueuedTotal}</strong></p>
+                        <p>Current queue: <strong>{currentQueueDepth}</strong></p>
+                        <p>Dequeued: <strong>{metrics?.segments_dequeued_total ?? 0}</strong></p>
+                        <p>In flight: <strong>{segmentsInFlight}</strong></p>
                         <p>Transcribed: <strong>{segmentsTranscribed}</strong></p>
-                        <p>STT failures: <strong>{metrics?.segment_transcription_failures_total ?? metrics?.segment_transcription_failures ?? 0}</strong></p>
+                        <p>STT failures: <strong>{segmentsFailed}</strong></p>
+                        <p>STT timeouts: <strong>{segmentTranscriptionTimeouts}</strong></p>
                         <p>Consecutive STT failures: <strong>{metrics?.segment_transcription_failures_consecutive ?? 0}</strong></p>
                         <p>Last STT error: <strong>{metrics?.last_segment_transcription_error_kind ?? "none"}</strong></p>
+                        <p>Last STT started: <strong>{metrics?.last_transcription_started_segment_id ?? "none"}</strong></p>
+                        <p>Last STT completed: <strong>{metrics?.last_transcription_completed_segment_id ?? "none"}</strong></p>
+                        <p>Last STT failed: <strong>{metrics?.last_transcription_failed_segment_id ?? "none"}</strong></p>
+                        <p>Drain: <strong>{drainTimedOut ? "timed out" : drainStatus}</strong></p>
+                        <p>Drain started: <strong>{metrics?.drain_started_at ?? "none"}</strong></p>
+                        <p>Drain completed: <strong>{metrics?.drain_completed_at ?? "none"}</strong></p>
                         <p>Dropped: <strong>{metrics?.segments_dropped ?? 0}</strong></p>
                         <p>Silence dropped: <strong>{metrics?.dropped_silence_segments ?? 0}</strong></p>
                         <p>Silence frames skipped: <strong>{metrics?.silence_frames_skipped ?? 0}</strong></p>
