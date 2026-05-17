@@ -14,7 +14,7 @@ use std::{
     env,
     future::Future,
     pin::Pin,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_SUMMARY_BULLETS: usize = 6;
@@ -24,11 +24,46 @@ const MAX_OPEN_QUESTIONS: usize = 40;
 const MAX_RISKS: usize = 30;
 const MAX_TIMELINE_ITEMS: usize = 40;
 const MAX_TECHNICAL_ITEMS: usize = 12;
-const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_MEETING_LLM_CANDIDATES: &str = "gpt-oss:20b,qwen3:14b,qwen3:8b,llama3.1:8b";
 const DEFAULT_PROMPT_MAX_CHARS_TOTAL: usize = 24_000;
 const DEFAULT_PROMPT_MAX_CHARS_PER_SEGMENT: usize = 900;
 const DEFAULT_MEETING_LLM_TIMEOUT_SECS: u64 = 45;
+const ITALIAN_LANGUAGE_MARKERS: &[&str] = &[
+    "che",
+    "di",
+    "del",
+    "della",
+    "delle",
+    "il",
+    "lo",
+    "la",
+    "gli",
+    "le",
+    "un",
+    "una",
+    "per",
+    "con",
+    "non",
+    "sono",
+    "abbiamo",
+    "deve",
+    "dobbiamo",
+    "quindi",
+    "perche",
+    "perché",
+    "anche",
+    "questo",
+    "questa",
+    "grazie",
+    "ciao",
+    "buongiorno",
+    "allora",
+];
+const ENGLISH_LANGUAGE_MARKERS: &[&str] = &[
+    "the", "and", "that", "this", "with", "for", "not", "we", "you", "should", "need", "because",
+    "about", "then", "also", "thanks", "hello", "meeting", "please",
+];
 
 #[derive(Debug, Clone)]
 pub struct MeetingIntelligenceInput {
@@ -38,7 +73,7 @@ pub struct MeetingIntelligenceInput {
     pub generation_options: MeetingIntelligenceGenerationOptions,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MeetingLlmPromptStats {
     pub input_segment_count: usize,
     pub input_truncated: bool,
@@ -47,6 +82,9 @@ pub struct MeetingLlmPromptStats {
     pub max_chars_total: usize,
     pub max_chars_per_segment: usize,
     pub included_segment_ids: Vec<String>,
+    pub detected_language: MeetingLanguage,
+    pub language_confidence: f32,
+    pub language_source: MeetingLanguageSource,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +112,8 @@ pub struct MeetingLlmRawOutput {
     pub provider: String,
     pub model: String,
     pub stats: MeetingLlmPromptStats,
+    pub endpoint: Option<String>,
+    pub llm_generation_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,13 +124,15 @@ pub enum MeetingLlmErrorKind {
     InvalidResponse,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MeetingLlmError {
     pub kind: MeetingLlmErrorKind,
     pub message: String,
     pub provider: String,
     pub model: Option<String>,
     pub stats: MeetingLlmPromptStats,
+    pub endpoint: Option<String>,
+    pub llm_generation_duration_ms: Option<u64>,
 }
 
 impl MeetingLlmError {
@@ -101,6 +143,8 @@ impl MeetingLlmError {
             provider: "ollama".to_string(),
             model: None,
             stats,
+            endpoint: None,
+            llm_generation_duration_ms: None,
         }
     }
 
@@ -109,6 +153,8 @@ impl MeetingLlmError {
         message: impl Into<String>,
         model: Option<String>,
         stats: MeetingLlmPromptStats,
+        endpoint: Option<String>,
+        llm_generation_duration_ms: Option<u64>,
     ) -> Self {
         Self {
             kind,
@@ -116,6 +162,8 @@ impl MeetingLlmError {
             provider: "ollama".to_string(),
             model,
             stats,
+            endpoint,
+            llm_generation_duration_ms,
         }
     }
 
@@ -144,6 +192,8 @@ pub trait MeetingIntelligenceLlm: Send + Sync {
 pub struct OllamaMeetingIntelligenceLlm {
     client: Client,
     timeout: Duration,
+    base_url: String,
+    sanitized_endpoint: String,
 }
 
 impl OllamaMeetingIntelligenceLlm {
@@ -153,9 +203,13 @@ impl OllamaMeetingIntelligenceLlm {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| (1..=300).contains(value))
             .unwrap_or(DEFAULT_MEETING_LLM_TIMEOUT_SECS);
+        let base_url = configured_ollama_base_url();
+        let sanitized_endpoint = sanitize_ollama_endpoint(&base_url);
         Self {
             client: Client::new(),
             timeout: Duration::from_secs(timeout_secs),
+            base_url,
+            sanitized_endpoint,
         }
     }
 
@@ -184,7 +238,7 @@ impl OllamaMeetingIntelligenceLlm {
     async fn fetch_installed_models(&self) -> Result<Vec<String>, String> {
         let response = self
             .client
-            .get(format!("{OLLAMA_BASE_URL}/api/tags"))
+            .get(format!("{}/api/tags", self.base_url))
             .send()
             .await
             .map_err(|error| format!("Ollama tags request failed: {error}"))?;
@@ -226,7 +280,7 @@ impl OllamaMeetingIntelligenceLlm {
 
         let response = self
             .client
-            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .post(format!("{}/api/chat", self.base_url))
             .json(&payload)
             .send()
             .await
@@ -269,11 +323,15 @@ impl MeetingIntelligenceLlm for OllamaMeetingIntelligenceLlm {
         input: MeetingLlmPromptInput,
     ) -> MeetingLlmFuture<'a> {
         Box::pin(async move {
+            let started_at = Instant::now();
             let stats = input.stats.clone();
             let model = match self.select_model().await {
                 Ok(model) => model,
                 Err(error) => {
-                    return Err(MeetingLlmError::unavailable(error, stats));
+                    let mut llm_error = MeetingLlmError::unavailable(error, stats);
+                    llm_error.endpoint = Some(self.sanitized_endpoint.clone());
+                    llm_error.llm_generation_duration_ms = Some(elapsed_ms(started_at));
+                    return Err(llm_error);
                 }
             };
             let call = self.call_model(&model, &input);
@@ -283,6 +341,8 @@ impl MeetingIntelligenceLlm for OllamaMeetingIntelligenceLlm {
                     provider: "ollama".to_string(),
                     model,
                     stats: input.stats,
+                    endpoint: Some(self.sanitized_endpoint.clone()),
+                    llm_generation_duration_ms: Some(elapsed_ms(started_at)),
                 }),
                 Ok(Err(error)) => {
                     let kind = if error.contains("empty response")
@@ -298,6 +358,8 @@ impl MeetingIntelligenceLlm for OllamaMeetingIntelligenceLlm {
                         error,
                         Some(model),
                         input.stats,
+                        Some(self.sanitized_endpoint.clone()),
+                        Some(elapsed_ms(started_at)),
                     ))
                 }
                 Err(_) => Err(MeetingLlmError::with_kind(
@@ -305,6 +367,8 @@ impl MeetingIntelligenceLlm for OllamaMeetingIntelligenceLlm {
                     "Ollama meeting intelligence request timed out",
                     Some(model),
                     input.stats,
+                    Some(self.sanitized_endpoint.clone()),
+                    Some(elapsed_ms(started_at)),
                 )),
             }
         })
@@ -350,6 +414,8 @@ impl MeetingIntelligenceEngine {
             provider: "ollama".to_string(),
             model: model_name.unwrap_or("local").to_string(),
             stats: prompt_stats_for_input(&input),
+            endpoint: None,
+            llm_generation_duration_ms: None,
         });
         Self::generate_with_llm_output_or_rule_based(input, output, None)
     }
@@ -382,6 +448,8 @@ impl MeetingIntelligenceEngine {
             fallback.diagnostics.degraded_reason = Some(error.message);
             fallback.diagnostics.model_provider = Some(error.provider);
             fallback.diagnostics.model_name = error.model;
+            fallback.diagnostics.llm_endpoint = error.endpoint;
+            fallback.diagnostics.llm_generation_duration_ms = error.llm_generation_duration_ms;
             apply_prompt_stats(&mut fallback.diagnostics, &error.stats);
             return Ok(fallback);
         }
@@ -418,6 +486,8 @@ impl MeetingIntelligenceEngine {
                 };
                 result.diagnostics.model_provider = Some(output.provider);
                 result.diagnostics.model_name = Some(output.model);
+                result.diagnostics.llm_endpoint = output.endpoint;
+                result.diagnostics.llm_generation_duration_ms = output.llm_generation_duration_ms;
                 result.diagnostics.llm_used = true;
                 result.diagnostics.fallback_used = false;
                 apply_prompt_stats(&mut result.diagnostics, &output.stats);
@@ -444,6 +514,8 @@ impl MeetingIntelligenceEngine {
                     Some("local model output failed schema or evidence validation".to_string());
                 fallback.diagnostics.model_provider = Some(output.provider);
                 fallback.diagnostics.model_name = Some(output.model);
+                fallback.diagnostics.llm_endpoint = output.endpoint;
+                fallback.diagnostics.llm_generation_duration_ms = output.llm_generation_duration_ms;
                 apply_prompt_stats(&mut fallback.diagnostics, &output.stats);
                 Ok(fallback)
             }
@@ -458,7 +530,7 @@ impl MeetingIntelligenceEngine {
         let draft = match serde_json::from_str::<LlmMeetingIntelligenceDraft>(raw_json) {
             Ok(value) => value,
             Err(_) => {
-                return Err(base_diagnostics(
+                let mut diagnostics = base_diagnostics(
                     MeetingIntelligenceStatus::Failed,
                     ArtifactGenerator::LocalLlm {
                         provider: "ollama".to_string(),
@@ -470,7 +542,10 @@ impl MeetingIntelligenceEngine {
                     0,
                     false,
                     Vec::new(),
-                ));
+                );
+                let language_detection = detect_meeting_language(&input.transcript_entries);
+                apply_language_detection(&mut diagnostics, &language_detection);
+                return Err(diagnostics);
             }
         };
 
@@ -718,6 +793,8 @@ impl MeetingIntelligenceEngine {
             stats.warnings,
         );
         diagnostics.llm_used = true;
+        let language_detection = detect_meeting_language(&input.transcript_entries);
+        apply_language_detection(&mut diagnostics, &language_detection);
 
         Ok(MeetingIntelligenceResult {
             session_id: input.session_id.clone(),
@@ -762,7 +839,7 @@ impl MeetingIntelligenceEngine {
         ));
         let timeline = rule_based_timeline(input);
 
-        let diagnostics = base_diagnostics(
+        let mut diagnostics = base_diagnostics(
             status.clone(),
             generator,
             unavailable_reason,
@@ -772,6 +849,8 @@ impl MeetingIntelligenceEngine {
             status == MeetingIntelligenceStatus::Degraded,
             warnings,
         );
+        let language_detection = detect_meeting_language(&input.transcript_entries);
+        apply_language_detection(&mut diagnostics, &language_detection);
 
         MeetingIntelligenceResult {
             session_id: input.session_id.clone(),
@@ -854,6 +933,7 @@ pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> Meeti
     }
 
     selected_rev.reverse();
+    let language_detection = detect_prompt_language(&selected_rev);
     let included_segment_ids = selected_rev
         .iter()
         .map(|segment| segment.segment_id.clone())
@@ -866,6 +946,9 @@ pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> Meeti
         max_chars_total,
         max_chars_per_segment,
         included_segment_ids,
+        detected_language: language_detection.language,
+        language_confidence: language_detection.confidence,
+        language_source: language_detection.source,
     };
     let prompt = meeting_llm_user_prompt(input, &selected_rev, &stats);
     MeetingLlmPromptInput {
@@ -878,6 +961,7 @@ pub fn build_meeting_llm_prompt_input(input: &MeetingIntelligenceInput) -> Meeti
 
 fn prompt_stats_for_input(input: &MeetingIntelligenceInput) -> MeetingLlmPromptStats {
     let bounded = bounded_input(input.clone());
+    let language_detection = detect_meeting_language(&bounded.transcript_entries);
     MeetingLlmPromptStats {
         input_segment_count: bounded.transcript_entries.len(),
         input_truncated: input.transcript_entries.len() != bounded.transcript_entries.len(),
@@ -897,6 +981,9 @@ fn prompt_stats_for_input(input: &MeetingIntelligenceInput) -> MeetingLlmPromptS
             .iter()
             .map(|entry| entry.segment_id.clone())
             .collect(),
+        detected_language: language_detection.language,
+        language_confidence: language_detection.confidence,
+        language_source: language_detection.source,
     }
 }
 
@@ -932,6 +1019,9 @@ fn apply_prompt_stats(
     diagnostics.max_segments = stats.max_segments;
     diagnostics.max_chars_total = stats.max_chars_total;
     diagnostics.max_chars_per_segment = stats.max_chars_per_segment;
+    diagnostics.detected_language = stats.detected_language;
+    diagnostics.language_confidence = stats.language_confidence;
+    diagnostics.language_source = stats.language_source;
     if stats.input_truncated
         && !diagnostics.warnings.iter().any(|warning| {
             warning == "Local model input was truncated to bounded transcript context"
@@ -964,6 +1054,7 @@ fn base_diagnostics(
         generator,
         model_provider: provider,
         model_name: model,
+        llm_endpoint: None,
         degraded_reason: unavailable_reason.clone(),
         model_unavailable_reason: unavailable_reason,
         llm_used: false,
@@ -977,6 +1068,11 @@ fn base_diagnostics(
         max_segments: 0,
         max_chars_total: 0,
         max_chars_per_segment: 0,
+        detected_language: MeetingLanguage::Unknown,
+        language_confidence: 0.0,
+        language_source: MeetingLanguageSource::Unknown,
+        llm_generation_duration_ms: None,
+        total_generation_duration_ms: None,
         transcript_changed_during_generation: false,
         snapshot_transcript_segment_count: 0,
         transcript_text_logged: false,
@@ -1026,13 +1122,16 @@ fn meeting_llm_user_prompt(
         serde_json::to_string_pretty(&speaker_registry).unwrap_or_else(|_| "[]".to_string());
     let transcript_json =
         serde_json::to_string_pretty(&transcript).unwrap_or_else(|_| "[]".to_string());
+    let language_instruction = meeting_language_instruction(stats.detected_language);
 
     format!(
         r#"Generate transcript-backed meeting intelligence for session "{session_id}".
 
-Language:
-- Generate artifacts in the dominant language of the transcript.
-- If mixed, prefer the user's/local microphone language when clear.
+Output language:
+- Detected transcript language: {detected_language} (confidence {language_confidence}, source {language_source}).
+{language_instruction}
+- Keep JSON keys exactly as specified in English. Only user-facing string values should follow the output language.
+- Do not switch to English unless the transcript is primarily English or a direct quote requires it.
 
 Bounded input:
 - input_segment_count: {input_segment_count}
@@ -1132,6 +1231,10 @@ Rules:
         max_segments = stats.max_segments,
         max_chars_total = stats.max_chars_total,
         max_chars_per_segment = stats.max_chars_per_segment,
+        detected_language = meeting_language_label(stats.detected_language),
+        language_confidence = format!("{:.2}", stats.language_confidence),
+        language_source = meeting_language_source_label(stats.language_source),
+        language_instruction = language_instruction,
         speaker_json = speaker_json,
         transcript_json = transcript_json
     )
@@ -1143,6 +1246,242 @@ fn configured_usize(key: &str, default: usize, min: usize, max: usize) -> usize 
         .and_then(|value| value.parse::<usize>().ok())
         .map(|value| value.clamp(min, max))
         .unwrap_or(default)
+}
+
+fn configured_ollama_base_url() -> String {
+    let astra_url = env::var("ASTRA_OLLAMA_BASE_URL").ok();
+    let ollama_host = env::var("OLLAMA_HOST").ok();
+    configured_ollama_base_url_from(astra_url.as_deref(), ollama_host.as_deref())
+}
+
+fn configured_ollama_base_url_from(astra_url: Option<&str>, ollama_host: Option<&str>) -> String {
+    astra_url
+        .and_then(normalize_ollama_base_url)
+        .or_else(|| ollama_host.and_then(normalize_ollama_base_url))
+        .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
+}
+
+fn normalize_ollama_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        Some(format!("http://{trimmed}"))
+    }
+}
+
+fn sanitize_ollama_endpoint(value: &str) -> String {
+    let without_scheme = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .unwrap_or(value);
+    let host = without_scheme.split('/').next().unwrap_or("").trim();
+    if host.is_empty() || host.contains('@') {
+        return "configured endpoint".to_string();
+    }
+    if host.starts_with("127.0.0.1")
+        || host.starts_with("localhost")
+        || host.starts_with("0.0.0.0")
+        || host.starts_with("[::1]")
+    {
+        host.to_string()
+    } else {
+        "configured endpoint".to_string()
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeetingLanguageDetection {
+    language: MeetingLanguage,
+    confidence: f32,
+    source: MeetingLanguageSource,
+}
+
+impl Default for MeetingLanguageDetection {
+    fn default() -> Self {
+        Self {
+            language: MeetingLanguage::Unknown,
+            confidence: 0.0,
+            source: MeetingLanguageSource::Unknown,
+        }
+    }
+}
+
+fn detect_meeting_language(entries: &[TranscriptEntry]) -> MeetingLanguageDetection {
+    let mut total_italian = 0.0f32;
+    let mut total_english = 0.0f32;
+    let mut local_italian = 0.0f32;
+    let mut local_english = 0.0f32;
+
+    for entry in entries {
+        let (italian, english) = score_language_markers(&entry.text);
+        let is_local = entry.source == TranscriptSource::Microphone
+            || entry.speaker_id.as_deref() == Some(LOCAL_USER_SPEAKER_ID);
+        let weight = if is_local { 1.6 } else { 1.0 };
+        total_italian += italian * weight;
+        total_english += english * weight;
+        if is_local {
+            local_italian += italian * weight;
+            local_english += english * weight;
+        }
+    }
+
+    choose_language_detection(total_italian, total_english, local_italian, local_english)
+}
+
+fn detect_prompt_language(segments: &[MeetingLlmPromptSegment]) -> MeetingLanguageDetection {
+    let mut total_italian = 0.0f32;
+    let mut total_english = 0.0f32;
+    let mut local_italian = 0.0f32;
+    let mut local_english = 0.0f32;
+
+    for segment in segments {
+        let (italian, english) = score_language_markers(&segment.text);
+        let is_local = segment.source == TranscriptSource::Microphone
+            || segment.speaker_id.as_deref() == Some(LOCAL_USER_SPEAKER_ID);
+        let weight = if is_local { 1.6 } else { 1.0 };
+        total_italian += italian * weight;
+        total_english += english * weight;
+        if is_local {
+            local_italian += italian * weight;
+            local_english += english * weight;
+        }
+    }
+
+    choose_language_detection(total_italian, total_english, local_italian, local_english)
+}
+
+fn choose_language_detection(
+    total_italian: f32,
+    total_english: f32,
+    local_italian: f32,
+    local_english: f32,
+) -> MeetingLanguageDetection {
+    let local_total = local_italian + local_english;
+    if local_total >= 2.0 {
+        if local_italian > 0.0 && local_italian >= local_english * 1.2 {
+            return MeetingLanguageDetection {
+                language: MeetingLanguage::Italian,
+                confidence: language_confidence(local_italian, local_english),
+                source: MeetingLanguageSource::UserSourceWeighted,
+            };
+        }
+        if local_english > 0.0 && local_english >= local_italian * 1.2 {
+            return MeetingLanguageDetection {
+                language: MeetingLanguage::English,
+                confidence: language_confidence(local_english, local_italian),
+                source: MeetingLanguageSource::UserSourceWeighted,
+            };
+        }
+    }
+
+    let total = total_italian + total_english;
+    if total < 2.0 {
+        return MeetingLanguageDetection::default();
+    }
+    if total_italian > 0.0 && total_english > 0.0 {
+        let larger = total_italian.max(total_english);
+        let smaller = total_italian.min(total_english);
+        if larger / smaller < 1.35 {
+            return MeetingLanguageDetection {
+                language: MeetingLanguage::Mixed,
+                confidence: 1.0 - ((larger - smaller) / total),
+                source: MeetingLanguageSource::TranscriptHeuristic,
+            };
+        }
+    }
+
+    if total_italian > total_english {
+        MeetingLanguageDetection {
+            language: MeetingLanguage::Italian,
+            confidence: language_confidence(total_italian, total_english),
+            source: MeetingLanguageSource::TranscriptHeuristic,
+        }
+    } else {
+        MeetingLanguageDetection {
+            language: MeetingLanguage::English,
+            confidence: language_confidence(total_english, total_italian),
+            source: MeetingLanguageSource::TranscriptHeuristic,
+        }
+    }
+}
+
+fn score_language_markers(text: &str) -> (f32, f32) {
+    let mut italian = 0.0f32;
+    let mut english = 0.0f32;
+    for token in text
+        .to_lowercase()
+        .split(|character: char| !character.is_alphabetic() && character != '\'')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if ITALIAN_LANGUAGE_MARKERS.contains(&token) {
+            italian += 1.0;
+        }
+        if ENGLISH_LANGUAGE_MARKERS.contains(&token) {
+            english += 1.0;
+        }
+    }
+    (italian, english)
+}
+
+fn language_confidence(primary: f32, secondary: f32) -> f32 {
+    let total = primary + secondary;
+    if total <= f32::EPSILON {
+        0.0
+    } else {
+        ((primary - secondary).abs() / total).clamp(0.0, 1.0)
+    }
+}
+
+fn apply_language_detection(
+    diagnostics: &mut MeetingIntelligenceDiagnostics,
+    detection: &MeetingLanguageDetection,
+) {
+    diagnostics.detected_language = detection.language;
+    diagnostics.language_confidence = detection.confidence;
+    diagnostics.language_source = detection.source;
+}
+
+fn meeting_language_label(language: MeetingLanguage) -> &'static str {
+    match language {
+        MeetingLanguage::Italian => "Italian",
+        MeetingLanguage::English => "English",
+        MeetingLanguage::Mixed => "Mixed",
+        MeetingLanguage::Unknown => "Unknown",
+    }
+}
+
+fn meeting_language_source_label(source: MeetingLanguageSource) -> &'static str {
+    match source {
+        MeetingLanguageSource::TranscriptHeuristic => "transcript_heuristic",
+        MeetingLanguageSource::UserSourceWeighted => "user_source_weighted",
+        MeetingLanguageSource::Unknown => "unknown",
+    }
+}
+
+fn meeting_language_instruction(language: MeetingLanguage) -> &'static str {
+    match language {
+        MeetingLanguage::Italian => {
+            "- Generate every user-facing string value in natural professional Italian.\n- The follow-up subject and body must be Italian; do not use \"Hi\" or \"Best\"."
+        }
+        MeetingLanguage::English => {
+            "- Generate every user-facing string value in professional English.\n- The follow-up subject and body must be English."
+        }
+        MeetingLanguage::Mixed => {
+            "- Prefer the local user/microphone dominant language when clear.\n- If a specific item is only supported by another language in the transcript, preserve that item language instead of inventing a translation."
+        }
+        MeetingLanguage::Unknown => {
+            "- Preserve the transcript's natural language where detectable from the provided entries.\n- If language remains unclear, use concise professional language without inventing context."
+        }
+    }
 }
 
 fn select_first_available(candidates: &[String], installed_models: &[String]) -> Option<String> {
@@ -1186,22 +1525,58 @@ fn rule_based_summary(
     let evidence = all_evidence(input);
     let speakers = speaker_names(input);
     let topics = extract_topics(&input.transcript_entries);
+    let italian = matches!(
+        detect_meeting_language(&input.transcript_entries).language,
+        MeetingLanguage::Italian
+    );
     let mut bullets = Vec::new();
     bullets.push(format!(
-        "Transcript contains {} grounded segments from {}.",
+        "{} {} {} {}.",
+        if italian {
+            "La trascrizione contiene"
+        } else {
+            "Transcript contains"
+        },
         input.transcript_entries.len(),
+        if italian {
+            "segmenti verificati da"
+        } else {
+            "grounded segments from"
+        },
         if speakers.is_empty() {
-            "unknown speakers".to_string()
+            if italian {
+                "speaker sconosciuti".to_string()
+            } else {
+                "unknown speakers".to_string()
+            }
         } else {
             speakers.join(", ")
         }
     ));
     if !topics.is_empty() {
-        bullets.push(format!("Main repeated terms: {}.", topics.join(", ")));
+        bullets.push(format!(
+            "{}: {}.",
+            if italian {
+                "Termini principali ricorrenti"
+            } else {
+                "Main repeated terms"
+            },
+            topics.join(", ")
+        ));
     }
     bullets.push(format!(
-        "Derived artifacts are evidence-linked to {} transcript segment(s).",
-        evidence.len()
+        "{} {} {}.",
+        if italian {
+            "Gli artefatti derivati sono collegati a"
+        } else {
+            "Derived artifacts are evidence-linked to"
+        },
+        evidence.len(),
+        if italian {
+            "segmenti della trascrizione"
+        } else {
+            "transcript segment(s)"
+        }
     ));
 
     MeetingSummary {
@@ -1387,10 +1762,22 @@ fn rule_based_follow_up_draft(
     questions: &[MeetingOpenQuestion],
     risks: &[MeetingRisk],
 ) -> MeetingFollowUpDraft {
-    let mut body =
-        String::from("Hi,\n\nHere is the transcript-backed recap from the work session.\n\n");
+    let language = detect_meeting_language(&input.transcript_entries).language;
+    let italian = matches!(language, MeetingLanguage::Italian);
+    let mut body = if italian {
+        String::from(
+            "Ciao,\n\n\
+             di seguito trovi un riepilogo basato sulla trascrizione della sessione.\n\n",
+        )
+    } else {
+        String::from("Hi,\n\nHere is the transcript-backed recap from the work session.\n\n")
+    };
     if let Some(summary) = summary {
-        body.push_str("Summary:\n");
+        body.push_str(if italian {
+            "Riepilogo:\n"
+        } else {
+            "Summary:\n"
+        });
         for bullet in &summary.bullets {
             body.push_str("- ");
             body.push_str(bullet);
@@ -1399,7 +1786,11 @@ fn rule_based_follow_up_draft(
         body.push('\n');
     }
     if !decisions.is_empty() {
-        body.push_str("Decisions:\n");
+        body.push_str(if italian {
+            "Decisioni:\n"
+        } else {
+            "Decisions:\n"
+        });
         for decision in decisions.iter().take(6) {
             body.push_str("- ");
             body.push_str(&decision.decision);
@@ -1408,7 +1799,11 @@ fn rule_based_follow_up_draft(
         body.push('\n');
     }
     if !action_items.is_empty() {
-        body.push_str("Action items:\n");
+        body.push_str(if italian {
+            "Azioni da completare:\n"
+        } else {
+            "Action items:\n"
+        });
         for item in action_items.iter().take(8) {
             body.push_str("- ");
             body.push_str(&item.task);
@@ -1422,7 +1817,11 @@ fn rule_based_follow_up_draft(
         body.push('\n');
     }
     if !questions.is_empty() {
-        body.push_str("Open questions:\n");
+        body.push_str(if italian {
+            "Domande aperte:\n"
+        } else {
+            "Open questions:\n"
+        });
         for question in questions.iter().take(6) {
             body.push_str("- ");
             body.push_str(&question.question);
@@ -1431,7 +1830,11 @@ fn rule_based_follow_up_draft(
         body.push('\n');
     }
     if !risks.is_empty() {
-        body.push_str("Risks / blockers:\n");
+        body.push_str(if italian {
+            "Rischi / blocchi:\n"
+        } else {
+            "Risks / blockers:\n"
+        });
         for risk in risks.iter().take(6) {
             body.push_str("- ");
             body.push_str(&risk.risk);
@@ -1439,12 +1842,16 @@ fn rule_based_follow_up_draft(
         }
         body.push('\n');
     }
-    body.push_str("Best,\n");
+    body.push_str(if italian { "Saluti\n" } else { "Best,\n" });
 
     MeetingFollowUpDraft {
         id: new_meeting_artifact_id(),
         session_id: input.session_id.clone(),
-        subject: "Follow-up: meeting recap".to_string(),
+        subject: if italian {
+            "Riepilogo della sessione".to_string()
+        } else {
+            "Follow-up: meeting recap".to_string()
+        },
         body,
         tone: FollowUpTone::Professional,
         evidence_segment_ids: all_evidence(input),
@@ -1873,6 +2280,35 @@ mod tests {
         }
     }
 
+    fn italian_input() -> MeetingIntelligenceInput {
+        let mut input = input();
+        input.transcript_entries.clear();
+        let mut first = TranscriptEntry::sourced(
+            "session",
+            TranscriptSource::Microphone,
+            "You",
+            "Ciao, dobbiamo chiudere questa milestone perché il riepilogo deve essere in italiano e non in inglese.",
+            0.94,
+        );
+        first.segment_id = "seg-it-1".to_string();
+        first.speaker_id = Some(LOCAL_USER_SPEAKER_ID.to_string());
+        first.speaker_label = Some("You".to_string());
+        first.start_ms = Some(0);
+        let mut second = TranscriptEntry::sourced(
+            "session",
+            TranscriptSource::SystemAudio,
+            "Speaker 1",
+            "Abbiamo deciso che anche la bozza di follow-up deve usare un tono professionale italiano.",
+            0.9,
+        );
+        second.segment_id = "seg-it-2".to_string();
+        second.speaker_id = Some(REMOTE_SPEAKER_1_ID.to_string());
+        second.speaker_label = Some("Speaker 1".to_string());
+        second.start_ms = Some(1_000);
+        input.transcript_entries = vec![first, second];
+        input
+    }
+
     #[test]
     fn invalid_llm_json_falls_back_with_diagnostic() {
         let result = MeetingIntelligenceEngine::generate_with_llm_json_or_rule_based(
@@ -1921,6 +2357,8 @@ mod tests {
             provider: "ollama".to_string(),
             model: "test-model".to_string(),
             stats: build_meeting_llm_prompt_input(&input()).stats,
+            endpoint: Some("127.0.0.1:11434".to_string()),
+            llm_generation_duration_ms: Some(12),
         };
         let result = MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(
             input(),
@@ -1932,6 +2370,15 @@ mod tests {
         assert_eq!(result.status, MeetingIntelligenceStatus::Generated);
         assert!(result.diagnostics.llm_used);
         assert!(!result.diagnostics.fallback_used);
+        assert_eq!(result.diagnostics.model_provider.as_deref(), Some("ollama"));
+        assert_eq!(
+            result.diagnostics.llm_endpoint.as_deref(),
+            Some("127.0.0.1:11434")
+        );
+        assert_eq!(
+            result.diagnostics.detected_language,
+            MeetingLanguage::English
+        );
         assert!(result
             .follow_up_draft
             .as_ref()
@@ -1966,9 +2413,95 @@ mod tests {
             vec!["seg-4", "seg-5"]
         );
         assert!(prompt.stats.input_truncated);
+        assert!(prompt.prompt.contains("Output language:"));
+    }
+
+    #[test]
+    fn detects_italian_transcript_language() {
+        let detection = detect_meeting_language(&italian_input().transcript_entries);
+
+        assert_eq!(detection.language, MeetingLanguage::Italian);
+        assert!(detection.confidence > 0.5);
+    }
+
+    #[test]
+    fn detects_english_transcript_language() {
+        let detection = detect_meeting_language(&input().transcript_entries);
+
+        assert_eq!(detection.language, MeetingLanguage::English);
+    }
+
+    #[test]
+    fn mixed_transcript_prefers_local_user_language() {
+        let mut input = input();
+        input.transcript_entries[0].text =
+            "Ciao, quindi dobbiamo fare questa modifica perché la sintesi deve essere italiana."
+                .to_string();
+        input.transcript_entries[0].source = TranscriptSource::Microphone;
+        input.transcript_entries[0].speaker_id = Some(LOCAL_USER_SPEAKER_ID.to_string());
+        input.transcript_entries[1].text =
+            "The remote system audio contains English words and should not override the local user."
+                .to_string();
+
+        let detection = detect_meeting_language(&input.transcript_entries);
+
+        assert_eq!(detection.language, MeetingLanguage::Italian);
+        assert_eq!(detection.source, MeetingLanguageSource::UserSourceWeighted);
+    }
+
+    #[test]
+    fn prompt_instructs_language_without_changing_json_keys() {
+        let prompt = build_meeting_llm_prompt_input(&italian_input());
+
+        assert_eq!(prompt.stats.detected_language, MeetingLanguage::Italian);
         assert!(prompt
             .prompt
-            .contains("Generate artifacts in the dominant language of the transcript"));
+            .contains("Generate every user-facing string value in natural professional Italian"));
+        assert!(prompt.prompt.contains("\"summary\""));
+        assert!(prompt.prompt.contains("\"follow_up_draft\""));
+    }
+
+    #[test]
+    fn rule_based_followup_uses_italian_template_for_italian_transcript() {
+        let result = MeetingIntelligenceEngine::generate(italian_input()).expect("rule based");
+        let draft = result.follow_up_draft.expect("draft");
+
+        assert_eq!(
+            result.diagnostics.detected_language,
+            MeetingLanguage::Italian
+        );
+        assert_eq!(draft.subject, "Riepilogo della sessione");
+        assert!(draft.body.starts_with("Ciao,"));
+        assert!(draft.body.contains("Riepilogo:"));
+        assert!(!draft.body.contains("Hi,"));
+        assert!(!draft.body.contains("Best,"));
+    }
+
+    #[test]
+    fn ollama_base_url_prefers_astra_env_value() {
+        assert_eq!(
+            configured_ollama_base_url_from(
+                Some(" http://localhost:11435/ "),
+                Some("http://localhost:11436")
+            ),
+            "http://localhost:11435"
+        );
+    }
+
+    #[test]
+    fn ollama_base_url_uses_ollama_host_when_astra_absent() {
+        assert_eq!(
+            configured_ollama_base_url_from(None, Some("localhost:11436/")),
+            "http://localhost:11436"
+        );
+    }
+
+    #[test]
+    fn ollama_base_url_falls_back_to_local_default() {
+        assert_eq!(
+            configured_ollama_base_url_from(Some(" "), None),
+            DEFAULT_OLLAMA_BASE_URL
+        );
     }
 
     #[test]

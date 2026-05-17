@@ -666,6 +666,25 @@ pub enum FollowUpTone {
     Professional,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingLanguage {
+    Italian,
+    English,
+    Mixed,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingLanguageSource {
+    TranscriptHeuristic,
+    UserSourceWeighted,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingIntelligenceGenerationOptions {
     #[serde(default)]
@@ -845,6 +864,8 @@ pub struct MeetingIntelligenceDiagnostics {
     #[serde(default)]
     pub model_name: Option<String>,
     #[serde(default)]
+    pub llm_endpoint: Option<String>,
+    #[serde(default)]
     pub degraded_reason: Option<String>,
     #[serde(default)]
     pub model_unavailable_reason: Option<String>,
@@ -866,6 +887,16 @@ pub struct MeetingIntelligenceDiagnostics {
     pub max_chars_total: usize,
     #[serde(default)]
     pub max_chars_per_segment: usize,
+    #[serde(default)]
+    pub detected_language: MeetingLanguage,
+    #[serde(default)]
+    pub language_confidence: f32,
+    #[serde(default)]
+    pub language_source: MeetingLanguageSource,
+    #[serde(default)]
+    pub llm_generation_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub total_generation_duration_ms: Option<u64>,
     #[serde(default)]
     pub transcript_changed_during_generation: bool,
     #[serde(default)]

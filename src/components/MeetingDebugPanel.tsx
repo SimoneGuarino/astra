@@ -122,6 +122,26 @@ function confidenceLabel(confidence?: number | null): string {
     return `${Math.round(confidence * 100)}% confidence`;
 }
 
+function languageLabel(language?: string | null): string {
+    switch (language) {
+        case "italian":
+            return "Italian";
+        case "english":
+            return "English";
+        case "mixed":
+            return "Mixed";
+        case "unknown":
+        default:
+            return "Unknown";
+    }
+}
+
+function formatDurationMs(durationMs?: number | null): string {
+    if (typeof durationMs !== "number") return "not measured";
+    if (durationMs < 1000) return `${durationMs}ms`;
+    return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
 function formatTimelineTime(timestampMs?: number | null): string {
     if (typeof timestampMs !== "number") return "time unknown";
     const totalSeconds = Math.floor(timestampMs / 1000);
@@ -1434,6 +1454,11 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <>
                         <div className="meeting-intelligence-meta">
                             <span>Generator: <strong>{generatorLabel(intelligence)}</strong></span>
+                            <span>Provider: <strong>{intelligence.diagnostics.model_provider ?? "none"}</strong></span>
+                            <span>Model: <strong>{intelligence.diagnostics.model_name ?? "none"}</strong></span>
+                            <span>Endpoint: <strong>{intelligence.diagnostics.llm_endpoint ?? "not used"}</strong></span>
+                            <span>Language: <strong>{languageLabel(intelligence.diagnostics.detected_language)}</strong></span>
+                            <span>Generation: <strong>{formatDurationMs(intelligence.diagnostics.total_generation_duration_ms ?? intelligence.diagnostics.llm_generation_duration_ms)}</strong></span>
                             <span>Segments: <strong>{intelligence.source_transcript_segment_count}</strong></span>
                             <span>LLM: <strong>{intelligence.diagnostics.llm_used ? "used" : "not used"}</strong></span>
                             <span>Fallback: <strong>{intelligence.diagnostics.fallback_used ? "yes" : "no"}</strong></span>
@@ -1921,9 +1946,11 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <p>Speaker attribution: <strong>source default</strong></p>
                         <p>Live summary: <strong>{liveCapabilities?.live_summarization.state ?? "unknown"}</strong></p>
                         <p>Last summary update: <strong>{lastSummaryTimestamp ?? "none"}</strong></p>
+                        <p>Follow-up draft: <strong>{toolState(toolByName("meeting.followup.draft"))}</strong></p>
                         <p>Follow-up sending: <strong>{toolState(toolByName("meeting.followup.send"))}</strong></p>
                         <p>Clear data: <strong>{toolState(toolByName("meeting.clear_data"))}</strong></p>
                         <p className="desktop-agent-muted">Diarization: {liveCapabilities?.diarization.reason ?? "unavailable; captured segments use non-identifying segment metadata only."}</p>
+                        <p className="desktop-agent-muted">Follow-up draft is copy-only and generated through governed Meeting Intelligence; email sending remains unavailable.</p>
                         <p className="desktop-agent-muted">Summary: {liveCapabilities?.live_summarization.reason ?? "live summary is unavailable unless a governed model adapter is connected."}</p>
                     </article>
 

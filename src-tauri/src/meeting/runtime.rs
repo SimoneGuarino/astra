@@ -35,7 +35,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -697,13 +697,14 @@ impl MeetingRuntime {
         &self,
         options: MeetingIntelligenceGenerationOptions,
     ) -> Result<MeetingIntelligenceResult, MeetingRuntimeError> {
+        let generation_started_at = Instant::now();
         let snapshot = {
             let mut registry = self.lock_registry()?;
             registry.begin_intelligence_generation(options)?
         };
         let input = snapshot.input.clone();
 
-        let result = if input.generation_options.use_local_llm {
+        let mut result = if input.generation_options.use_local_llm {
             let prompt_input = build_meeting_llm_prompt_input(&input);
             match self
                 .intelligence_llm
@@ -724,6 +725,12 @@ impl MeetingRuntime {
         } else {
             MeetingIntelligenceEngine::generate_with_llm_output_or_rule_based(input, None, None)?
         };
+        result.diagnostics.total_generation_duration_ms = Some(
+            generation_started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
 
         let mut registry = self.lock_registry()?;
         registry.store_intelligence_result(&snapshot, result)
@@ -1967,6 +1974,8 @@ mod tests {
                         provider: "ollama".to_string(),
                         model: "mock-meeting-model".to_string(),
                         stats: input.stats,
+                        endpoint: Some("127.0.0.1:11434".to_string()),
+                        llm_generation_duration_ms: Some(1),
                     }),
                     Err(kind) => Err(MeetingLlmError {
                         kind,
@@ -1974,6 +1983,8 @@ mod tests {
                         provider: "ollama".to_string(),
                         model: Some("mock-meeting-model".to_string()),
                         stats: input.stats,
+                        endpoint: Some("127.0.0.1:11434".to_string()),
+                        llm_generation_duration_ms: Some(1),
                     }),
                 }
             })

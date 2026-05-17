@@ -439,7 +439,7 @@ async fn fetch_installed_models(client: &Client) -> Result<Vec<String>, String> 
 
 fn select_intent_model(installed_models: &[String]) -> String {
     let candidates = env::var("ASTRA_MODEL_INTENT_CANDIDATES")
-        .unwrap_or_else(|_| "qwen3:8b,llama3.1:8b,gpt-oss:20b,qwen3:14b".to_string())
+        .unwrap_or_else(|_| "qwen3:4b,qwen3:8b,llama3.1:8b,gpt-oss:20b,qwen3:14b".to_string())
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -448,7 +448,7 @@ fn select_intent_model(installed_models: &[String]) -> String {
 
     select_first_available(&candidates, installed_models)
         .or_else(|| candidates.first().cloned())
-        .unwrap_or_else(|| "qwen3:8b".to_string())
+        .unwrap_or_else(|| "qwen3:4b".to_string())
 }
 
 fn select_first_available(candidates: &[String], installed_models: &[String]) -> Option<String> {

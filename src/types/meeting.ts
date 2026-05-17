@@ -206,6 +206,8 @@ export type MeetingIntelligenceStatus =
 
 export type RiskSeverity = "low" | "medium" | "high";
 export type FollowUpTone = "professional";
+export type MeetingLanguage = "italian" | "english" | "mixed" | "unknown";
+export type MeetingLanguageSource = "transcript_heuristic" | "user_source_weighted" | "unknown";
 
 export type MeetingIntelligenceGenerationOptions = {
     use_local_llm: boolean;
@@ -313,6 +315,7 @@ export type MeetingIntelligenceDiagnostics = {
     generator: ArtifactGenerator;
     model_provider?: string | null;
     model_name?: string | null;
+    llm_endpoint?: string | null;
     degraded_reason?: string | null;
     model_unavailable_reason?: string | null;
     llm_used: boolean;
@@ -326,6 +329,11 @@ export type MeetingIntelligenceDiagnostics = {
     max_segments: number;
     max_chars_total: number;
     max_chars_per_segment: number;
+    detected_language: MeetingLanguage;
+    language_confidence: number;
+    language_source: MeetingLanguageSource;
+    llm_generation_duration_ms?: number | null;
+    total_generation_duration_ms?: number | null;
     transcript_changed_during_generation: boolean;
     snapshot_transcript_segment_count: number;
     transcript_text_logged: boolean;
