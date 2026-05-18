@@ -388,6 +388,111 @@ export type ExportedMeeting = {
     metadata: unknown;
 };
 
+export type MeetingSessionArchiveDocument = {
+    schema_version: number;
+    session_id: string;
+    archived_at: string;
+    updated_at: string;
+    state: MeetingSessionState;
+    exported: ExportedMeeting;
+    capture_health: CaptureHealth;
+    system_capture_health: CaptureHealth;
+    microphone_capture_health: CaptureHealth;
+};
+
+export type MeetingSessionListRequest = {
+    limit?: number;
+    cursor?: string | null;
+    date_from?: string | null;
+    date_to?: string | null;
+    has_intelligence?: boolean | null;
+    query?: string | null;
+};
+
+export type MeetingSessionListItem = {
+    session_id: string;
+    title: string;
+    platform: string;
+    session_mode: MeetingSessionMode;
+    started_at: string;
+    ended_at: string;
+    duration_ms: number;
+    transcript_count: number;
+    intelligence_present: boolean;
+    summary_preview: string;
+    action_item_count: number;
+    decision_count: number;
+    open_question_count: number;
+    risk_count: number;
+    technical_recap_present: boolean;
+    speakers_preview: string[];
+    capture_sources: string[];
+    stt_completeness_status: string;
+    stt_completeness_detail?: string;
+    drain_status: string;
+    last_updated_at: string;
+};
+
+export type MeetingSessionListResponse = {
+    sessions: MeetingSessionListItem[];
+    next_cursor?: string | null;
+    diagnostics: MeetingDiagnostic[];
+};
+
+export type MeetingSessionReadRequest = {
+    session_id: string;
+    include_transcript?: boolean;
+    include_intelligence?: boolean;
+    include_diagnostics?: boolean;
+};
+
+export type MeetingSessionReadResponse = {
+    archive: MeetingSessionArchiveDocument;
+    diagnostics: MeetingDiagnostic[];
+};
+
+export type MeetingSessionSearchRequest = {
+    query: string;
+    limit?: number;
+};
+
+export type MeetingSessionSearchResult = {
+    session_id: string;
+    session_title: string;
+    matched_kind: string;
+    title: string;
+    snippet: string;
+    score: number;
+    evidence_segment_ids: string[];
+    speaker_display_name?: string | null;
+    timestamp_ms?: number | null;
+};
+
+export type MeetingSessionSearchResponse = {
+    results: MeetingSessionSearchResult[];
+    searched_session_count: number;
+    matched_session_count: number;
+    truncated: boolean;
+    corrupt_archive_count: number;
+    diagnostics: MeetingDiagnostic[];
+};
+
+export type MeetingSessionExportFormat = "markdown" | "json";
+
+export type MeetingSessionExportRequest = {
+    session_id: string;
+    format?: MeetingSessionExportFormat;
+};
+
+export type MeetingSessionExportResponse = {
+    session_id: string;
+    format: MeetingSessionExportFormat;
+    filename: string;
+    content: string;
+    content_length: number;
+    diagnostics: MeetingDiagnostic[];
+};
+
 export type CallDetectionState = "idle" | "detected" | "likely" | "confirmed";
 
 export type CallInfo = {

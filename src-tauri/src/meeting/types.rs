@@ -583,6 +583,190 @@ impl Default for CaptureHealth {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSttCompletenessStatus {
+    Complete,
+    CompleteNoSpeech,
+    IncompleteDrainTimeout,
+    IncompletePendingQueue,
+    IncompleteInFlight,
+    IncompleteFailedSegments,
+    IncompleteTimeouts,
+    Unavailable,
+    #[default]
+    Unknown,
+}
+
+impl MeetingSttCompletenessStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::CompleteNoSpeech => "complete_no_speech",
+            Self::IncompleteDrainTimeout => "incomplete_drain_timeout",
+            Self::IncompletePendingQueue => "incomplete_pending_queue",
+            Self::IncompleteInFlight => "incomplete_in_flight",
+            Self::IncompleteFailedSegments => "incomplete_failed_segments",
+            Self::IncompleteTimeouts => "incomplete_timeouts",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn is_incomplete(self) -> bool {
+        matches!(
+            self,
+            Self::IncompleteDrainTimeout
+                | Self::IncompletePendingQueue
+                | Self::IncompleteInFlight
+                | Self::IncompleteFailedSegments
+                | Self::IncompleteTimeouts
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingSttCompletenessSource {
+    pub status: MeetingSttCompletenessStatus,
+    pub segments_written: u64,
+    pub segments_transcribed: u64,
+    pub current_queue_depth: usize,
+    pub segments_in_flight: u64,
+    pub segments_failed: u64,
+    pub timeouts: u64,
+    pub dropped_silence_segments: u64,
+    #[serde(default)]
+    pub drain_status: Option<String>,
+    pub drain_timeout: bool,
+    #[serde(default)]
+    pub last_error_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingSttCompletenessReport {
+    pub overall: MeetingSttCompletenessStatus,
+    pub system_audio: MeetingSttCompletenessSource,
+    pub microphone: MeetingSttCompletenessSource,
+    pub segments_written: u64,
+    pub segments_transcribed: u64,
+    pub current_queue_depth: usize,
+    pub segments_in_flight: u64,
+    pub segments_failed: u64,
+    pub timeouts: u64,
+}
+
+pub fn derive_meeting_stt_completeness(
+    system_health: &CaptureHealth,
+    microphone_health: &CaptureHealth,
+) -> MeetingSttCompletenessReport {
+    let system_audio = derive_meeting_stt_source_completeness(&system_health.metrics);
+    let microphone = derive_meeting_stt_source_completeness(&microphone_health.metrics);
+    let overall = aggregate_meeting_stt_completeness(system_audio.status, microphone.status);
+
+    MeetingSttCompletenessReport {
+        overall,
+        segments_written: system_audio
+            .segments_written
+            .saturating_add(microphone.segments_written),
+        segments_transcribed: system_audio
+            .segments_transcribed
+            .saturating_add(microphone.segments_transcribed),
+        current_queue_depth: system_audio
+            .current_queue_depth
+            .saturating_add(microphone.current_queue_depth),
+        segments_in_flight: system_audio
+            .segments_in_flight
+            .saturating_add(microphone.segments_in_flight),
+        segments_failed: system_audio
+            .segments_failed
+            .saturating_add(microphone.segments_failed),
+        timeouts: system_audio.timeouts.saturating_add(microphone.timeouts),
+        system_audio,
+        microphone,
+    }
+}
+
+pub fn derive_meeting_stt_source_completeness(
+    metrics: &CaptureMetrics,
+) -> MeetingSttCompletenessSource {
+    let status = if metrics.drain_timeout
+        || matches!(
+            metrics.segment_transcription_drain_status.as_deref(),
+            Some("timed_out")
+        ) {
+        MeetingSttCompletenessStatus::IncompleteDrainTimeout
+    } else if metrics.current_queue_depth > 0 {
+        MeetingSttCompletenessStatus::IncompletePendingQueue
+    } else if metrics.segments_in_flight > 0 {
+        MeetingSttCompletenessStatus::IncompleteInFlight
+    } else if metrics.segments_failed > 0
+        || metrics.segment_transcription_failures_total > 0
+        || metrics.last_segment_transcription_error_kind.is_some()
+    {
+        MeetingSttCompletenessStatus::IncompleteFailedSegments
+    } else if metrics.segment_transcription_timeouts > 0 {
+        MeetingSttCompletenessStatus::IncompleteTimeouts
+    } else if metrics.segments_written > 0
+        && metrics.segments_transcribed < metrics.segments_written
+    {
+        MeetingSttCompletenessStatus::IncompleteFailedSegments
+    } else if metrics.segments_written == 0 && metrics.dropped_silence_segments > 0 {
+        MeetingSttCompletenessStatus::CompleteNoSpeech
+    } else if metrics.segments_written > 0
+        && metrics.segments_transcribed == metrics.segments_written
+    {
+        MeetingSttCompletenessStatus::Complete
+    } else if matches!(
+        metrics.segment_transcription_drain_status.as_deref(),
+        Some("completed" | "closed")
+    ) {
+        MeetingSttCompletenessStatus::CompleteNoSpeech
+    } else {
+        MeetingSttCompletenessStatus::Unknown
+    };
+
+    MeetingSttCompletenessSource {
+        status,
+        segments_written: metrics.segments_written,
+        segments_transcribed: metrics.segments_transcribed,
+        current_queue_depth: metrics.current_queue_depth,
+        segments_in_flight: metrics.segments_in_flight,
+        segments_failed: metrics.segments_failed,
+        timeouts: metrics.segment_transcription_timeouts,
+        dropped_silence_segments: metrics.dropped_silence_segments,
+        drain_status: metrics.segment_transcription_drain_status.clone(),
+        drain_timeout: metrics.drain_timeout,
+        last_error_kind: metrics.last_segment_transcription_error_kind.clone(),
+    }
+}
+
+fn aggregate_meeting_stt_completeness(
+    system_audio: MeetingSttCompletenessStatus,
+    microphone: MeetingSttCompletenessStatus,
+) -> MeetingSttCompletenessStatus {
+    let statuses = [system_audio, microphone];
+    for candidate in [
+        MeetingSttCompletenessStatus::IncompleteDrainTimeout,
+        MeetingSttCompletenessStatus::IncompletePendingQueue,
+        MeetingSttCompletenessStatus::IncompleteInFlight,
+        MeetingSttCompletenessStatus::IncompleteFailedSegments,
+        MeetingSttCompletenessStatus::IncompleteTimeouts,
+    ] {
+        if statuses.contains(&candidate) {
+            return candidate;
+        }
+    }
+    if statuses.contains(&MeetingSttCompletenessStatus::Complete) {
+        MeetingSttCompletenessStatus::Complete
+    } else if statuses.contains(&MeetingSttCompletenessStatus::CompleteNoSpeech) {
+        MeetingSttCompletenessStatus::CompleteNoSpeech
+    } else if statuses.contains(&MeetingSttCompletenessStatus::Unavailable) {
+        MeetingSttCompletenessStatus::Unavailable
+    } else {
+        MeetingSttCompletenessStatus::Unknown
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MeetingCapabilityState {
@@ -1134,6 +1318,156 @@ pub struct ExportedMeeting {
     #[serde(default)]
     pub intelligence: Option<MeetingIntelligenceResult>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionArchiveDocument {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub archived_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub state: MeetingSessionState,
+    pub exported: ExportedMeeting,
+    pub capture_health: CaptureHealth,
+    pub system_capture_health: CaptureHealth,
+    pub microphone_capture_health: CaptureHealth,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionListRequest {
+    #[serde(default = "default_session_memory_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub date_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub date_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub has_intelligence: Option<bool>,
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionListResponse {
+    pub sessions: Vec<MeetingSessionListItem>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<MeetingDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingSessionListItem {
+    pub session_id: String,
+    pub title: String,
+    pub platform: String,
+    pub session_mode: MeetingSessionMode,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+    pub duration_ms: u64,
+    pub transcript_count: usize,
+    pub intelligence_present: bool,
+    pub summary_preview: String,
+    pub action_item_count: usize,
+    pub decision_count: usize,
+    pub open_question_count: usize,
+    pub risk_count: usize,
+    pub technical_recap_present: bool,
+    pub speakers_preview: Vec<String>,
+    pub capture_sources: Vec<String>,
+    pub stt_completeness_status: String,
+    #[serde(default)]
+    pub stt_completeness_detail: String,
+    pub drain_status: String,
+    pub last_updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionReadRequest {
+    pub session_id: String,
+    #[serde(default = "default_true")]
+    pub include_transcript: bool,
+    #[serde(default = "default_true")]
+    pub include_intelligence: bool,
+    #[serde(default = "default_true")]
+    pub include_diagnostics: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionReadResponse {
+    pub archive: MeetingSessionArchiveDocument,
+    #[serde(default)]
+    pub diagnostics: Vec<MeetingDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionSearchRequest {
+    pub query: String,
+    #[serde(default = "default_session_memory_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionSearchResponse {
+    pub results: Vec<MeetingSessionSearchResult>,
+    pub searched_session_count: usize,
+    pub matched_session_count: usize,
+    pub truncated: bool,
+    pub corrupt_archive_count: usize,
+    #[serde(default)]
+    pub diagnostics: Vec<MeetingDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeetingSessionSearchResult {
+    pub session_id: String,
+    pub session_title: String,
+    pub matched_kind: String,
+    pub title: String,
+    pub snippet: String,
+    pub score: f32,
+    #[serde(default)]
+    pub evidence_segment_ids: Vec<String>,
+    #[serde(default)]
+    pub speaker_display_name: Option<String>,
+    #[serde(default)]
+    pub timestamp_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingSessionExportFormat {
+    #[default]
+    Markdown,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionExportRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub format: MeetingSessionExportFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingSessionExportResponse {
+    pub session_id: String,
+    pub format: MeetingSessionExportFormat,
+    pub filename: String,
+    pub content: String,
+    pub content_length: usize,
+    #[serde(default)]
+    pub diagnostics: Vec<MeetingDiagnostic>,
+}
+
+fn default_session_memory_limit() -> usize {
+    20
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

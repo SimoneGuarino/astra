@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-05-18T19:03:32.612992300Z",
+  "sessions": [
+    {
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "title": "Speaking: Speaker 1",
+      "platform": "teams",
+      "session_mode": "real_capture",
+      "started_at": "2026-05-18T19:01:02.195995500Z",
+      "ended_at": "2026-05-18T19:03:32.599629500Z",
+      "duration_ms": 150403,
+      "transcript_count": 5,
+      "intelligence_present": false,
+      "summary_preview": "Speaking: Speaker 1",
+      "action_item_count": 0,
+      "decision_count": 0,
+      "open_question_count": 0,
+      "risk_count": 0,
+      "technical_recap_present": false,
+      "speakers_preview": [
+        "You",
+        "Speaker 1",
+        "Manual",
+        "Imported",
+        "Unknown"
+      ],
+      "capture_sources": [
+        "system_audio"
+      ],
+      "stt_completeness_status": "incomplete_drain_timeout",
+      "stt_completeness_detail": "incomplete_drain_timeout; system incomplete_drain_timeout (5/6 transcribed, 0 queued, 1 in-flight, 0 failed, 1 timeout); microphone complete_no_speech (0/0 transcribed, 0 queued, 0 in-flight, 0 failed, 0 timeout)",
+      "drain_status": "timed_out",
+      "last_updated_at": "2026-05-18T19:03:32.599245500Z"
+    },
+    {
+      "session_id": "f217f3fe-6fc4-4ec6-86a3-74fb4f0687a8",
+      "title": "Speaking: Speaker 1",
+      "platform": "teams",
+      "session_mode": "real_capture",
+      "started_at": "2026-05-17T18:59:25.274600700Z",
+      "ended_at": "2026-05-17T19:04:59.990076800Z",
+      "duration_ms": 334715,
+      "transcript_count": 18,
+      "intelligence_present": false,
+      "summary_preview": "Speaking: Speaker 1",
+      "action_item_count": 0,
+      "decision_count": 0,
+      "open_question_count": 0,
+      "risk_count": 0,
+      "technical_recap_present": false,
+      "speakers_preview": [
+        "You",
+        "Speaker 1",
+        "Manual",
+        "Imported",
+        "Unknown"
+      ],
+      "capture_sources": [
+        "system_audio"
+      ],
+      "stt_completeness_status": "incomplete",
+      "stt_completeness_detail": "",
+      "drain_status": "timed_out",
+      "last_updated_at": "2026-05-17T19:04:59.989437500Z"
+    }
+  ]
+}

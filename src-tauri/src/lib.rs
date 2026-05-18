@@ -65,14 +65,18 @@ use meeting::{
         MeetingAudioFileTranscriptionResult, MeetingConfig, MeetingDataClearPreview,
         MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode, MeetingSessionState,
-        NoteEntry, RenameSpeakerRequest, RenameSpeakerResult, SummaryEntry, TranscriptEntry,
+        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionExportRequest,
+        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
+        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
+        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState, NoteEntry,
+        RenameSpeakerRequest, RenameSpeakerResult, SummaryEntry, TranscriptEntry,
     },
 };
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
 use model_routing::resolve_ollama_request;
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use speech_events::{
     resolve_audio_response_enabled, AssistantAudioResponsePolicy, AssistantErrorEvent,
     AssistantInputModality, AssistantInterruptedEvent, AssistantRequestFinishedEvent,
@@ -2217,6 +2221,12 @@ fn meeting_from_value<T: DeserializeOwned>(value: serde_json::Value) -> Result<T
         .map_err(|error| format!("meeting result deserialization failed: {error}"))
 }
 
+fn sha256_hex(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 fn emit_meeting_update_events(window: &WebviewWindow, events: &[&str]) {
     let payload = serde_json::json!({
         "source": "meeting_runtime",
@@ -2749,6 +2759,139 @@ fn stop_meeting_session(
         ],
     );
     Ok(exported)
+}
+
+#[tauri::command]
+fn list_meeting_sessions(
+    state: State<'_, AssistantRuntime>,
+    request: MeetingSessionListRequest,
+) -> Result<MeetingSessionListResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "limit": request.limit,
+        "cursor_present": request.cursor.is_some(),
+        "date_from_present": request.date_from.is_some(),
+        "date_to_present": request.date_to.is_some(),
+        "has_intelligence": request.has_intelligence,
+        "query_length": request.query.as_ref().map(|value| value.chars().count()).unwrap_or_default(),
+        "query_hash": request.query.as_ref().map(|value| sha256_hex(value)),
+        "metadata_only": true,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value =
+        governed_meeting_command(state.inner(), "meeting.sessions.list", params, move || {
+            meeting_value(
+                meeting
+                    .list_archived_sessions(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        })?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn read_meeting_session_archive(
+    state: State<'_, AssistantRuntime>,
+    request: MeetingSessionReadRequest,
+) -> Result<MeetingSessionReadResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "session_id": request.session_id,
+        "include_transcript": request.include_transcript,
+        "include_intelligence": request.include_intelligence,
+        "include_diagnostics": request.include_diagnostics,
+        "metadata_only": true,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.archive.read",
+        params,
+        move || {
+            meeting_value(
+                meeting
+                    .read_archived_session(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn search_meeting_sessions(
+    state: State<'_, AssistantRuntime>,
+    request: MeetingSessionSearchRequest,
+) -> Result<MeetingSessionSearchResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "query_length": request.query.chars().count(),
+        "query_hash": sha256_hex(&request.query),
+        "limit": request.limit,
+        "metadata_only": true,
+        "query_text_included": false,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value =
+        governed_meeting_command(state.inner(), "meeting.session.search", params, move || {
+            meeting_value(
+                meeting
+                    .search_archived_sessions(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        })?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn export_meeting_session_archive(
+    state: State<'_, AssistantRuntime>,
+    request: MeetingSessionExportRequest,
+) -> Result<MeetingSessionExportResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "session_id": request.session_id,
+        "format": request.format,
+        "metadata_only": true,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value =
+        governed_meeting_command(state.inner(), "meeting.session.export", params, move || {
+            meeting_value(
+                meeting
+                    .export_archived_session(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        })?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn reindex_meeting_sessions(
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingSessionListResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.reindex",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .rebuild_session_memory_index()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
 }
 
 #[tauri::command]
@@ -3487,6 +3630,11 @@ pub fn run() {
             pause_meeting_session,
             resume_meeting_session,
             stop_meeting_session,
+            list_meeting_sessions,
+            read_meeting_session_archive,
+            search_meeting_sessions,
+            export_meeting_session_archive,
+            reindex_meeting_sessions,
             add_meeting_transcript,
             rename_meeting_speaker,
             transcribe_meeting_audio_file,

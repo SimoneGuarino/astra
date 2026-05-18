@@ -1,0 +1,276 @@
+{
+  "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+  "platform": "teams",
+  "started_at": "2026-05-18T19:01:02.195995500Z",
+  "ended_at": "2026-05-18T19:03:32.599629500Z",
+  "participants": [],
+  "transcript": [
+    {
+      "segment_id": "7f7b5d33-b2a0-4dd8-92e1-12c644ea471c",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "source": "system_audio",
+      "timestamp": "2026-05-18T19:01:40.803718300Z",
+      "created_at": "2026-05-18T19:01:40.803718300Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce",
+      "confidence": 0.0,
+      "start_ms": 0,
+      "end_ms": 15000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "ff5fe53d-4423-454c-bc11-ad1b188bb19c",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "source": "system_audio",
+      "timestamp": "2026-05-18T19:01:41.026234Z",
+      "created_at": "2026-05-18T19:01:41.026234Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Non è la finale questa è la seconda semifinale tra poco i Kings Parti con i presidenti poi la finalissima questo momento sarebbe underdogs al pagambo Colombo da Marco Evan, cross de viaggio",
+      "confidence": 0.0,
+      "start_ms": 15000,
+      "end_ms": 30000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "30559073-b2a4-4997-b049-c81a411ce8dd",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "source": "system_audio",
+      "timestamp": "2026-05-18T19:01:48.321052300Z",
+      "created_at": "2026-05-18T19:01:48.321052300Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Valla profonda Marco Evanna, valla centrale per Marino, ancora Marino, gioco fermo",
+      "confidence": 0.0,
+      "start_ms": 30000,
+      "end_ms": 45000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "9f5798c3-704b-45d3-9f53-8cde7a7fe590",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "source": "system_audio",
+      "timestamp": "2026-05-18T19:02:03.645695Z",
+      "created_at": "2026-05-18T19:02:03.645695Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "Tornando su Gilly ci sarà un motivo per cui i Cesare con Gilly hanno superato la fase italiana della Coppa, andando a giocare le finale europee. Ma beh, forse no, si sta valzando.",
+      "confidence": 0.0,
+      "start_ms": 45000,
+      "end_ms": 60000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    },
+    {
+      "segment_id": "055e8a4b-e263-49ce-be0c-6aec02897c35",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "source": "system_audio",
+      "timestamp": "2026-05-18T19:02:18.675371900Z",
+      "created_at": "2026-05-18T19:02:18.675371900Z",
+      "speaker": "Speaker 1",
+      "speaker_id": "remote_speaker_1",
+      "speaker_label": "Speaker 1",
+      "speaker_confidence": 0.65,
+      "speaker_attribution_method": "source_default",
+      "text": "quando ha preso la palla si è ripultato giù. Ti dicevo, Lola, senza nulla togliere a Tunno che peraltro Tunno Valentini c'era l'Ecole inizio per i Cesare. Tunno peraltro ha deciso al Mescol la partita con la Zetacomo.",
+      "confidence": 0.0,
+      "start_ms": 60000,
+      "end_ms": 75000,
+      "stt_model": "local",
+      "audio_backend": "wasapi"
+    }
+  ],
+  "summary": [
+    {
+      "id": "f2925bfb-6bf9-4a48-938a-17613dd9cda8",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:01:40.803842700Z",
+      "created_at": "2026-05-18T19:01:40.803842700Z",
+      "summary": "Speaking: Speaker 1",
+      "evidence_segment_ids": [
+        "7f7b5d33-b2a0-4dd8-92e1-12c644ea471c"
+      ]
+    },
+    {
+      "id": "bf61b13e-ba6e-43e0-bc8e-f68c0d03c030",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:01:48.321148200Z",
+      "created_at": "2026-05-18T19:01:48.321148200Z",
+      "summary": "Speaking: Speaker 1",
+      "evidence_segment_ids": [
+        "7f7b5d33-b2a0-4dd8-92e1-12c644ea471c",
+        "ff5fe53d-4423-454c-bc11-ad1b188bb19c",
+        "30559073-b2a4-4997-b049-c81a411ce8dd"
+      ]
+    }
+  ],
+  "action_items": [],
+  "decisions": [],
+  "notes": [
+    {
+      "id": "2632f5a1-aac0-49c9-ab0b-bc3fa1b42417",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:01:40.803783700Z",
+      "created_at": "2026-05-18T19:01:40.803783700Z",
+      "content": "[Speaker 1] Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce Da dentro l'area degli stallions vi finisce ",
+      "evidence_segment_ids": [
+        "7f7b5d33-b2a0-4dd8-92e1-12c644ea471c"
+      ]
+    },
+    {
+      "id": "f14e7c60-e955-4660-b0fa-0b5931d0c6b5",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:01:41.026282800Z",
+      "created_at": "2026-05-18T19:01:41.026282800Z",
+      "content": "[Speaker 1] Non è la finale questa è la seconda semifinale tra poco i Kings Parti con i presidenti poi la finalissima questo momento sarebbe underdogs al pagambo Colombo da Marco Evan, cross de viaggio",
+      "evidence_segment_ids": [
+        "ff5fe53d-4423-454c-bc11-ad1b188bb19c"
+      ]
+    },
+    {
+      "id": "7a47488c-606b-41f5-a678-59f09f66d5e0",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:01:48.321080500Z",
+      "created_at": "2026-05-18T19:01:48.321080500Z",
+      "content": "[Speaker 1] Valla profonda Marco Evanna, valla centrale per Marino, ancora Marino, gioco fermo",
+      "evidence_segment_ids": [
+        "30559073-b2a4-4997-b049-c81a411ce8dd"
+      ]
+    },
+    {
+      "id": "1d799cb5-7ff9-4bdb-b803-d5fd78296c75",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:02:03.645733300Z",
+      "created_at": "2026-05-18T19:02:03.645733300Z",
+      "content": "[Speaker 1] Tornando su Gilly ci sarà un motivo per cui i Cesare con Gilly hanno superato la fase italiana della Coppa, andando a giocare le finale europee. Ma beh, forse no, si sta valzando.",
+      "evidence_segment_ids": [
+        "9f5798c3-704b-45d3-9f53-8cde7a7fe590"
+      ]
+    },
+    {
+      "id": "c449e925-8005-48e2-a4b9-d529f87d18f3",
+      "session_id": "2f1f2b32-d1ad-4dac-89a8-e5adaf5a7d75",
+      "timestamp": "2026-05-18T19:02:18.675418500Z",
+      "created_at": "2026-05-18T19:02:18.675418500Z",
+      "content": "[Speaker 1] quando ha preso la palla si è ripultato giù. Ti dicevo, Lola, senza nulla togliere a Tunno che peraltro Tunno Valentini c'era l'Ecole inizio per i Cesare. Tunno peraltro ha deciso al Mescol la partita con la Zetacomo.",
+      "evidence_segment_ids": [
+        "055e8a4b-e263-49ce-be0c-6aec02897c35"
+      ]
+    }
+  ],
+  "intelligence": null,
+  "metadata": {
+    "capture_active": false,
+    "capture_backend": "wasapi",
+    "capture_backend_status": "capture active sources: system_audio:Capturing:segments_written=0; segment_file_stt=enabled",
+    "diarization_enabled": false,
+    "meeting_segment_transcription_incomplete": true,
+    "segment_stt_diagnostics": {
+      "current_queue_depth": 0,
+      "drain_status": "timed_out",
+      "drain_timeout": true,
+      "last_stt_error": null,
+      "last_transcription_completed_segment_id": "055e8a4b-e263-49ce-be0c-6aec02897c35",
+      "last_transcription_failed_segment_id": null,
+      "last_transcription_started_segment_id": "dbd066b1-f8a8-4455-bb98-2d677edaab26",
+      "segment_transcription_timeouts": 1,
+      "segments_dequeued_total": 6,
+      "segments_failed": 0,
+      "segments_in_flight": 1,
+      "segments_queued_total": 6,
+      "segments_transcribed": 5,
+      "segments_written": 6
+    },
+    "session_mode": "real_capture",
+    "speaker_rename_count": 0,
+    "speakers": [
+      {
+        "attribution_method": "source_default",
+        "confidence": 1.0,
+        "display_name": "You",
+        "source": "microphone",
+        "speaker_id": "local_user"
+      },
+      {
+        "attribution_method": "source_default",
+        "confidence": 0.6499999761581421,
+        "display_name": "Speaker 1",
+        "source": "system_audio",
+        "speaker_id": "remote_speaker_1"
+      },
+      {
+        "attribution_method": "source_default",
+        "confidence": 0.8999999761581421,
+        "display_name": "Manual",
+        "source": "manual",
+        "speaker_id": "manual_entry"
+      },
+      {
+        "attribution_method": "source_default",
+        "confidence": 0.800000011920929,
+        "display_name": "Imported",
+        "source": "imported_file",
+        "speaker_id": "imported_file"
+      },
+      {
+        "attribution_method": "unknown",
+        "confidence": 0.0,
+        "display_name": "Unknown",
+        "source": "unknown",
+        "speaker_id": "unknown_speaker"
+      }
+    ],
+    "stt_completeness": {
+      "current_queue_depth": 0,
+      "microphone": {
+        "current_queue_depth": 0,
+        "drain_status": "closed",
+        "drain_timeout": false,
+        "dropped_silence_segments": 0,
+        "last_error_kind": null,
+        "segments_failed": 0,
+        "segments_in_flight": 0,
+        "segments_transcribed": 0,
+        "segments_written": 0,
+        "status": "complete_no_speech",
+        "timeouts": 0
+      },
+      "overall": "incomplete_drain_timeout",
+      "segments_failed": 0,
+      "segments_in_flight": 1,
+      "segments_transcribed": 5,
+      "segments_written": 6,
+      "system_audio": {
+        "current_queue_depth": 0,
+        "drain_status": "timed_out",
+        "drain_timeout": true,
+        "dropped_silence_segments": 0,
+        "last_error_kind": null,
+        "segments_failed": 0,
+        "segments_in_flight": 1,
+        "segments_transcribed": 5,
+        "segments_written": 6,
+        "status": "incomplete_drain_timeout",
+        "timeouts": 1
+      },
+      "timeouts": 1
+    },
+    "transcription_model": "local"
+  }
+}

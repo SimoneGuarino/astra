@@ -100,17 +100,65 @@ impl NoteOrganizer {
         let mut md = String::new();
 
         md.push_str(&format!(
-            "# Meeting: {} ({})\n\n",
-            exported.platform, exported.session_id
+            "# Meeting Session Recap\n\nSession: `{}`\n\n",
+            exported.session_id
         ));
+        md.push_str("## Metadata\n");
+        md.push_str(&format!("- Platform: {}\n", exported.platform));
         md.push_str(&format!(
-            "Started: {}\n",
+            "- Started: {}\n",
             exported.started_at.format("%Y-%m-%dT%H:%M:%SZ")
         ));
         md.push_str(&format!(
-            "Ended: {}\n\n",
+            "- Ended: {}\n",
             exported.ended_at.format("%Y-%m-%dT%H:%M:%SZ")
         ));
+        if let Some(session_mode) = exported.metadata.get("session_mode") {
+            md.push_str(&format!("- Session mode: {}\n", session_mode));
+        }
+        if let Some(completeness) = exported.metadata.get("stt_completeness") {
+            md.push_str(&format!(
+                "- STT completeness: {}\n",
+                stt_status_markdown_label(
+                    completeness
+                        .get("overall")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                )
+            ));
+            md.push_str(&format!(
+                "- System audio STT: {}\n",
+                stt_source_markdown_label(completeness.get("system_audio"))
+            ));
+            md.push_str(&format!(
+                "- Microphone STT: {}\n",
+                stt_source_markdown_label(completeness.get("microphone"))
+            ));
+        } else if let Some(status) = exported
+            .metadata
+            .get("meeting_segment_transcription_incomplete")
+            .and_then(|value| value.as_bool())
+        {
+            md.push_str(&format!(
+                "- STT completeness: {}\n",
+                if status { "incomplete" } else { "complete" }
+            ));
+        }
+        if let Some(diagnostics) = exported.metadata.get("segment_stt_diagnostics") {
+            md.push_str(&format!("- Segment STT diagnostics: `{}`\n", diagnostics));
+        }
+        md.push('\n');
+
+        if exported
+            .metadata
+            .get("meeting_segment_transcription_incomplete")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            md.push_str(
+                "> Warning: STT drain timed out or captured segments were not fully transcribed before export. The saved transcript may be incomplete.\n\n",
+            );
+        }
 
         if !exported.participants.is_empty() {
             md.push_str("## Participants\n");
@@ -120,44 +168,101 @@ impl NoteOrganizer {
             md.push('\n');
         }
 
-        md.push_str("## Transcript\n");
-        for entry in &exported.transcript {
-            md.push_str(&format!(
-                "{} [{}] ({}): {}\n",
-                entry.speaker_display_name(),
-                entry.source.as_str(),
-                entry.timestamp.format("%H:%M:%S"),
-                entry.text
-            ));
+        md.push_str("## Summary\n");
+        if let Some(intelligence) = &exported.intelligence {
+            if let Some(summary) = &intelligence.summary {
+                md.push_str(&summary.text);
+                md.push_str("\n\n");
+                for bullet in &summary.bullets {
+                    md.push_str(&format!("- {}\n", bullet));
+                }
+                if !summary.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "\nEvidence: {}\n",
+                        summary.evidence_segment_ids.join(", ")
+                    ));
+                }
+            }
         }
-
-        md.push_str("\n## Summary\n");
-        for entry in &exported.summary {
-            md.push_str(&format!(
-                "[{}] {}\n",
-                entry.timestamp.format("%H:%M:%S"),
-                entry.summary
-            ));
+        if exported
+            .intelligence
+            .as_ref()
+            .and_then(|value| value.summary.as_ref())
+            .is_none()
+        {
+            for entry in &exported.summary {
+                md.push_str(&format!(
+                    "- [{}] {}\n",
+                    entry.timestamp.format("%H:%M:%S"),
+                    entry.summary
+                ));
+            }
+            if exported.summary.is_empty() {
+                md.push_str("_No summary available._\n");
+            }
         }
 
         md.push_str("\n## Decisions\n");
         let mut decision_no = 0;
+        if let Some(intelligence) = &exported.intelligence {
+            for decision in &intelligence.decisions {
+                decision_no += 1;
+                md.push_str(&format!("{}. {}\n", decision_no, decision.decision));
+                if let Some(rationale) = &decision.rationale {
+                    md.push_str(&format!("   - Rationale: {}\n", rationale));
+                }
+                if let Some(speaker) = &decision.made_by_display_name {
+                    md.push_str(&format!("   - By: {}\n", speaker));
+                }
+                if !decision.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "   - Evidence: {}\n",
+                        decision.evidence_segment_ids.join(", ")
+                    ));
+                }
+            }
+        }
         for decision in &exported.decisions {
             decision_no += 1;
-            md.push_str(&format!("\nD{}: {}\n", decision_no, decision.decision));
+            md.push_str(&format!("{}. {}\n", decision_no, decision.decision));
             if !decision.rationale.is_empty() {
-                md.push_str(&format!("Rationale: {}\n", decision.rationale));
+                md.push_str(&format!("   - Rationale: {}\n", decision.rationale));
             }
             if !decision.evidence_segment_ids.is_empty() {
                 md.push_str(&format!(
-                    "Evidence: {}\n",
+                    "   - Evidence: {}\n",
                     decision.evidence_segment_ids.join(", ")
                 ));
             }
         }
+        if decision_no == 0 {
+            md.push_str("_No evidence-backed decisions recorded._\n");
+        }
 
-        md.push_str("\n## Action items\n");
+        md.push_str("\n## Action Items\n");
         let mut item_no = 0;
+        if let Some(intelligence) = &exported.intelligence {
+            for item in &intelligence.action_items {
+                item_no += 1;
+                md.push_str(&format!("{}. {}\n", item_no, item.task));
+                md.push_str(&format!(
+                    "   - Assignee: {}\n",
+                    item.assignee_display_name
+                        .as_deref()
+                        .unwrap_or("not detected")
+                ));
+                if let Some(due) = &item.due_date {
+                    md.push_str(&format!("   - Due: {}\n", due));
+                }
+                md.push_str(&format!("   - Status: {}\n", item.status));
+                if !item.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "   - Evidence: {}\n",
+                        item.evidence_segment_ids.join(", ")
+                    ));
+                }
+            }
+        }
         for item in &exported.action_items {
             item_no += 1;
             let assignee = item
@@ -167,7 +272,7 @@ impl NoteOrganizer {
                 .unwrap_or("tbd".to_string());
             let deadline = item.deadline.map(|d| d.format("%Y-%m-%d").to_string());
             md.push_str(&format!(
-                "\n{}- {}\n  Assignee: {}{} {}{}\n",
+                "{}. {}\n   - Assignee: {}{} {}{}\n",
                 item_no,
                 item.description,
                 assignee,
@@ -182,49 +287,141 @@ impl NoteOrganizer {
                 if item.evidence_segment_ids.is_empty() {
                     String::new()
                 } else {
-                    format!("\n  Evidence: {}", item.evidence_segment_ids.join(", "))
+                    format!("\n   - Evidence: {}", item.evidence_segment_ids.join(", "))
                 },
             ));
         }
+        if item_no == 0 {
+            md.push_str("_No evidence-backed action items recorded._\n");
+        }
 
         if let Some(intelligence) = &exported.intelligence {
-            md.push_str("\n## Meeting Intelligence\n");
-            md.push_str(&format!("Status: {:?}\n", intelligence.status));
-            if let Some(summary) = &intelligence.summary {
-                md.push_str("\n### Summary\n");
-                md.push_str(&summary.text);
-                md.push('\n');
-                if !summary.evidence_segment_ids.is_empty() {
+            md.push_str("\n## Open Questions\n");
+            if !intelligence.open_questions.is_empty() {
+                for question in &intelligence.open_questions {
+                    md.push_str(&format!("- {}\n", question.question));
+                    if !question.evidence_segment_ids.is_empty() {
+                        md.push_str(&format!(
+                            "  - Evidence: {}\n",
+                            question.evidence_segment_ids.join(", ")
+                        ));
+                    }
+                }
+            } else {
+                md.push_str("_No open questions detected._\n");
+            }
+
+            md.push_str("\n## Risks / Blockers\n");
+            if !intelligence.risks.is_empty() {
+                for risk in &intelligence.risks {
+                    md.push_str(&format!("- {:?}: {}\n", risk.severity, risk.risk));
+                    if !risk.evidence_segment_ids.is_empty() {
+                        md.push_str(&format!(
+                            "  - Evidence: {}\n",
+                            risk.evidence_segment_ids.join(", ")
+                        ));
+                    }
+                }
+            } else {
+                md.push_str("_No grounded risks detected._\n");
+            }
+
+            md.push_str("\n## Technical Recap\n");
+            if let Some(recap) = &intelligence.technical_recap {
+                for bullet in &recap.bullets {
+                    md.push_str(&format!("- {}\n", bullet));
+                }
+                if !recap.mentioned_files.is_empty() {
                     md.push_str(&format!(
-                        "Evidence: {}\n",
-                        summary.evidence_segment_ids.join(", ")
+                        "- Files/modules: {}\n",
+                        recap.mentioned_files.join(", ")
+                    ));
+                }
+                if !recap.mentioned_commands.is_empty() {
+                    md.push_str(&format!(
+                        "- Commands: {}\n",
+                        recap.mentioned_commands.join(", ")
+                    ));
+                }
+                if !recap.mentioned_errors.is_empty() {
+                    md.push_str(&format!(
+                        "- Errors: {}\n",
+                        recap.mentioned_errors.join(", ")
+                    ));
+                }
+                if !recap.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "- Evidence: {}\n",
+                        recap.evidence_segment_ids.join(", ")
+                    ));
+                }
+            } else {
+                md.push_str("_No grounded technical details detected._\n");
+            }
+
+            md.push_str("\n## Timeline\n");
+            if intelligence.timeline.is_empty() {
+                md.push_str("_No timeline generated._\n");
+            }
+            for item in &intelligence.timeline {
+                md.push_str(&format!(
+                    "- {} {}: {}\n",
+                    item.timestamp_ms
+                        .map(|value| format!("{}ms", value))
+                        .unwrap_or_else(|| "time_unknown".to_string()),
+                    item.speaker_display_name.as_deref().unwrap_or("Unknown"),
+                    if item.detail.is_empty() {
+                        &item.title
+                    } else {
+                        &item.detail
+                    }
+                ));
+                if !item.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "  - Evidence: {}\n",
+                        item.evidence_segment_ids.join(", ")
                     ));
                 }
             }
-            if !intelligence.open_questions.is_empty() {
-                md.push_str("\n### Open Questions\n");
-                for question in &intelligence.open_questions {
-                    md.push_str(&format!("- {}\n", question.question));
-                }
-            }
-            if !intelligence.risks.is_empty() {
-                md.push_str("\n### Risks / Blockers\n");
-                for risk in &intelligence.risks {
-                    md.push_str(&format!("- {:?}: {}\n", risk.severity, risk.risk));
-                }
-            }
-            if let Some(recap) = &intelligence.technical_recap {
-                if !recap.bullets.is_empty() {
-                    md.push_str("\n### Technical Recap\n");
-                    for bullet in &recap.bullets {
-                        md.push_str(&format!("- {}\n", bullet));
-                    }
-                }
-            }
+
             if let Some(draft) = &intelligence.follow_up_draft {
-                md.push_str("\n### Follow-up Draft\n");
+                md.push_str("\n## Follow-up Draft\n");
                 md.push_str(&format!("Subject: {}\n\n{}\n", draft.subject, draft.body));
+                if !draft.evidence_segment_ids.is_empty() {
+                    md.push_str(&format!(
+                        "\nEvidence: {}\n",
+                        draft.evidence_segment_ids.join(", ")
+                    ));
+                }
             }
+        }
+
+        md.push_str("\n## Transcript\n");
+        if exported.transcript.is_empty() {
+            md.push_str("_No transcript entries were available at export time._\n");
+        }
+        for entry in &exported.transcript {
+            md.push_str(&format!(
+                "- `{}` [{}] {}: {}\n",
+                entry.segment_id,
+                entry.source.as_str(),
+                entry.speaker_display_name(),
+                entry.text
+            ));
+        }
+
+        md.push_str("\n## Diagnostics\n");
+        if let Some(speakers) = exported.metadata.get("speakers") {
+            md.push_str(&format!("- Speakers: `{}`\n", speakers));
+        }
+        if let Some(intelligence) = &exported.intelligence {
+            md.push_str(&format!(
+                "- Intelligence: {:?}; generator={:?}; fallback_used={}; audit_redacted={}\n",
+                intelligence.status,
+                intelligence.diagnostics.generator,
+                intelligence.diagnostics.fallback_used,
+                intelligence.diagnostics.audit_redacted
+            ));
         }
 
         Ok(md)
@@ -386,6 +583,70 @@ fn file_name_string(path: &Path) -> Result<String, String> {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .ok_or_else(|| format!("Path has no file name: {}", path.display()))
+}
+
+fn stt_status_markdown_label(status: &str) -> String {
+    match status {
+        "complete" => "complete".to_string(),
+        "complete_no_speech" => "complete/no speech".to_string(),
+        "incomplete_drain_timeout" => "incomplete (drain timed out)".to_string(),
+        "incomplete_pending_queue" => "incomplete (pending queue)".to_string(),
+        "incomplete_in_flight" => "incomplete (segment still in flight)".to_string(),
+        "incomplete_failed_segments" => "incomplete (failed segments)".to_string(),
+        "incomplete_timeouts" => "incomplete (STT timeouts)".to_string(),
+        "unavailable" => "unavailable".to_string(),
+        "unknown" => "unknown".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn stt_source_markdown_label(source: Option<&serde_json::Value>) -> String {
+    let Some(source) = source else {
+        return "unknown".to_string();
+    };
+    let status = source
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let written = source
+        .get("segments_written")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let transcribed = source
+        .get("segments_transcribed")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let queued = source
+        .get("current_queue_depth")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let in_flight = source
+        .get("segments_in_flight")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let failed = source
+        .get("segments_failed")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let timeouts = source
+        .get("timeouts")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    let silence = source
+        .get("dropped_silence_segments")
+        .and_then(|value| value.as_u64())
+        .unwrap_or_default();
+    format!(
+        "{} ({}/{} transcribed, {} queued, {} in-flight, {} failed, {} timeout, {} silence dropped)",
+        stt_status_markdown_label(status),
+        transcribed,
+        written,
+        queued,
+        in_flight,
+        failed,
+        timeouts,
+        silence
+    )
 }
 
 #[cfg(test)]

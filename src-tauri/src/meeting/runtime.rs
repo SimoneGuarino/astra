@@ -15,18 +15,22 @@ use super::{
     note_organizer::NoteOrganizer,
     privacy_control::PrivacyState,
     segment_writer::CapturedMeetingSegment,
+    session_memory::SessionMemoryStore,
     session_registry::SessionRegistry,
     stt_adapter::{ExistingSttClientMeetingAdapter, MeetingFileTranscriber},
     types::{
-        normalize_meeting_app_name, ActionItem, CallInfo, CaptureBackend, CaptureControllerState,
-        CaptureHealth, ClearMeetingDataRequest, ConsentState, DecisionLogEntry, ExportedMeeting,
-        MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
-        MeetingCapabilityReadiness, MeetingCapabilityState, MeetingConfig, MeetingDataClearPreview,
-        MeetingDataClearResult, MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLanguage, MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionMode,
-        MeetingSessionState, MeetingStatus, RenameSpeakerRequest, RenameSpeakerResult,
-        SpeakerAttributionMethod, TranscriptEntry, TranscriptSource,
-        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        derive_meeting_stt_completeness, normalize_meeting_app_name, ActionItem, CallInfo,
+        CaptureBackend, CaptureControllerState, CaptureHealth, ClearMeetingDataRequest,
+        ConsentState, DecisionLogEntry, ExportedMeeting, MeetingAudioFileTranscriptionRequest,
+        MeetingAudioFileTranscriptionResult, MeetingCapabilityReadiness, MeetingCapabilityState,
+        MeetingConfig, MeetingDataClearPreview, MeetingDataClearResult,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult, MeetingLanguage,
+        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionExportRequest,
+        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
+        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
+        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
+        MeetingStatus, RenameSpeakerRequest, RenameSpeakerResult, SpeakerAttributionMethod,
+        TranscriptEntry, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
 };
 use crate::stt_client::SttClient;
@@ -52,6 +56,7 @@ pub struct MeetingRuntime {
     stt_adapter: Arc<dyn MeetingFileTranscriber>,
     intelligence_llm: Arc<dyn MeetingIntelligenceLlm>,
     organizer: NoteOrganizer,
+    session_memory: SessionMemoryStore,
     meeting_storage_dir: PathBuf,
 }
 
@@ -95,6 +100,7 @@ impl MeetingRuntime {
             stt_adapter,
             intelligence_llm,
             organizer: NoteOrganizer::new(meeting_storage_dir.clone()),
+            session_memory: SessionMemoryStore::new(meeting_storage_dir.clone()),
             meeting_storage_dir,
         }
     }
@@ -863,10 +869,62 @@ impl MeetingRuntime {
             &system_capture_health,
             &microphone_capture_health,
         );
+        let completed_state = {
+            let registry = self.lock_registry()?;
+            registry
+                .get_last_completed_state()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)?
+        };
+        let combined_capture_health = aggregate_capture_health(
+            system_capture_health.clone(),
+            microphone_capture_health.clone(),
+        );
         self.organizer
             .save_meeting_data(&exported)
             .map_err(|message| MeetingRuntimeError::StorageError { message })?;
+        self.session_memory.archive_completed_session(
+            &completed_state,
+            &exported,
+            &combined_capture_health,
+            &system_capture_health,
+            &microphone_capture_health,
+        )?;
         Ok(exported)
+    }
+
+    pub fn list_archived_sessions(
+        &self,
+        request: MeetingSessionListRequest,
+    ) -> Result<MeetingSessionListResponse, MeetingRuntimeError> {
+        self.session_memory.list_sessions(request)
+    }
+
+    pub fn read_archived_session(
+        &self,
+        request: MeetingSessionReadRequest,
+    ) -> Result<MeetingSessionReadResponse, MeetingRuntimeError> {
+        self.session_memory.read_session(request)
+    }
+
+    pub fn search_archived_sessions(
+        &self,
+        request: MeetingSessionSearchRequest,
+    ) -> Result<MeetingSessionSearchResponse, MeetingRuntimeError> {
+        self.session_memory.search_sessions(request)
+    }
+
+    pub fn export_archived_session(
+        &self,
+        request: MeetingSessionExportRequest,
+    ) -> Result<MeetingSessionExportResponse, MeetingRuntimeError> {
+        self.session_memory.export_session(request)
+    }
+
+    pub fn rebuild_session_memory_index(
+        &self,
+    ) -> Result<MeetingSessionListResponse, MeetingRuntimeError> {
+        self.session_memory.rebuild_index()
     }
 
     pub fn add_transcript(&self, mut entry: TranscriptEntry) -> Result<(), MeetingRuntimeError> {
@@ -2008,6 +2066,10 @@ fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) ->
         .metrics
         .segments_dropped
         .saturating_add(microphone.metrics.segments_dropped);
+    aggregate.metrics.dropped_silence_segments = system
+        .metrics
+        .dropped_silence_segments
+        .saturating_add(microphone.metrics.dropped_silence_segments);
     aggregate.metrics.segment_transcription_failures_total = system
         .metrics
         .segment_transcription_failures_total
@@ -2069,13 +2131,24 @@ fn apply_segment_stt_export_metadata(
 ) {
     let aggregate = aggregate_capture_health(system_health.clone(), microphone_health.clone());
     let metrics = aggregate.metrics;
-    let incomplete = metrics.segments_written > 0
-        && exported.transcript.is_empty()
-        && metrics.segments_transcribed == 0;
+    let completeness = derive_meeting_stt_completeness(system_health, microphone_health);
+    let incomplete = completeness.overall.is_incomplete();
     if let Some(metadata) = exported.metadata.as_object_mut() {
         metadata.insert(
             "meeting_segment_transcription_incomplete".to_string(),
             serde_json::json!(incomplete),
+        );
+        metadata.insert(
+            "stt_completeness".to_string(),
+            serde_json::to_value(&completeness).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "overall": completeness.overall.as_str(),
+                    "segments_written": metrics.segments_written,
+                    "segments_transcribed": metrics.segments_transcribed,
+                    "segments_in_flight": metrics.segments_in_flight,
+                    "timeouts": metrics.segment_transcription_timeouts,
+                })
+            }),
         );
         metadata.insert(
             "segment_stt_diagnostics".to_string(),
@@ -2129,10 +2202,13 @@ fn capture_status_message(
 mod tests {
     use super::*;
     use crate::meeting::types::{
-        ActionItemStatus, ArtifactGenerator, ClearMeetingDataRequest, MeetingClearScope,
-        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus, MeetingStatus,
-        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE, LOCAL_USER_SPEAKER_ID,
-        REMOTE_SPEAKER_1_ID,
+        derive_meeting_stt_source_completeness, ActionItemStatus, ArtifactGenerator,
+        CaptureMetrics, ClearMeetingDataRequest, MeetingClearScope,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus,
+        MeetingSessionExportFormat, MeetingSessionExportRequest, MeetingSessionListRequest,
+        MeetingSessionReadRequest, MeetingSessionSearchRequest, MeetingStatus,
+        MeetingSttCompletenessStatus, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        LOCAL_USER_SPEAKER_ID, REMOTE_SPEAKER_1_ID,
     };
     use crate::meeting::{
         intelligence_engine::{
@@ -2395,6 +2471,133 @@ mod tests {
         let runtime = MeetingRuntime::new(temp_root());
         let result = runtime.add_transcript(transcript());
         assert!(matches!(result, Err(MeetingRuntimeError::NoActiveSession)));
+    }
+
+    #[test]
+    fn stt_completeness_derives_complete_from_finished_metrics() {
+        let mut metrics = CaptureMetrics {
+            segments_written: 3,
+            segments_transcribed: 3,
+            segment_transcription_drain_status: Some("completed".to_string()),
+            ..CaptureMetrics::default()
+        };
+        assert_eq!(
+            derive_meeting_stt_source_completeness(&metrics).status,
+            MeetingSttCompletenessStatus::Complete
+        );
+
+        metrics.segments_written = 0;
+        metrics.segments_transcribed = 0;
+        metrics.dropped_silence_segments = 4;
+        assert_eq!(
+            derive_meeting_stt_source_completeness(&metrics).status,
+            MeetingSttCompletenessStatus::CompleteNoSpeech
+        );
+    }
+
+    #[test]
+    fn stt_completeness_derives_incomplete_drain_timeout_pending_and_failed() {
+        let drain_timeout = CaptureMetrics {
+            segments_written: 19,
+            segments_transcribed: 18,
+            segments_in_flight: 1,
+            drain_timeout: true,
+            segment_transcription_drain_status: Some("timed_out".to_string()),
+            ..CaptureMetrics::default()
+        };
+        assert_eq!(
+            derive_meeting_stt_source_completeness(&drain_timeout).status,
+            MeetingSttCompletenessStatus::IncompleteDrainTimeout
+        );
+
+        let pending = CaptureMetrics {
+            current_queue_depth: 1,
+            ..CaptureMetrics::default()
+        };
+        assert_eq!(
+            derive_meeting_stt_source_completeness(&pending).status,
+            MeetingSttCompletenessStatus::IncompletePendingQueue
+        );
+
+        let failed = CaptureMetrics {
+            segments_written: 2,
+            segments_transcribed: 1,
+            segments_failed: 1,
+            ..CaptureMetrics::default()
+        };
+        assert_eq!(
+            derive_meeting_stt_source_completeness(&failed).status,
+            MeetingSttCompletenessStatus::IncompleteFailedSegments
+        );
+    }
+
+    #[test]
+    fn export_metadata_and_markdown_mark_partial_drain_timeout_incomplete() {
+        let mut exported = ExportedMeeting {
+            session_id: "session-partial-drain".to_string(),
+            platform: "teams".to_string(),
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+            participants: Vec::new(),
+            transcript: vec![transcript()],
+            summary: Vec::new(),
+            action_items: Vec::new(),
+            decisions: Vec::new(),
+            notes: Vec::new(),
+            intelligence: None,
+            metadata: serde_json::json!({}),
+        };
+        let mut system_health = CaptureHealth::default();
+        system_health.metrics.segments_written = 19;
+        system_health.metrics.segments_queued_total = 19;
+        system_health.metrics.segments_dequeued_total = 19;
+        system_health.metrics.segments_transcribed = 18;
+        system_health.metrics.segments_in_flight = 1;
+        system_health.metrics.segment_transcription_timeouts = 1;
+        system_health.metrics.drain_timeout = true;
+        system_health.metrics.segment_transcription_drain_status = Some("timed_out".to_string());
+
+        let mut microphone_health = CaptureHealth::default();
+        microphone_health.metrics.dropped_silence_segments = 3;
+        microphone_health.metrics.segment_transcription_drain_status =
+            Some("completed".to_string());
+
+        apply_segment_stt_export_metadata(&mut exported, &system_health, &microphone_health);
+
+        assert_eq!(
+            exported
+                .metadata
+                .get("meeting_segment_transcription_incomplete")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            exported
+                .metadata
+                .get("stt_completeness")
+                .and_then(|value| value.get("overall"))
+                .and_then(|value| value.as_str()),
+            Some("incomplete_drain_timeout")
+        );
+        assert_eq!(
+            exported
+                .metadata
+                .get("stt_completeness")
+                .and_then(|value| value.get("microphone"))
+                .and_then(|value| value.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("complete_no_speech")
+        );
+
+        let markdown = NoteOrganizer::new(temp_root())
+            .to_markdown(&exported)
+            .expect("markdown export");
+        assert!(markdown.contains("STT completeness: incomplete (drain timed out)"));
+        assert!(markdown.contains("System audio STT: incomplete (drain timed out)"));
+        assert!(markdown.contains("18/19 transcribed"));
+        assert!(markdown.contains("1 in-flight"));
+        assert!(markdown.contains("1 timeout"));
+        assert!(markdown.contains("Microphone STT: complete/no speech"));
     }
 
     #[test]
@@ -2701,6 +2904,14 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            exported
+                .metadata
+                .get("stt_completeness")
+                .and_then(|value| value.get("overall"))
+                .and_then(|value| value.as_str()),
+            Some("incomplete_failed_segments")
+        );
         let diagnostics = exported
             .metadata
             .get("segment_stt_diagnostics")
@@ -2723,6 +2934,202 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("stt_timeout")
         );
+        let list = runtime
+            .list_archived_sessions(MeetingSessionListRequest {
+                limit: 10,
+                cursor: None,
+                date_from: None,
+                date_to: None,
+                has_intelligence: None,
+                query: None,
+            })
+            .expect("list archived sessions");
+        let item = list.sessions.first().expect("archived session");
+        assert_eq!(item.stt_completeness_status, "incomplete_failed_segments");
+        assert!(item
+            .stt_completeness_detail
+            .contains("incomplete_failed_segments"));
+    }
+
+    #[tokio::test]
+    async fn completed_session_is_archived_listed_read_searchable_and_exportable() {
+        let root = temp_root();
+        let runtime =
+            MeetingRuntime::with_file_transcriber(root.clone(), Arc::new(FixedTranscriber));
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+
+        let storage_dir = root.join(".astra").join("meetings");
+        let samples = vec![100_i16; 16_000];
+        let writer = SegmentWriter::new(
+            storage_dir.clone(),
+            SegmentWriterConfig {
+                sample_rate: 16_000,
+                channels: 1,
+                transcript_source: TranscriptSource::SystemAudio,
+                ..SegmentWriterConfig::default()
+            },
+        );
+        let segment = writer
+            .write_pcm_i16_segment(&session.session_id, &samples)
+            .expect("system segment");
+        runtime
+            .transcribe_captured_segment(segment, None, false)
+            .await
+            .expect("system transcription");
+        runtime
+            .rename_speaker(RenameSpeakerRequest {
+                speaker_id: REMOTE_SPEAKER_1_ID.to_string(),
+                display_name: "Marco".to_string(),
+            })
+            .expect("rename speaker");
+        runtime
+            .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+            .await
+            .expect("generate rule-based intelligence");
+
+        let exported = runtime.stop_session().expect("stop session");
+        let archive_dir = storage_dir.join("sessions").join(&exported.session_id);
+        assert!(archive_dir.join("session.json").exists());
+        assert!(archive_dir.join("transcript.json").exists());
+        assert!(archive_dir.join("intelligence.json").exists());
+        assert!(archive_dir.join("export.md").exists());
+
+        let list = runtime
+            .list_archived_sessions(MeetingSessionListRequest {
+                limit: 10,
+                cursor: None,
+                date_from: None,
+                date_to: None,
+                has_intelligence: Some(true),
+                query: None,
+            })
+            .expect("list archived sessions");
+        assert_eq!(list.sessions.len(), 1);
+        let item = list.sessions.first().expect("session list item");
+        assert_eq!(item.session_id, exported.session_id);
+        assert_eq!(item.transcript_count, 1);
+        assert!(item.intelligence_present);
+        assert!(item.speakers_preview.iter().any(|name| name == "Marco"));
+        assert_eq!(item.stt_completeness_status, "complete");
+
+        let read = runtime
+            .read_archived_session(MeetingSessionReadRequest {
+                session_id: exported.session_id.clone(),
+                include_transcript: true,
+                include_intelligence: true,
+                include_diagnostics: true,
+            })
+            .expect("read archived session");
+        let archive = read.archive;
+        assert_eq!(archive.state.transcript.len(), 1);
+        assert_eq!(
+            archive.state.transcript[0].speaker_label.as_deref(),
+            Some("Marco")
+        );
+        let transcript_ids = archive
+            .state
+            .transcript
+            .iter()
+            .map(|entry| entry.segment_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let intelligence = archive
+            .state
+            .intelligence
+            .as_ref()
+            .expect("archived intelligence");
+        let summary = intelligence.summary.as_ref().expect("summary");
+        assert!(summary
+            .evidence_segment_ids
+            .iter()
+            .all(|id| transcript_ids.contains(id.as_str())));
+
+        let transcript_search = runtime
+            .search_archived_sessions(MeetingSessionSearchRequest {
+                query: "ship".to_string(),
+                limit: 20,
+            })
+            .expect("search transcript");
+        assert!(transcript_search
+            .results
+            .iter()
+            .any(|result| result.matched_kind == "transcript"));
+
+        let action_search = runtime
+            .search_archived_sessions(MeetingSessionSearchRequest {
+                query: "tomorrow".to_string(),
+                limit: 20,
+            })
+            .expect("search action items");
+        assert!(action_search.results.iter().any(|result| {
+            matches!(
+                result.matched_kind.as_str(),
+                "action_item" | "intelligence_action_item"
+            )
+        }));
+
+        let markdown = runtime
+            .export_archived_session(MeetingSessionExportRequest {
+                session_id: exported.session_id.clone(),
+                format: MeetingSessionExportFormat::Markdown,
+            })
+            .expect("export markdown");
+        assert_eq!(
+            markdown.filename,
+            format!("{}_session.md", exported.session_id)
+        );
+        assert!(markdown.content.contains("# Meeting Session Recap"));
+        assert!(markdown.content.contains("## Summary"));
+        assert!(markdown.content.contains("## Action Items"));
+        assert!(markdown.content.contains("## Transcript"));
+
+        let json = runtime
+            .export_archived_session(MeetingSessionExportRequest {
+                session_id: exported.session_id.clone(),
+                format: MeetingSessionExportFormat::Json,
+            })
+            .expect("export json");
+        assert!(json.content.contains(&exported.session_id));
+        assert!(json.content.contains("\"schema_version\""));
+    }
+
+    #[test]
+    fn corrupt_archive_does_not_crash_reindex_or_search() {
+        let root = temp_root();
+        let runtime = MeetingRuntime::new(root.clone());
+        let bad_dir = root
+            .join(".astra")
+            .join("meetings")
+            .join("sessions")
+            .join("bad-session");
+        std::fs::create_dir_all(&bad_dir).expect("bad archive dir");
+        std::fs::write(bad_dir.join("session.json"), "{not valid json").expect("bad archive");
+
+        let rebuilt = runtime
+            .rebuild_session_memory_index()
+            .expect("rebuild index");
+        assert!(rebuilt.sessions.is_empty());
+        assert!(rebuilt
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "archive_corrupt"));
+
+        let searched = runtime
+            .search_archived_sessions(MeetingSessionSearchRequest {
+                query: "decision".to_string(),
+                limit: 10,
+            })
+            .expect("search corrupt archives");
+        assert!(searched.results.is_empty());
+        assert_eq!(searched.corrupt_archive_count, 0);
     }
 
     #[tokio::test]

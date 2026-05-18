@@ -17,6 +17,14 @@ import type {
     MeetingIntelligenceGenerationOptions,
     MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
+    MeetingSessionExportRequest,
+    MeetingSessionExportResponse,
+    MeetingSessionListRequest,
+    MeetingSessionListResponse,
+    MeetingSessionReadRequest,
+    MeetingSessionReadResponse,
+    MeetingSessionSearchRequest,
+    MeetingSessionSearchResponse,
     MeetingSession,
     MeetingSessionState,
     NoteEntry,
@@ -131,6 +139,35 @@ export function useMeeting() {
         []
     );
 
+    const listSessions = useCallback(
+        (request: MeetingSessionListRequest = {}) =>
+            invoke<MeetingSessionListResponse>("list_meeting_sessions", { request }),
+        []
+    );
+
+    const readSessionArchive = useCallback(
+        (request: MeetingSessionReadRequest) =>
+            invoke<MeetingSessionReadResponse>("read_meeting_session_archive", { request }),
+        []
+    );
+
+    const searchSessions = useCallback(
+        (request: MeetingSessionSearchRequest) =>
+            invoke<MeetingSessionSearchResponse>("search_meeting_sessions", { request }),
+        []
+    );
+
+    const exportSessionArchive = useCallback(
+        (request: MeetingSessionExportRequest) =>
+            invoke<MeetingSessionExportResponse>("export_meeting_session_archive", { request }),
+        []
+    );
+
+    const reindexSessions = useCallback(
+        () => invoke<MeetingSessionListResponse>("reindex_meeting_sessions"),
+        []
+    );
+
     const addTranscript = useCallback(
         (entry: TranscriptEntry) =>
             invoke<void>("add_meeting_transcript", { entry }),
@@ -209,7 +246,9 @@ export function useMeeting() {
             getLastCompletedState,
             getLiveCapabilities,
             grantConsent,
+            exportSessionArchive,
             listTranscript,
+            listSessions,
             pauseSession,
             previewClearData,
             readActionItems,
@@ -218,9 +257,12 @@ export function useMeeting() {
             readIntelligence,
             readNotes,
             readSummary,
+            readSessionArchive,
+            reindexSessions,
             renameSpeaker,
             resumeSession,
             revokeConsent,
+            searchSessions,
             startSession,
             stopSession,
             transcribeAudioFile,
@@ -242,7 +284,9 @@ export function useMeeting() {
             getLastCompletedState,
             getLiveCapabilities,
             grantConsent,
+            exportSessionArchive,
             listTranscript,
+            listSessions,
             pauseSession,
             previewClearData,
             readActionItems,
@@ -251,9 +295,12 @@ export function useMeeting() {
             readIntelligence,
             readNotes,
             readSummary,
+            readSessionArchive,
+            reindexSessions,
             renameSpeaker,
             resumeSession,
             revokeConsent,
+            searchSessions,
             startSession,
             stopSession,
             transcribeAudioFile,

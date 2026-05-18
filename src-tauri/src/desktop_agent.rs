@@ -2585,6 +2585,11 @@ fn meeting_audit_data_category(tool_name: &str) -> &'static str {
             "meeting_consent"
         }
         "meeting.session.read"
+        | "meeting.sessions.list"
+        | "meeting.session.archive.read"
+        | "meeting.session.search"
+        | "meeting.session.export"
+        | "meeting.session.reindex"
         | "meeting.session.start"
         | "meeting.session.manual"
         | "meeting.session.pause"

@@ -874,6 +874,102 @@ input {
     font-size: 12px;
 }
 
+.meeting-session-memory__search {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 8px;
+    align-items: center;
+}
+
+.meeting-session-memory__diagnostics,
+.meeting-session-list-item__meta,
+.meeting-session-memory__archive-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.meeting-session-memory__diagnostics span,
+.meeting-session-list-item__meta span,
+.meeting-session-memory__archive-meta span {
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.72);
+    border-radius: 999px;
+    padding: 5px 8px;
+    color: rgba(58, 79, 128, 0.78);
+    font-size: 12px;
+}
+
+.meeting-session-memory__grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    gap: 12px;
+}
+
+.meeting-session-memory__panel,
+.meeting-archive-view,
+.meeting-archive-export-preview {
+    display: grid;
+    gap: 10px;
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.74);
+    border-radius: 12px;
+    padding: 10px;
+}
+
+.meeting-session-list,
+.meeting-session-search-results,
+.meeting-session-memory__transcript-preview {
+    display: grid;
+    gap: 8px;
+}
+
+.meeting-session-list-item,
+.meeting-session-search-result {
+    display: grid;
+    gap: 8px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(85, 108, 190, 0.1);
+}
+
+.meeting-session-list-item:last-child,
+.meeting-session-search-result:last-child {
+    padding-bottom: 0;
+    border-bottom: 0;
+}
+
+.meeting-session-list-item strong,
+.meeting-session-search-result strong,
+.meeting-archive-view strong {
+    color: #26335f;
+}
+
+.meeting-session-list-item span,
+.meeting-session-search-result span,
+.meeting-session-search-result small,
+.meeting-archive-view span {
+    color: rgba(58, 79, 128, 0.72);
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.meeting-session-list-item p,
+.meeting-session-search-result p,
+.meeting-session-memory__transcript-preview p {
+    margin: 0;
+    color: rgba(41, 49, 78, 0.92);
+    font-size: 13px;
+    line-height: 1.45;
+}
+
+.meeting-archive-export-preview pre {
+    max-height: 280px;
+    overflow: auto;
+    margin: 0;
+    white-space: pre-wrap;
+    font-size: 12px;
+}
+
 .meeting-generated-item {
     display: grid;
     gap: 4px;
@@ -1234,6 +1330,8 @@ input {
     .meeting-intelligence-grid,
     .meeting-intelligence-meta,
     .meeting-generated-columns,
+    .meeting-session-memory__grid,
+    .meeting-session-memory__search,
     .meeting-call-status {
         grid-template-columns: 1fr;
     }

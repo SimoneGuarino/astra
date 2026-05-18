@@ -35,6 +35,7 @@ pub mod note_organizer;
 pub mod privacy_control;
 pub mod runtime;
 pub mod segment_writer;
+pub mod session_memory;
 pub mod session_registry;
 pub mod speaker_diarization;
 pub mod stt_adapter;

@@ -11,9 +11,14 @@ import type {
     DecisionLogEntry,
     MeetingConfig,
     MeetingDataClearPreview,
+    MeetingDiagnostic,
     MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
     MeetingSession,
+    MeetingSessionArchiveDocument,
+    MeetingSessionExportResponse,
+    MeetingSessionListItem,
+    MeetingSessionSearchResult,
     MeetingSessionState,
     MeetingStatus,
     SpeakerLabel,
@@ -353,6 +358,45 @@ function summarizeOperationResult(result: unknown): string {
         });
     }
 
+    if ("sessions" in result && Array.isArray(result.sessions)) {
+        return JSON.stringify({
+            sessions: result.sessions.length,
+            next_cursor: result.next_cursor ?? null,
+            diagnostics: Array.isArray(result.diagnostics) ? result.diagnostics.length : 0,
+        });
+    }
+
+    if ("results" in result && Array.isArray(result.results)) {
+        return JSON.stringify({
+            results: result.results.length,
+            searched_session_count: result.searched_session_count,
+            matched_session_count: result.matched_session_count,
+            truncated: result.truncated,
+            corrupt_archive_count: result.corrupt_archive_count,
+        });
+    }
+
+    if ("archive" in result && isRecord(result.archive)) {
+        const archive = result.archive;
+        const state = isRecord(archive.state) ? archive.state : {};
+        const transcript = Array.isArray(state.transcript) ? state.transcript.length : 0;
+        return JSON.stringify({
+            session_id: archive.session_id,
+            transcript,
+            intelligence_present: Boolean(state.intelligence),
+        });
+    }
+
+    if ("content_length" in result) {
+        return JSON.stringify({
+            session_id: result.session_id,
+            format: result.format,
+            filename: result.filename,
+            content_length: result.content_length,
+            diagnostics: Array.isArray(result.diagnostics) ? result.diagnostics.length : 0,
+        });
+    }
+
     if ("session_id" in result && "transcript" in result) {
         const transcript = Array.isArray(result.transcript) ? result.transcript.length : 0;
         const actionItems = Array.isArray(result.action_items) ? result.action_items.length : 0;
@@ -392,6 +436,58 @@ function formatEntryTime(value: string): string {
         minute: "2-digit",
         second: "2-digit",
     });
+}
+
+function formatSessionDate(value?: string | null): string {
+    if (!value) return "unknown";
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return value;
+    return parsed.toLocaleString([], {
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+    });
+}
+
+function artifactKindLabel(kind: string): string {
+    return kind
+        .replace(/^intelligence_/, "")
+        .replace(/_/g, " ")
+        .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function sttCompletenessLabel(status?: string | null): string {
+    switch (status) {
+        case "complete":
+            return "STT complete";
+        case "complete_no_speech":
+            return "STT complete/no speech";
+        case "captured_untranscribed":
+        case "incomplete_pending_queue":
+            return "STT incomplete - pending queue";
+        case "incomplete_drain_timeout":
+            return "STT incomplete - drain timed out";
+        case "incomplete_in_flight":
+            return "STT incomplete - in flight";
+        case "incomplete_failed_segments":
+            return "STT incomplete - failed segments";
+        case "incomplete_timeouts":
+            return "STT incomplete - timeout";
+        case "unavailable":
+            return "STT unavailable";
+        case "incomplete":
+            return "STT incomplete";
+        default:
+            return status ? `STT ${status}` : "STT unknown";
+    }
+}
+
+function hasIncompleteTranscriptionMetadata(metadata: unknown): boolean {
+    return (
+        isRecord(metadata) &&
+        metadata.meeting_segment_transcription_incomplete === true
+    );
 }
 
 function relativeTimestamp(value?: string | null): string {
@@ -487,6 +583,13 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const [isGeneratingIntelligence, setIsGeneratingIntelligence] = useState(false);
     const [isStoppingSession, setIsStoppingSession] = useState(false);
     const [expandedEvidenceKeys, setExpandedEvidenceKeys] = useState<Record<string, boolean>>({});
+    const [sessionMemory, setSessionMemory] = useState<MeetingSessionListItem[]>([]);
+    const [sessionMemoryDiagnostics, setSessionMemoryDiagnostics] = useState<MeetingDiagnostic[]>([]);
+    const [sessionSearchQuery, setSessionSearchQuery] = useState("");
+    const [sessionSearchResults, setSessionSearchResults] = useState<MeetingSessionSearchResult[]>([]);
+    const [openedArchive, setOpenedArchive] = useState<MeetingSessionArchiveDocument | null>(null);
+    const [archiveExport, setArchiveExport] = useState<MeetingSessionExportResponse | null>(null);
+    const [isSessionMemoryBusy, setIsSessionMemoryBusy] = useState(false);
 
     const meetingTools = useMemo(
         () => capabilities?.tools.filter((tool) => tool.category === "meeting") ?? [],
@@ -518,6 +621,10 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         () => new Map(transcriptEntries.map((entry) => [entry.segment_id, entry])),
         [transcriptEntries]
     );
+    const archivedTranscriptBySegmentId = useMemo(
+        () => new Map((openedArchive?.state.transcript ?? []).map((entry) => [entry.segment_id, entry])),
+        [openedArchive]
+    );
     const speakers = displayedState?.speakers ?? [];
     const notes = displayedState?.notes ?? [];
     const summaries = displayedState?.summary ?? [];
@@ -538,6 +645,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const segmentsFailed = metrics?.segments_failed ?? metrics?.segment_transcription_failures_total ?? 0;
     const segmentTranscriptionTimeouts = metrics?.segment_transcription_timeouts ?? 0;
     const pendingSegments = currentQueueDepth + segmentsInFlight;
+    const missingTranscriptSegments = Math.max(0, segmentsWritten - segmentsTranscribed);
     const capturedWithoutTranscript =
         segmentsWritten > 0 && segmentsTranscribed === 0 && transcriptEntries.length === 0;
     const drainStatus = metrics?.segment_transcription_drain_status ?? "idle";
@@ -680,10 +788,11 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             liveCapabilities?.capture_health.state === "capturing" ||
             currentStatusKind === "capturing";
         const isTranscribing =
-            (isRecording || currentStatusKind === "stopping") &&
-            (currentStatusKind === "transcribing" ||
-                pendingSegments > 0 ||
-                drainStatus === "running");
+            isStoppingSession ||
+            ((isRecording || currentStatusKind === "stopping") &&
+                (currentStatusKind === "transcribing" ||
+                    pendingSegments > 0 ||
+                    drainStatus === "running"));
         const failureReason =
             statusFailureReason(currentStatus) ??
             liveCapabilities?.capture_health.last_error ??
@@ -705,6 +814,18 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 blockingReasons: failureReason ? [failureReason] : [],
                 isRecording,
                 isTranscribing,
+            };
+        }
+
+        if (isStoppingSession || currentStatusKind === "stopping" || drainStatus === "running") {
+            return {
+                state: "transcribing",
+                title: "Stopping / draining STT",
+                description: `Astra is finalizing captured audio before archive/export. Queue: ${currentQueueDepth}; in flight: ${segmentsInFlight}; transcribed: ${segmentsTranscribed}/${segmentsWritten}.`,
+                nextAction: "Wait for bounded STT drain to finish or time out.",
+                blockingReasons: [],
+                isRecording,
+                isTranscribing: true,
             };
         }
 
@@ -821,12 +942,15 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         consentReady,
         currentStatus,
         currentStatusKind,
+        currentQueueDepth,
         googleMeetDetected,
         hasActiveSession,
+        isStoppingSession,
         lastTranscriptAt,
         liveCapabilities,
         metrics,
         pendingSegments,
+        segmentsInFlight,
         segmentsTranscribed,
         segmentsWritten,
         sessionMode,
@@ -847,6 +971,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             meeting.getAvailableAudioDevices(),
             meeting.autoDetectAudioBackend(),
             meeting.getLiveCapabilities(),
+            meeting.listSessions({ limit: 8 }),
         ]);
         const warnings: Record<string, string> = {};
 
@@ -858,6 +983,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             nextDevices,
             nextBackend,
             nextLiveCapabilities,
+            nextSessionMemory,
         ] = results;
 
         if (nextConsent.status === "fulfilled") setConsent(nextConsent.value);
@@ -880,6 +1006,13 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
 
         if (nextLiveCapabilities.status === "fulfilled") setLiveCapabilities(nextLiveCapabilities.value);
         else warnings.live_capabilities = errorText(nextLiveCapabilities.reason);
+
+        if (nextSessionMemory.status === "fulfilled") {
+            setSessionMemory(nextSessionMemory.value.sessions);
+            setSessionMemoryDiagnostics(nextSessionMemory.value.diagnostics);
+        } else {
+            warnings.session_memory = errorText(nextSessionMemory.reason);
+        }
 
         setRefreshWarnings(warnings);
     }, [meeting]);
@@ -1135,6 +1268,79 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         [meeting, runOperation]
     );
 
+    const handleOpenArchivedSession = useCallback(async (sessionId: string) => {
+        try {
+            setIsSessionMemoryBusy(true);
+            setLastError(null);
+            const response = await meeting.readSessionArchive({
+                session_id: sessionId,
+                include_transcript: true,
+                include_intelligence: true,
+                include_diagnostics: true,
+            });
+            setOpenedArchive(response.archive);
+            setArchiveExport(null);
+            setLastResult(`open archived session: ${summarizeOperationResult(response)}`);
+        } catch (error) {
+            setLastResult(null);
+            setLastError(`open archived session: ${errorText(error)}`);
+        } finally {
+            setIsSessionMemoryBusy(false);
+        }
+    }, [meeting]);
+
+    const handleSearchSessionMemory = useCallback(async () => {
+        const query = sessionSearchQuery.trim();
+        if (!query) {
+            setSessionSearchResults([]);
+            return;
+        }
+        try {
+            setIsSessionMemoryBusy(true);
+            setLastError(null);
+            const response = await meeting.searchSessions({ query, limit: 20 });
+            setSessionSearchResults(response.results);
+            setSessionMemoryDiagnostics(response.diagnostics);
+            setLastResult(`search session memory: ${summarizeOperationResult(response)}`);
+        } catch (error) {
+            setLastResult(null);
+            setLastError(`search session memory: ${errorText(error)}`);
+        } finally {
+            setIsSessionMemoryBusy(false);
+        }
+    }, [meeting, sessionSearchQuery]);
+
+    const handleExportArchivedSession = useCallback(async (sessionId: string, format: "markdown" | "json") => {
+        try {
+            setIsSessionMemoryBusy(true);
+            setLastError(null);
+            const response = await meeting.exportSessionArchive({ session_id: sessionId, format });
+            setArchiveExport(response);
+            setLastResult(`export archived session: ${summarizeOperationResult(response)}`);
+        } catch (error) {
+            setLastResult(null);
+            setLastError(`export archived session: ${errorText(error)}`);
+        } finally {
+            setIsSessionMemoryBusy(false);
+        }
+    }, [meeting]);
+
+    const handleReindexSessionMemory = useCallback(async () => {
+        try {
+            setIsSessionMemoryBusy(true);
+            setLastError(null);
+            const response = await meeting.reindexSessions();
+            setSessionMemory(response.sessions);
+            setSessionMemoryDiagnostics(response.diagnostics);
+            setLastResult(`reindex session memory: ${summarizeOperationResult(response)}`);
+        } catch (error) {
+            setLastResult(null);
+            setLastError(`reindex session memory: ${errorText(error)}`);
+        } finally {
+            setIsSessionMemoryBusy(false);
+        }
+    }, [meeting]);
+
     const handleCopyFollowUpDraft = useCallback(async () => {
         const draft = intelligence?.follow_up_draft;
         if (!draft) return;
@@ -1168,6 +1374,11 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const scrollToTranscript = useCallback(() => {
         transcriptRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, []);
+
+    const openedArchiveIntelligence = openedArchive?.state.intelligence ?? null;
+    const openedArchiveSummary = openedArchiveIntelligence?.summary ?? null;
+    const openedArchiveTitle =
+        openedArchive ? sessionMemory.find((item) => item.session_id === openedArchive.session_id)?.title ?? openedArchive.session_id : null;
 
     return (
         <div className="desktop-agent-section meeting-control-center">
@@ -1406,14 +1617,20 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 ) : null}
                 {finalizingStt ? (
                     <div className="meeting-stt-warning">
-                        <strong>Finalizing transcription.</strong>
-                        <p>Capture stopped or is stopping; Astra is draining pending segment STT before completion.</p>
+                        <strong>Stopping and draining STT queue.</strong>
+                        <p>
+                            Astra is waiting for bounded segment transcription finalization. Queue: {currentQueueDepth};
+                            in flight: {segmentsInFlight}; transcribed: {segmentsTranscribed}/{segmentsWritten}.
+                        </p>
                     </div>
                 ) : null}
                 {drainTimedOut ? (
                     <div className="meeting-stt-warning meeting-stt-warning--error">
-                        <strong>Segment transcription did not finish before the drain timeout.</strong>
-                        <p>Check STT worker/device diagnostics. Export metadata will include the incomplete transcription state.</p>
+                        <strong>STT drain timed out before all captured segments were transcribed.</strong>
+                        <p>
+                            The session was saved, but transcript/export may be missing {missingTranscriptSegments || segmentsInFlight || currentQueueDepth} segment(s).
+                            Check STT worker/device diagnostics.
+                        </p>
                     </div>
                 ) : null}
                 <div className="desktop-agent-inline-actions">
@@ -1435,6 +1652,221 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         Streaming STT unsupported
                     </Button>
                 </div>
+            </section>
+
+            <section className="desktop-agent-card meeting-section-card meeting-session-memory">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Session Memory</p>
+                        <h3>Archived Sessions</h3>
+                        <p>Local completed sessions, indexed for governed read/search/export.</p>
+                    </div>
+                    <span className="meeting-count-pill">{sessionMemory.length} recent</span>
+                </div>
+
+                <div className="meeting-session-memory__search">
+                    <input
+                        className="desktop-agent-input"
+                        value={sessionSearchQuery}
+                        onChange={(event) => setSessionSearchQuery(event.target.value)}
+                        placeholder="Search transcripts and artifacts"
+                        aria-label="Search archived meeting sessions"
+                    />
+                    <Button
+                        variant="secondary"
+                        radius="full"
+                        size="xs"
+                        disabled={isSessionMemoryBusy || !sessionSearchQuery.trim()}
+                        onClick={() => void handleSearchSessionMemory()}
+                    >
+                        Search
+                    </Button>
+                    <Button
+                        variant="text"
+                        radius="full"
+                        size="xs"
+                        disabled={isSessionMemoryBusy}
+                        onClick={() => void handleReindexSessionMemory()}
+                    >
+                        Reindex
+                    </Button>
+                </div>
+
+                {sessionMemoryDiagnostics.length ? (
+                    <div className="meeting-session-memory__diagnostics">
+                        {sessionMemoryDiagnostics.slice(0, 3).map((diagnostic) => (
+                            <span key={`${diagnostic.code}-${diagnostic.created_at}`}>
+                                {diagnostic.severity}: {diagnostic.code}
+                            </span>
+                        ))}
+                    </div>
+                ) : null}
+
+                <div className="meeting-session-memory__grid">
+                    <div className="meeting-session-memory__panel">
+                        <div className="meeting-generated-block__header">
+                            <h4>Recent Sessions</h4>
+                            <span>{isSessionMemoryBusy ? "working" : "local"}</span>
+                        </div>
+                        {sessionMemory.length ? (
+                            <div className="meeting-session-list">
+                                {sessionMemory.map((item) => (
+                                    <article key={item.session_id} className="meeting-session-list-item">
+                                        <div>
+                                            <strong>{item.title}</strong>
+                                            <span>{formatSessionDate(item.started_at)} - {item.platform}</span>
+                                            <p>{item.summary_preview || "No summary preview yet."}</p>
+                                        </div>
+                                        <div className="meeting-session-list-item__meta">
+                                            <span>{item.transcript_count} transcript</span>
+                                            <span>{item.intelligence_present ? "intelligence" : "no intelligence"}</span>
+                                            <span>{sttCompletenessLabel(item.stt_completeness_status)}</span>
+                                            <span>Drain: {item.drain_status || "unknown"}</span>
+                                        </div>
+                                        {item.stt_completeness_detail ? (
+                                            <p className="desktop-agent-muted">{item.stt_completeness_detail}</p>
+                                        ) : null}
+                                        <div className="desktop-agent-inline-actions">
+                                            <Button
+                                                variant="text"
+                                                radius="full"
+                                                size="xs"
+                                                disabled={isSessionMemoryBusy}
+                                                onClick={() => void handleOpenArchivedSession(item.session_id)}
+                                            >
+                                                Open
+                                            </Button>
+                                            <Button
+                                                variant="text"
+                                                radius="full"
+                                                size="xs"
+                                                disabled={isSessionMemoryBusy}
+                                                onClick={() => void handleExportArchivedSession(item.session_id, "markdown")}
+                                            >
+                                                Export MD
+                                            </Button>
+                                            <Button
+                                                variant="text"
+                                                radius="full"
+                                                size="xs"
+                                                disabled={isSessionMemoryBusy}
+                                                onClick={() => void handleExportArchivedSession(item.session_id, "json")}
+                                            >
+                                                Export JSON
+                                            </Button>
+                                        </div>
+                                    </article>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="desktop-agent-empty">No archived sessions yet. Completed meetings appear here after Stop.</div>
+                        )}
+                    </div>
+
+                    <div className="meeting-session-memory__panel">
+                        <div className="meeting-generated-block__header">
+                            <h4>Search Results</h4>
+                            <span>{sessionSearchResults.length}</span>
+                        </div>
+                        {sessionSearchResults.length ? (
+                            <div className="meeting-session-search-results">
+                                {sessionSearchResults.map((result, index) => (
+                                    <article key={`${result.session_id}-${result.matched_kind}-${index}`} className="meeting-session-search-result">
+                                        <span>{artifactKindLabel(result.matched_kind)} - {result.session_title}</span>
+                                        <strong>{result.title}</strong>
+                                        <p>{result.snippet}</p>
+                                        <small>
+                                            {result.speaker_display_name ? `${result.speaker_display_name} - ` : ""}
+                                            Evidence: {result.evidence_segment_ids.join(", ") || "none"}
+                                        </small>
+                                        <Button
+                                            variant="text"
+                                            radius="full"
+                                            size="xs"
+                                            disabled={isSessionMemoryBusy}
+                                            onClick={() => void handleOpenArchivedSession(result.session_id)}
+                                        >
+                                            Open session
+                                        </Button>
+                                    </article>
+                                ))}
+                            </div>
+                        ) : (
+                            <div className="desktop-agent-empty">Search uses bounded lexical matching across transcripts and saved artifacts.</div>
+                        )}
+                    </div>
+                </div>
+
+                {openedArchive ? (
+                    <article className="meeting-archive-view">
+                        <div className="meeting-generated-block__header">
+                            <div>
+                                <h4>Archived Session: {openedArchiveTitle}</h4>
+                                <span>{formatSessionDate(openedArchive.exported.started_at)} - {openedArchive.exported.platform}</span>
+                            </div>
+                            <span>{openedArchive.state.transcript.length} transcript entries</span>
+                        </div>
+                        {hasIncompleteTranscriptionMetadata(openedArchive.exported.metadata) ? (
+                            <p className="meeting-intelligence-warning">
+                                This archived export includes incomplete STT diagnostics. Check metadata before relying on the transcript.
+                            </p>
+                        ) : null}
+                        {openedArchiveSummary ? (
+                            <div className="meeting-generated-item">
+                                <strong>Summary</strong>
+                                <p>{openedArchiveSummary.text}</p>
+                                <EvidencePreview
+                                    ids={openedArchiveSummary.evidence_segment_ids}
+                                    transcriptBySegmentId={archivedTranscriptBySegmentId}
+                                    expanded={expandedEvidenceKeys[`archive-summary-${openedArchiveSummary.id}`] === true}
+                                    onToggle={() =>
+                                        setExpandedEvidenceKeys((prev) => ({
+                                            ...prev,
+                                            [`archive-summary-${openedArchiveSummary.id}`]:
+                                                !prev[`archive-summary-${openedArchiveSummary.id}`],
+                                        }))
+                                    }
+                                />
+                            </div>
+                        ) : null}
+                        <div className="meeting-session-memory__archive-meta">
+                            <span>Actions: <strong>{openedArchive.state.action_items.length + (openedArchiveIntelligence?.action_items.length ?? 0)}</strong></span>
+                            <span>Decisions: <strong>{openedArchive.state.decisions.length + (openedArchiveIntelligence?.decisions.length ?? 0)}</strong></span>
+                            <span>Speakers: <strong>{openedArchive.state.speakers.map((speaker) => speaker.display_name).join(", ") || "none"}</strong></span>
+                            <span>STT: <strong>{sttCompletenessLabel(sessionMemory.find((item) => item.session_id === openedArchive.session_id)?.stt_completeness_status)}</strong></span>
+                        </div>
+                        {sessionMemory.find((item) => item.session_id === openedArchive.session_id)?.stt_completeness_detail ? (
+                            <p className="desktop-agent-muted">
+                                {sessionMemory.find((item) => item.session_id === openedArchive.session_id)?.stt_completeness_detail}
+                            </p>
+                        ) : null}
+                        <div className="meeting-session-memory__transcript-preview">
+                            {openedArchive.state.transcript.slice(0, 5).map((entry) => (
+                                <p key={entry.segment_id}>
+                                    <strong>[{transcriptSourceLabel(entry.source)}] {speakerDisplayName(entry)}:</strong> {truncateEvidenceText(entry.text, 220)}
+                                </p>
+                            ))}
+                            {openedArchive.state.transcript.length > 5 ? (
+                                <p className="desktop-agent-muted">{openedArchive.state.transcript.length - 5} more transcript entries in archive/export.</p>
+                            ) : null}
+                        </div>
+                    </article>
+                ) : null}
+
+                {archiveExport ? (
+                    <article className="meeting-archive-export-preview">
+                        <div className="meeting-generated-block__header">
+                            <h4>{archiveExport.filename}</h4>
+                            <span>{archiveExport.content_length} bytes</span>
+                        </div>
+                        {archiveExport.diagnostics.length ? (
+                            <p className="meeting-intelligence-warning">
+                                Export diagnostics: {archiveExport.diagnostics.map((diagnostic) => diagnostic.code).join(", ")}
+                            </p>
+                        ) : null}
+                        <pre>{archiveExport.content.slice(0, 2400)}{archiveExport.content.length > 2400 ? "\n..." : ""}</pre>
+                    </article>
+                ) : null}
             </section>
 
             <section ref={transcriptRef} className="desktop-agent-card meeting-section-card">
