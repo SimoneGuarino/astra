@@ -59,6 +59,7 @@ fn save_partial_state(
         "summary_count": state.summary.len(),
         "action_items_count": state.action_items.len(),
         "decisions_count": state.decisions.len(),
+        "screen_context_count": state.screen_contexts.len(),
         "intelligence_present": state.intelligence.is_some(),
     }))
     .map_err(|error| MeetingRuntimeError::SerializationError {
@@ -132,6 +133,7 @@ impl SessionRegistry {
             action_items: Vec::new(),
             decisions: Vec::new(),
             notes: Vec::new(),
+            screen_contexts: Vec::new(),
             intelligence: None,
             speakers: default_session_speakers(),
             speaker_rename_count: 0,
@@ -268,6 +270,7 @@ impl SessionRegistry {
             decisions: completed_state.decisions.clone(),
             notes: completed_state.notes.clone(),
             intelligence: completed_state.intelligence.clone(),
+            screen_contexts: completed_state.screen_contexts.clone(),
             metadata: json!({
                 "capture_backend": completed_state.session.config.capture_backend,
                 "transcription_model": completed_state.session.config.transcription_model,
@@ -358,6 +361,52 @@ impl SessionRegistry {
         Ok(())
     }
 
+    pub fn add_screen_context(
+        &mut self,
+        mut context: MeetingScreenContext,
+    ) -> Result<MeetingScreenContextAttachResponse, MeetingRuntimeError> {
+        let storage_dir = self.storage_dir.clone();
+        let target = self.screen_context_target_state_mut(context.session_id.as_str())?;
+        context.session_id = target.session.session_id.clone();
+        let linked_segments =
+            nearest_transcript_segment_ids(&target.transcript, context.captured_at, 3);
+        context.linked_transcript_segment_ids = linked_segments;
+        context.linked_time_window = linked_transcript_time_window(
+            &target.transcript,
+            &context.linked_transcript_segment_ids,
+        );
+
+        if context.linked_transcript_segment_ids.is_empty() {
+            context.diagnostics.push(MeetingDiagnostic {
+                code: "screen_context_no_transcript_link".to_string(),
+                severity: MeetingDiagnosticSeverity::Warning,
+                message: "Screen context was attached without transcript segments to link"
+                    .to_string(),
+                created_at: Utc::now(),
+            });
+        }
+
+        let diagnostics = context.diagnostics.clone();
+        target.screen_contexts.push(context.clone());
+        target.intelligence = None;
+        target.last_updated_at = Utc::now();
+        target.diagnostics.push(MeetingDiagnostic {
+            code: "screen_context_attached".to_string(),
+            severity: MeetingDiagnosticSeverity::Info,
+            message: format!(
+                "Screen context attached with {} linked transcript segment(s); screenshot_stored={}",
+                context.linked_transcript_segment_ids.len(),
+                context.screenshot_ref.is_some()
+            ),
+            created_at: Utc::now(),
+        });
+        save_partial_state(&storage_dir, target)?;
+        Ok(MeetingScreenContextAttachResponse {
+            context,
+            diagnostics,
+        })
+    }
+
     pub fn get_transcript(&self) -> &[TranscriptEntry] {
         &self.active_state.transcript
     }
@@ -427,6 +476,7 @@ impl SessionRegistry {
                 session_id: target.session.session_id.clone(),
                 transcript_entries: target.transcript.clone(),
                 speakers: target.speakers.clone(),
+                screen_contexts: target.screen_contexts.clone(),
                 generation_options: options,
             },
             transcription_model: target.session.config.transcription_model.clone(),
@@ -515,6 +565,7 @@ impl SessionRegistry {
             session_id: target.session.session_id.clone(),
             transcript_entries: target.transcript.clone(),
             speakers: target.speakers.clone(),
+            screen_contexts: target.screen_contexts.clone(),
             generation_options: options,
         })
     }
@@ -571,6 +622,30 @@ impl SessionRegistry {
         self.last_completed_state
             .as_mut()
             .ok_or(MeetingRuntimeError::NoActiveSession)
+    }
+
+    fn screen_context_target_state_mut(
+        &mut self,
+        requested_session_id: &str,
+    ) -> Result<&mut MeetingSessionState, MeetingRuntimeError> {
+        let requested = requested_session_id.trim();
+        if self.active_session.is_some()
+            && (requested.is_empty() || requested == self.active_state.session.session_id)
+        {
+            return Ok(&mut self.active_state);
+        }
+        if let Some(state) = self.last_completed_state.as_mut() {
+            if !requested.is_empty() && requested == state.session.session_id {
+                return Ok(state);
+            }
+        }
+        if requested.is_empty() {
+            Err(MeetingRuntimeError::NoActiveSession)
+        } else {
+            Err(MeetingRuntimeError::InvalidConfig {
+                message: "requested meeting session is not active or last completed".to_string(),
+            })
+        }
     }
 
     pub fn clear(&mut self) {
@@ -795,6 +870,7 @@ fn idle_state() -> MeetingSessionState {
         action_items: Vec::new(),
         decisions: Vec::new(),
         notes: Vec::new(),
+        screen_contexts: Vec::new(),
         intelligence: None,
         speakers: default_session_speakers(),
         speaker_rename_count: 0,
@@ -819,6 +895,45 @@ fn transcript_order(left: &TranscriptEntry, right: &TranscriptEntry) -> std::cmp
             right.created_at,
             right.segment_id.as_str(),
         ))
+}
+
+fn nearest_transcript_segment_ids(
+    transcript: &[TranscriptEntry],
+    captured_at: chrono::DateTime<Utc>,
+    limit: usize,
+) -> Vec<String> {
+    let mut before = transcript
+        .iter()
+        .filter(|entry| entry.timestamp <= captured_at || entry.created_at <= captured_at)
+        .collect::<Vec<_>>();
+    before.sort_by(|left, right| {
+        right
+            .timestamp
+            .cmp(&left.timestamp)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| right.segment_id.cmp(&left.segment_id))
+    });
+    before
+        .into_iter()
+        .take(limit)
+        .map(|entry| entry.segment_id.clone())
+        .collect()
+}
+
+fn linked_transcript_time_window(
+    transcript: &[TranscriptEntry],
+    segment_ids: &[String],
+) -> Option<MeetingTimeWindow> {
+    if segment_ids.is_empty() {
+        return None;
+    }
+    let selected = transcript
+        .iter()
+        .filter(|entry| segment_ids.iter().any(|id| id == &entry.segment_id))
+        .collect::<Vec<_>>();
+    let start_at = selected.iter().map(|entry| entry.timestamp).min()?;
+    let end_at = selected.iter().map(|entry| entry.timestamp).max()?;
+    Some(MeetingTimeWindow { start_at, end_at })
 }
 
 fn transcript_signature(transcript: &[TranscriptEntry]) -> Vec<String> {

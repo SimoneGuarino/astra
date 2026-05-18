@@ -175,6 +175,72 @@ export type MeetingDiagnostic = {
     created_at: string;
 };
 
+export type ScreenContextSource =
+    | "manual_capture"
+    | "user_requested"
+    | "session_marker"
+    | "imported";
+
+export type ScreenContextAttachmentMode =
+    | "current_moment"
+    | "nearest_transcript_window"
+    | "manual_selection";
+
+export type ScreenContextRedaction =
+    | "metadata_only"
+    | "screenshot_stored"
+    | "screenshot_not_stored"
+    | "redacted";
+
+export type MeetingTimeWindow = {
+    start_at: string;
+    end_at: string;
+};
+
+export type ScreenArtifactRef = {
+    storage_uri: string;
+    media_type: string;
+    bytes: number;
+    width?: number | null;
+    height?: number | null;
+};
+
+export type ScreenStructuredObservation = {
+    provider: string;
+    model?: string | null;
+    semantic_frame?: unknown | null;
+    visible_app?: string | null;
+    page_kind?: string | null;
+};
+
+export type MeetingScreenContext = {
+    context_id: string;
+    session_id: string;
+    captured_at: string;
+    source: ScreenContextSource;
+    attachment_mode: ScreenContextAttachmentMode;
+    linked_transcript_segment_ids: string[];
+    linked_time_window?: MeetingTimeWindow | null;
+    summary: string;
+    structured_observation?: ScreenStructuredObservation | null;
+    screenshot_ref?: ScreenArtifactRef | null;
+    redaction: ScreenContextRedaction;
+    confidence: number;
+    diagnostics: MeetingDiagnostic[];
+};
+
+export type MeetingScreenContextAttachRequest = {
+    session_id?: string | null;
+    store_screenshot?: boolean;
+    capture_fresh?: boolean;
+    attachment_mode?: ScreenContextAttachmentMode;
+};
+
+export type MeetingScreenContextAttachResponse = {
+    context: MeetingScreenContext;
+    diagnostics: MeetingDiagnostic[];
+};
+
 export type MeetingSessionState = {
     session: MeetingSession;
     transcript: TranscriptEntry[];
@@ -183,6 +249,7 @@ export type MeetingSessionState = {
     decisions: DecisionLogEntry[];
     notes: NoteEntry[];
     intelligence?: MeetingIntelligenceResult | null;
+    screen_contexts: MeetingScreenContext[];
     speakers: SpeakerLabel[];
     speaker_rename_count: number;
     status: MeetingStatus;
@@ -385,6 +452,7 @@ export type ExportedMeeting = {
     decisions: DecisionLogEntry[];
     notes: NoteEntry[];
     intelligence?: MeetingIntelligenceResult | null;
+    screen_contexts: MeetingScreenContext[];
     metadata: unknown;
 };
 
@@ -395,6 +463,7 @@ export type MeetingSessionArchiveDocument = {
     updated_at: string;
     state: MeetingSessionState;
     exported: ExportedMeeting;
+    screen_contexts: MeetingScreenContext[];
     capture_health: CaptureHealth;
     system_capture_health: CaptureHealth;
     microphone_capture_health: CaptureHealth;
@@ -425,6 +494,7 @@ export type MeetingSessionListItem = {
     open_question_count: number;
     risk_count: number;
     technical_recap_present: boolean;
+    screen_context_count: number;
     speakers_preview: string[];
     capture_sources: string[];
     stt_completeness_status: string;
@@ -466,6 +536,7 @@ export type MeetingSessionSearchResult = {
     evidence_segment_ids: string[];
     speaker_display_name?: string | null;
     timestamp_ms?: number | null;
+    screen_context_id?: string | null;
 };
 
 export type MeetingSessionSearchResponse = {

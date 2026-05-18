@@ -47,6 +47,7 @@ use assistant_response::{
     speech_safe_text, RenderedAssistantResponse, StreamPresentationState,
 };
 use audio_files::AudioFileRegistry;
+use chrono::{DateTime, Utc};
 use conversation_history::ConversationHistoryManager;
 use conversation_router::{route_message, ConversationRoute};
 use desktop_agent::DesktopAgentRuntime;
@@ -65,11 +66,13 @@ use meeting::{
         MeetingAudioFileTranscriptionResult, MeetingConfig, MeetingDataClearPreview,
         MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionExportRequest,
+        MeetingLiveCapabilitySnapshot, MeetingScreenContext, MeetingScreenContextAttachRequest,
+        MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
         MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
         MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
         MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState, NoteEntry,
-        RenameSpeakerRequest, RenameSpeakerResult, SummaryEntry, TranscriptEntry,
+        RenameSpeakerRequest, RenameSpeakerResult, ScreenContextRedaction, ScreenContextSource,
+        ScreenStructuredObservation, SummaryEntry, TranscriptEntry,
     },
 };
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
@@ -2211,6 +2214,174 @@ fn meeting_file_transcription_preflight_params(
     })
 }
 
+fn meeting_screen_context_preflight_params(
+    request: &MeetingScreenContextAttachRequest,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id_present": request
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+        "store_screenshot_requested": request.store_screenshot,
+        "capture_fresh": request.capture_fresh,
+        "attachment_mode": request.attachment_mode,
+        "metadata_only": true,
+        "screen_pixels_included": false,
+        "screen_text_included": false,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    })
+}
+
+fn meeting_screen_context_datetime_from_ms(timestamp_ms: u64) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms as i64).unwrap_or_else(Utc::now)
+}
+
+fn bounded_meeting_screen_summary(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let bounded = compact.chars().take(900).collect::<String>();
+    if bounded.trim().is_empty() {
+        "Current screen captured, but no structured visual summary was available.".to_string()
+    } else {
+        bounded
+    }
+}
+
+fn meeting_screen_context_summary(
+    capture: &ScreenCaptureResult,
+    analysis: Option<&ScreenAnalysisResult>,
+) -> String {
+    if let Some(analysis) = analysis {
+        let answer = bounded_meeting_screen_summary(&analysis.answer);
+        if answer != "Current screen captured, but no structured visual summary was available." {
+            return answer;
+        }
+    }
+    format!(
+        "Screen snapshot captured through {} at {}.",
+        capture.provider,
+        meeting_screen_context_datetime_from_ms(capture.captured_at).format("%Y-%m-%dT%H:%M:%SZ")
+    )
+}
+
+fn meeting_screen_context_diagnostics(codes: Vec<String>) -> Vec<MeetingDiagnostic> {
+    codes
+        .into_iter()
+        .map(|code| {
+            let (normalized_code, message) = code
+                .split_once(':')
+                .map(|(code, detail)| {
+                    (
+                        code.to_string(),
+                        format!(
+                            "{} ({})",
+                            meeting_screen_context_diagnostic_message(code),
+                            detail
+                        ),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        code.clone(),
+                        meeting_screen_context_diagnostic_message(&code).to_string(),
+                    )
+                });
+            MeetingDiagnostic {
+                code: normalized_code,
+                severity: meeting_screen_context_diagnostic_severity(&code),
+                message,
+                created_at: Utc::now(),
+            }
+        })
+        .collect()
+}
+
+fn meeting_screen_context_diagnostic_message(code: &str) -> &'static str {
+    match code {
+        "screen_context_screenshot_not_stored" => {
+            "Raw screenshot was not stored; only the screen context summary was attached"
+        }
+        "screen_context_screenshot_storage_unsupported" => {
+            "Screenshot storage was requested but is disabled for this privacy-safe attachment path"
+        }
+        "screen_context_screenshot_cleanup_unconfirmed" => {
+            "Temporary screenshot cleanup could not be confirmed"
+        }
+        "screen_context_vision_unavailable" => {
+            "Local screen vision summary was unavailable; attached capture metadata only"
+        }
+        _ => "Screen context diagnostic recorded",
+    }
+}
+
+fn meeting_screen_context_diagnostic_severity(
+    code: &str,
+) -> meeting::types::MeetingDiagnosticSeverity {
+    match code {
+        "screen_context_screenshot_cleanup_unconfirmed" => {
+            meeting::types::MeetingDiagnosticSeverity::Warning
+        }
+        code if code.starts_with("screen_context_vision_unavailable") => {
+            meeting::types::MeetingDiagnosticSeverity::Warning
+        }
+        _ => meeting::types::MeetingDiagnosticSeverity::Info,
+    }
+}
+
+fn build_meeting_screen_context(
+    request: &MeetingScreenContextAttachRequest,
+    capture: &ScreenCaptureResult,
+    analysis: Option<&ScreenAnalysisResult>,
+    diagnostic_codes: Vec<String>,
+) -> MeetingScreenContext {
+    let structured_observation = analysis.map(|analysis| ScreenStructuredObservation {
+        provider: analysis.provider.clone(),
+        model: Some(analysis.model.clone()),
+        semantic_frame: analysis.semantic_frame.as_ref().and_then(|frame| {
+            let mut value = serde_json::to_value(frame).ok()?;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("image_path");
+            }
+            Some(value)
+        }),
+        visible_app: analysis
+            .semantic_frame
+            .as_ref()
+            .and_then(|frame| frame.page_evidence.browser_app_hint.clone()),
+        page_kind: analysis
+            .semantic_frame
+            .as_ref()
+            .and_then(|frame| frame.page_evidence.page_kind_hint.clone())
+            .or_else(|| {
+                analysis
+                    .semantic_frame
+                    .as_ref()
+                    .and_then(|frame| frame.page_state.as_ref().map(|state| state.kind.clone()))
+            }),
+    });
+    MeetingScreenContext {
+        context_id: Uuid::new_v4().to_string(),
+        session_id: request
+            .session_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        captured_at: meeting_screen_context_datetime_from_ms(capture.captured_at),
+        source: ScreenContextSource::ManualCapture,
+        attachment_mode: request.attachment_mode.clone(),
+        linked_transcript_segment_ids: Vec::new(),
+        linked_time_window: None,
+        summary: meeting_screen_context_summary(capture, analysis),
+        structured_observation,
+        screenshot_ref: None,
+        redaction: ScreenContextRedaction::ScreenshotNotStored,
+        confidence: if analysis.is_some() { 0.7 } else { 0.35 },
+        diagnostics: meeting_screen_context_diagnostics(diagnostic_codes),
+    }
+}
+
 fn meeting_value<T: Serialize>(value: T) -> Result<serde_json::Value, String> {
     serde_json::to_value(value)
         .map_err(|error| format!("meeting result serialization failed: {error}"))
@@ -2512,6 +2683,52 @@ fn read_meeting_diagnostics(
         },
     )?;
     meeting_from_value(value)
+}
+
+#[tauri::command]
+async fn attach_current_screen_to_meeting(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+    request: MeetingScreenContextAttachRequest,
+) -> Result<MeetingScreenContextAttachResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let governing_agent = state.desktop_agent.clone();
+    let capture_agent = governing_agent.clone();
+    let params = meeting_screen_context_preflight_params(&request);
+    let value = governing_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.screen_context.attach_current",
+            params,
+            false,
+            move || async move {
+                let (capture, analysis, diagnostic_codes) = capture_agent
+                    .capture_screen_for_meeting_context(request.store_screenshot)
+                    .await?;
+                let context = build_meeting_screen_context(
+                    &request,
+                    &capture,
+                    analysis.as_ref(),
+                    diagnostic_codes,
+                );
+                meeting_value(
+                    meeting
+                        .attach_screen_context(context)
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    let response = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-session-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(response)
 }
 
 #[tauri::command]
@@ -3622,6 +3839,7 @@ pub fn run() {
             read_meeting_action_items,
             read_meeting_decisions,
             read_meeting_diagnostics,
+            attach_current_screen_to_meeting,
             generate_meeting_intelligence,
             read_meeting_intelligence,
             clear_meeting_intelligence,

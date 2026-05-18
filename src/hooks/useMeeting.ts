@@ -21,6 +21,8 @@ import type {
     MeetingSessionExportResponse,
     MeetingSessionListRequest,
     MeetingSessionListResponse,
+    MeetingScreenContextAttachRequest,
+    MeetingScreenContextAttachResponse,
     MeetingSessionReadRequest,
     MeetingSessionReadResponse,
     MeetingSessionSearchRequest,
@@ -105,6 +107,12 @@ export function useMeeting() {
 
     const readDiagnostics = useCallback(
         () => invoke<MeetingDiagnostic[]>("read_meeting_diagnostics"),
+        []
+    );
+
+    const attachCurrentScreen = useCallback(
+        (request: MeetingScreenContextAttachRequest = {}) =>
+            invoke<MeetingScreenContextAttachResponse>("attach_current_screen_to_meeting", { request }),
         []
     );
 
@@ -233,6 +241,7 @@ export function useMeeting() {
             addActionItem,
             addDecision,
             addTranscript,
+            attachCurrentScreen,
             autoDetectAudioBackend,
             clearData,
             clearIntelligence,
@@ -271,6 +280,7 @@ export function useMeeting() {
             addActionItem,
             addDecision,
             addTranscript,
+            attachCurrentScreen,
             autoDetectAudioBackend,
             clearData,
             clearIntelligence,

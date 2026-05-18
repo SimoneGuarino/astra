@@ -25,12 +25,13 @@ use super::{
         MeetingAudioFileTranscriptionResult, MeetingCapabilityReadiness, MeetingCapabilityState,
         MeetingConfig, MeetingDataClearPreview, MeetingDataClearResult,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult, MeetingLanguage,
-        MeetingLiveCapabilitySnapshot, MeetingSession, MeetingSessionExportRequest,
-        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
-        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
-        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
-        MeetingStatus, RenameSpeakerRequest, RenameSpeakerResult, SpeakerAttributionMethod,
-        TranscriptEntry, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingLiveCapabilitySnapshot, MeetingScreenContext, MeetingScreenContextAttachResponse,
+        MeetingSession, MeetingSessionExportRequest, MeetingSessionExportResponse,
+        MeetingSessionListRequest, MeetingSessionListResponse, MeetingSessionMode,
+        MeetingSessionReadRequest, MeetingSessionReadResponse, MeetingSessionSearchRequest,
+        MeetingSessionSearchResponse, MeetingSessionState, MeetingStatus, RenameSpeakerRequest,
+        RenameSpeakerResult, SpeakerAttributionMethod, TranscriptEntry, TranscriptSource,
+        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
 };
 use crate::stt_client::SttClient;
@@ -925,6 +926,14 @@ impl MeetingRuntime {
         &self,
     ) -> Result<MeetingSessionListResponse, MeetingRuntimeError> {
         self.session_memory.rebuild_index()
+    }
+
+    pub fn attach_screen_context(
+        &self,
+        context: MeetingScreenContext,
+    ) -> Result<MeetingScreenContextAttachResponse, MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        registry.add_screen_context(context)
     }
 
     pub fn add_transcript(&self, mut entry: TranscriptEntry) -> Result<(), MeetingRuntimeError> {
@@ -2204,10 +2213,11 @@ mod tests {
     use crate::meeting::types::{
         derive_meeting_stt_source_completeness, ActionItemStatus, ArtifactGenerator,
         CaptureMetrics, ClearMeetingDataRequest, MeetingClearScope,
-        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus, MeetingScreenContext,
         MeetingSessionExportFormat, MeetingSessionExportRequest, MeetingSessionListRequest,
         MeetingSessionReadRequest, MeetingSessionSearchRequest, MeetingStatus,
-        MeetingSttCompletenessStatus, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingSttCompletenessStatus, ScreenContextAttachmentMode, ScreenContextRedaction,
+        ScreenContextSource, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
         LOCAL_USER_SPEAKER_ID, REMOTE_SPEAKER_1_ID,
     };
     use crate::meeting::{
@@ -2433,6 +2443,27 @@ mod tests {
         TranscriptEntry::sourced("", TranscriptSource::Manual, "speaker", "hello", 0.95)
     }
 
+    fn screen_context(
+        session_id: &str,
+        captured_at: chrono::DateTime<Utc>,
+    ) -> MeetingScreenContext {
+        MeetingScreenContext {
+            context_id: "screen-context-test".to_string(),
+            session_id: session_id.to_string(),
+            captured_at,
+            source: ScreenContextSource::ManualCapture,
+            attachment_mode: ScreenContextAttachmentMode::CurrentMoment,
+            linked_transcript_segment_ids: Vec::new(),
+            linked_time_window: None,
+            summary: "Visual Studio Code shows a GPU memory warning in the TTS module".to_string(),
+            structured_observation: None,
+            screenshot_ref: None,
+            redaction: ScreenContextRedaction::ScreenshotNotStored,
+            confidence: 0.7,
+            diagnostics: Vec::new(),
+        }
+    }
+
     #[test]
     fn privacy_state_denies_recording_by_default() {
         let runtime = MeetingRuntime::new(temp_root());
@@ -2545,6 +2576,7 @@ mod tests {
             decisions: Vec::new(),
             notes: Vec::new(),
             intelligence: None,
+            screen_contexts: Vec::new(),
             metadata: serde_json::json!({}),
         };
         let mut system_health = CaptureHealth::default();
@@ -2985,6 +3017,21 @@ mod tests {
             .transcribe_captured_segment(segment, None, false)
             .await
             .expect("system transcription");
+        let active_after_transcript = runtime.get_active_state().expect("active state");
+        let linked_entry_id = active_after_transcript
+            .transcript
+            .first()
+            .expect("transcript entry")
+            .segment_id
+            .clone();
+        let attached_screen = runtime
+            .attach_screen_context(screen_context(&session.session_id, Utc::now()))
+            .expect("attach screen context");
+        assert_eq!(attached_screen.context.screenshot_ref, None);
+        assert!(attached_screen
+            .context
+            .linked_transcript_segment_ids
+            .contains(&linked_entry_id));
         runtime
             .rename_speaker(RenameSpeakerRequest {
                 speaker_id: REMOTE_SPEAKER_1_ID.to_string(),
@@ -3001,6 +3048,7 @@ mod tests {
         assert!(archive_dir.join("session.json").exists());
         assert!(archive_dir.join("transcript.json").exists());
         assert!(archive_dir.join("intelligence.json").exists());
+        assert!(archive_dir.join("screen_context.json").exists());
         assert!(archive_dir.join("export.md").exists());
 
         let list = runtime
@@ -3020,6 +3068,7 @@ mod tests {
         assert!(item.intelligence_present);
         assert!(item.speakers_preview.iter().any(|name| name == "Marco"));
         assert_eq!(item.stt_completeness_status, "complete");
+        assert_eq!(item.screen_context_count, 1);
 
         let read = runtime
             .read_archived_session(MeetingSessionReadRequest {
@@ -3031,6 +3080,11 @@ mod tests {
             .expect("read archived session");
         let archive = read.archive;
         assert_eq!(archive.state.transcript.len(), 1);
+        assert_eq!(archive.state.screen_contexts.len(), 1);
+        assert_eq!(archive.screen_contexts.len(), 1);
+        assert!(archive.state.screen_contexts[0]
+            .linked_transcript_segment_ids
+            .contains(&linked_entry_id));
         assert_eq!(
             archive.state.transcript[0].speaker_label.as_deref(),
             Some("Marco")
@@ -3076,6 +3130,17 @@ mod tests {
             )
         }));
 
+        let screen_search = runtime
+            .search_archived_sessions(MeetingSessionSearchRequest {
+                query: "gpu memory".to_string(),
+                limit: 20,
+            })
+            .expect("search screen context");
+        assert!(screen_search.results.iter().any(|result| {
+            result.matched_kind == "screen_context"
+                && result.screen_context_id.as_deref() == Some("screen-context-test")
+        }));
+
         let markdown = runtime
             .export_archived_session(MeetingSessionExportRequest {
                 session_id: exported.session_id.clone(),
@@ -3089,6 +3154,8 @@ mod tests {
         assert!(markdown.content.contains("# Meeting Session Recap"));
         assert!(markdown.content.contains("## Summary"));
         assert!(markdown.content.contains("## Action Items"));
+        assert!(markdown.content.contains("## Screen Context"));
+        assert!(markdown.content.contains("GPU memory warning"));
         assert!(markdown.content.contains("## Transcript"));
 
         let json = runtime
@@ -3099,6 +3166,36 @@ mod tests {
             .expect("export json");
         assert!(json.content.contains(&exported.session_id));
         assert!(json.content.contains("\"schema_version\""));
+        assert!(json.content.contains("\"screen_contexts\""));
+    }
+
+    #[test]
+    fn screen_context_without_transcript_records_diagnostic_without_crashing() {
+        let root = temp_root();
+        let runtime = MeetingRuntime::new(root.clone());
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+
+        let attached = runtime
+            .attach_screen_context(screen_context(&session.session_id, Utc::now()))
+            .expect("attach screen context");
+
+        assert!(attached.context.linked_transcript_segment_ids.is_empty());
+        assert!(attached
+            .context
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "screen_context_no_transcript_link"));
+        let state = runtime.get_active_state().expect("active state");
+        assert_eq!(state.screen_contexts.len(), 1);
     }
 
     #[test]

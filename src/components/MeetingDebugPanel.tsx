@@ -582,6 +582,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const [clearPhrase, setClearPhrase] = useState("");
     const [isGeneratingIntelligence, setIsGeneratingIntelligence] = useState(false);
     const [isStoppingSession, setIsStoppingSession] = useState(false);
+    const [isAttachingScreenContext, setIsAttachingScreenContext] = useState(false);
     const [expandedEvidenceKeys, setExpandedEvidenceKeys] = useState<Record<string, boolean>>({});
     const [sessionMemory, setSessionMemory] = useState<MeetingSessionListItem[]>([]);
     const [sessionMemoryDiagnostics, setSessionMemoryDiagnostics] = useState<MeetingDiagnostic[]>([]);
@@ -631,6 +632,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const actionItems = displayedState?.action_items ?? [];
     const decisions = displayedState?.decisions ?? [];
     const intelligence = displayedState?.intelligence ?? null;
+    const screenContexts = displayedState?.screen_contexts ?? [];
     const diagnostics = displayedState?.diagnostics ?? [];
     const metrics = liveCapabilities?.capture_health.metrics;
     const systemHealth = liveCapabilities?.system_capture_health;
@@ -661,6 +663,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const systemAudioCaptureTool = toolByName("meeting.audio.capture.system");
     const microphoneCaptureTool = toolByName("meeting.audio.capture.microphone");
     const segmentTranscriptionTool = toolByName("meeting.transcription.segment");
+    const screenContextTool = toolByName("meeting.screen_context.attach_current");
     const googleMeetDetected = callLooksLikeGoogleMeet(callInfo);
 
     const realCaptureReadiness = useMemo<CaptureReadiness>(() => {
@@ -1263,6 +1266,21 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         }
     }, [meeting, runOperation]);
 
+    const handleAttachCurrentScreen = useCallback(async () => {
+        try {
+            setIsAttachingScreenContext(true);
+            await runOperation("attach screen context", () =>
+                meeting.attachCurrentScreen({
+                    store_screenshot: false,
+                    capture_fresh: true,
+                    attachment_mode: "current_moment",
+                })
+            );
+        } finally {
+            setIsAttachingScreenContext(false);
+        }
+    }, [meeting, runOperation]);
+
     const handleClearIntelligence = useCallback(
         () => runOperation("clear intelligence", () => meeting.clearIntelligence()),
         [meeting, runOperation]
@@ -1377,6 +1395,10 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
 
     const openedArchiveIntelligence = openedArchive?.state.intelligence ?? null;
     const openedArchiveSummary = openedArchiveIntelligence?.summary ?? null;
+    const openedArchiveScreenContexts =
+        openedArchive?.screen_contexts?.length
+            ? openedArchive.screen_contexts
+            : openedArchive?.state.screen_contexts ?? [];
     const openedArchiveTitle =
         openedArchive ? sessionMemory.find((item) => item.session_id === openedArchive.session_id)?.title ?? openedArchive.session_id : null;
 
@@ -1654,6 +1676,68 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 </div>
             </section>
 
+            <section className="desktop-agent-card meeting-section-card meeting-screen-context">
+                <div className="meeting-section-heading">
+                    <div>
+                        <p className="meeting-section-kicker">Screen Context</p>
+                        <h3>Attached Screen Context</h3>
+                        <p>Manual, governed screen observation attached to this work session. Screenshots are not stored by default.</p>
+                    </div>
+                    <span className="meeting-count-pill">{screenContexts.length} saved</span>
+                </div>
+                <div className="desktop-agent-inline-actions">
+                    <Button
+                        variant="secondary"
+                        radius="full"
+                        size="xs"
+                        disabled={isBusy || isAttachingScreenContext || !hasActiveSession}
+                        title={
+                            hasActiveSession
+                                ? "Attach current screen without desktop control"
+                                : "Start or reopen an active session before attaching screen context"
+                        }
+                        onClick={() => void handleAttachCurrentScreen()}
+                    >
+                        {isAttachingScreenContext ? "Attaching..." : "Attach current screen"}
+                    </Button>
+                    <span className="desktop-agent-muted">Permission: {permissionStatus(screenContextTool)}</span>
+                </div>
+                {screenContexts.length ? (
+                    <div className="meeting-generated-list">
+                        {[...screenContexts].slice(-3).reverse().map((context) => (
+                            <article key={context.context_id} className="meeting-generated-item">
+                                <div className="meeting-generated-block__header">
+                                    <strong>{formatEntryTime(context.captured_at)}</strong>
+                                    <span>{context.screenshot_ref ? "screenshot stored" : "screenshot not stored"}</span>
+                                </div>
+                                <p>{truncateEvidenceText(context.summary, 260)}</p>
+                                <EvidencePreview
+                                    ids={context.linked_transcript_segment_ids}
+                                    transcriptBySegmentId={transcriptBySegmentId}
+                                    expanded={expandedEvidenceKeys[`screen-context-${context.context_id}`] === true}
+                                    onToggle={() =>
+                                        setExpandedEvidenceKeys((prev) => ({
+                                            ...prev,
+                                            [`screen-context-${context.context_id}`]:
+                                                !prev[`screen-context-${context.context_id}`],
+                                        }))
+                                    }
+                                />
+                                {context.diagnostics.length ? (
+                                    <small className="desktop-agent-muted">
+                                        Diagnostics: {context.diagnostics.map((diagnostic) => diagnostic.code).join(", ")}
+                                    </small>
+                                ) : null}
+                            </article>
+                        ))}
+                    </div>
+                ) : (
+                    <div className="desktop-agent-empty">
+                        Attach the current screen when visual context matters to the session. Astra stores a bounded local summary and links it to nearby transcript segments.
+                    </div>
+                )}
+            </section>
+
             <section className="desktop-agent-card meeting-section-card meeting-session-memory">
                 <div className="meeting-section-heading">
                     <div>
@@ -1720,6 +1804,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                         <div className="meeting-session-list-item__meta">
                                             <span>{item.transcript_count} transcript</span>
                                             <span>{item.intelligence_present ? "intelligence" : "no intelligence"}</span>
+                                            <span>{item.screen_context_count} screen</span>
                                             <span>{sttCompletenessLabel(item.stt_completeness_status)}</span>
                                             <span>Drain: {item.drain_status || "unknown"}</span>
                                         </div>
@@ -1777,6 +1862,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                                         <p>{result.snippet}</p>
                                         <small>
                                             {result.speaker_display_name ? `${result.speaker_display_name} - ` : ""}
+                                            {result.screen_context_id ? `Screen context: ${result.screen_context_id} - ` : ""}
                                             Evidence: {result.evidence_segment_ids.join(", ") || "none"}
                                         </small>
                                         <Button
@@ -1839,6 +1925,40 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                             <p className="desktop-agent-muted">
                                 {sessionMemory.find((item) => item.session_id === openedArchive.session_id)?.stt_completeness_detail}
                             </p>
+                        ) : null}
+                        {openedArchiveScreenContexts.length ? (
+                            <div className="meeting-generated-block">
+                                <div className="meeting-generated-block__header">
+                                    <h4>Screen Contexts</h4>
+                                    <span>{openedArchiveScreenContexts.length}</span>
+                                </div>
+                                {openedArchiveScreenContexts.slice(0, 5).map((context) => (
+                                    <article key={context.context_id} className="meeting-generated-item">
+                                        <div className="meeting-generated-block__header">
+                                            <strong>{formatEntryTime(context.captured_at)}</strong>
+                                            <span>{context.screenshot_ref ? "screenshot stored" : "summary only"}</span>
+                                        </div>
+                                        <p>{truncateEvidenceText(context.summary, 240)}</p>
+                                        <EvidencePreview
+                                            ids={context.linked_transcript_segment_ids}
+                                            transcriptBySegmentId={archivedTranscriptBySegmentId}
+                                            expanded={expandedEvidenceKeys[`archive-screen-context-${context.context_id}`] === true}
+                                            onToggle={() =>
+                                                setExpandedEvidenceKeys((prev) => ({
+                                                    ...prev,
+                                                    [`archive-screen-context-${context.context_id}`]:
+                                                        !prev[`archive-screen-context-${context.context_id}`],
+                                                }))
+                                            }
+                                        />
+                                    </article>
+                                ))}
+                                {openedArchiveScreenContexts.length > 5 ? (
+                                    <p className="desktop-agent-muted">
+                                        {openedArchiveScreenContexts.length - 5} more screen context attachment(s) in archive/export.
+                                    </p>
+                                ) : null}
+                            </div>
                         ) : null}
                         <div className="meeting-session-memory__transcript-preview">
                             {openedArchive.state.transcript.slice(0, 5).map((entry) => (
@@ -2461,6 +2581,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         <p>Actions: <strong>{displayedState?.action_items.length ?? 0}</strong></p>
                         <p>Decisions: <strong>{displayedState?.decisions.length ?? 0}</strong></p>
                         <p>Notes: <strong>{displayedState?.notes.length ?? 0}</strong></p>
+                        <p>Screen contexts: <strong>{screenContexts.length}</strong></p>
                         <p>Diagnostics: <strong>{diagnostics.length}</strong></p>
                         {diagnostics.slice(-3).map((diagnostic) => (
                             <p key={`${diagnostic.code}-${diagnostic.created_at}`} className="desktop-agent-muted">

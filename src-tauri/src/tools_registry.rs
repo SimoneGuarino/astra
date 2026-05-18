@@ -250,6 +250,18 @@ impl ToolsRegistry {
                     false,
                 ),
                 tool(
+                    "meeting.screen_context.attach_current",
+                    "meeting",
+                    "Attach a governed on-demand screen context snapshot to the active work session without desktop control",
+                    vec![
+                        Permission::DesktopObserve,
+                        Permission::MeetingSessionRead,
+                        Permission::MeetingNotesWrite,
+                    ],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
                     "meeting.intelligence.generate",
                     "meeting",
                     "Generate governed transcript-backed meeting intelligence artifacts",

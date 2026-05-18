@@ -1428,6 +1428,61 @@ impl DesktopAgentRuntime {
         self.screen_capture.capture_snapshot()
     }
 
+    pub async fn capture_screen_for_meeting_context(
+        &self,
+        store_screenshot: bool,
+    ) -> Result<
+        (
+            ScreenCaptureResult,
+            Option<ScreenAnalysisResult>,
+            Vec<String>,
+        ),
+        String,
+    > {
+        if !self
+            .permissions
+            .allows(&crate::desktop_agent_types::Permission::DesktopObserve)
+            || !self
+                .policy
+                .permission_enabled(&crate::desktop_agent_types::Permission::DesktopObserve)
+        {
+            return Err("Permission denied for desktop observation".into());
+        }
+
+        let capture = self.screen_capture.capture_snapshot()?;
+        let mut diagnostics = Vec::new();
+        let analysis_question = "Summarize the current visible screen for a work session. Mention the visible app, page, file/module, error, command, or issue only if it is visible. Do not suggest clicking or desktop actions.";
+        let analysis = match self
+            .screen_vision
+            .analyze(
+                &capture.image_path,
+                capture.captured_at,
+                &capture.provider,
+                Some(analysis_question.to_string()),
+            )
+            .await
+        {
+            Ok(result) => Some(result),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "screen_context_vision_unavailable:{}",
+                    sanitize_screen_context_error(&error)
+                ));
+                None
+            }
+        };
+
+        if store_screenshot {
+            diagnostics.push("screen_context_screenshot_storage_unsupported".to_string());
+        }
+        match std::fs::remove_file(&capture.image_path) {
+            Ok(_) => diagnostics.push("screen_context_screenshot_not_stored".to_string()),
+            Err(_) => diagnostics.push("screen_context_screenshot_cleanup_unconfirmed".to_string()),
+        }
+
+        Ok((capture, analysis, diagnostics))
+    }
+
     pub async fn analyze_screen(
         &self,
         request: ScreenAnalysisRequest,
@@ -2595,7 +2650,8 @@ fn meeting_audit_data_category(tool_name: &str) -> &'static str {
         | "meeting.session.pause"
         | "meeting.session.resume"
         | "meeting.session.stop"
-        | "meeting.session.clear" => "meeting_session_metadata",
+        | "meeting.session.clear"
+        | "meeting.screen_context.attach_current" => "meeting_session_metadata",
         "meeting.transcript.add" => "meeting_transcript",
         "meeting.transcription.file" => "meeting_transcription_file_metadata",
         "meeting.action_item.add" | "meeting.decision.add" => "meeting_notes",
@@ -3428,6 +3484,26 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+fn sanitize_screen_context_error(error: &str) -> String {
+    let compact = error
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('\\', "/");
+    let redacted = compact
+        .split(' ')
+        .map(|part| {
+            if part.contains(":/") || part.starts_with('/') {
+                "redacted_path"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    redacted.chars().take(160).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -3711,6 +3787,54 @@ mod tests {
         assert!(serialized.contains("meeting_intelligence_metadata"));
         assert!(!serialized.contains("sensitive generated summary"));
         assert!(!serialized.contains("sensitive draft body"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_screen_context_audit_is_metadata_only() {
+        let root = std::env::temp_dir().join(format!(
+            "astra_meeting_screen_context_redact_{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_governed_direct_action(
+                "meeting-screen-context-redacted".into(),
+                "meeting.screen_context.attach_current",
+                json!({
+                    "session_id_present": true,
+                    "store_screenshot_requested": false,
+                    "metadata_only": true,
+                    "screen_pixels_included": false,
+                    "screen_text_included": false,
+                    "transcript_text_included": false,
+                }),
+                false,
+                || {
+                    Ok(json!({
+                        "context": {
+                            "context_id": "ctx",
+                            "summary": "sensitive visible screen text",
+                            "structured_observation": {
+                                "semantic_frame": {
+                                    "image_path": "C:/secret/screen.png"
+                                }
+                            }
+                        }
+                    }))
+                },
+            )
+            .expect("screen context action");
+
+        let events = runtime.recent_audit_events(10);
+        let serialized = serde_json::to_string(&events).expect("audit events json");
+        assert!(serialized.contains("meeting_session_metadata"));
+        assert!(!serialized.contains("sensitive visible screen text"));
+        assert!(!serialized.contains("screen.png"));
+        assert!(!serialized.contains("C:/secret"));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -396,6 +396,46 @@ impl NoteOrganizer {
             }
         }
 
+        md.push_str("\n## Screen Context\n");
+        if exported.screen_contexts.is_empty() {
+            md.push_str("_No screen context attachments were saved for this session._\n");
+        }
+        for context in &exported.screen_contexts {
+            md.push_str(&format!(
+                "- `{}` at {}: {}\n",
+                context.context_id,
+                context.captured_at.format("%Y-%m-%dT%H:%M:%SZ"),
+                context.summary
+            ));
+            md.push_str(&format!(
+                "  - Linked transcript segments: {}\n",
+                if context.linked_transcript_segment_ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    context.linked_transcript_segment_ids.join(", ")
+                }
+            ));
+            md.push_str(&format!(
+                "  - Screenshot: {}\n",
+                if context.screenshot_ref.is_some() {
+                    "stored"
+                } else {
+                    "not stored"
+                }
+            ));
+            if !context.diagnostics.is_empty() {
+                md.push_str(&format!(
+                    "  - Diagnostics: {}\n",
+                    context
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| diagnostic.code.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+
         md.push_str("\n## Transcript\n");
         if exported.transcript.is_empty() {
             md.push_str("_No transcript entries were available at export time._\n");

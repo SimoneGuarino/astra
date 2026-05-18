@@ -827,6 +827,8 @@ pub struct MeetingSessionState {
     pub decisions: Vec<DecisionLogEntry>,
     pub notes: Vec<NoteEntry>,
     #[serde(default)]
+    pub screen_contexts: Vec<MeetingScreenContext>,
+    #[serde(default)]
     pub intelligence: Option<MeetingIntelligenceResult>,
     #[serde(default)]
     pub speakers: Vec<SpeakerLabel>,
@@ -839,6 +841,94 @@ pub struct MeetingSessionState {
     pub diagnostics: Vec<MeetingDiagnostic>,
     pub started_at: DateTime<Utc>,
     pub last_updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenContextSource {
+    #[default]
+    ManualCapture,
+    UserRequested,
+    SessionMarker,
+    Imported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenContextAttachmentMode {
+    #[default]
+    CurrentMoment,
+    NearestTranscriptWindow,
+    ManualSelection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenContextRedaction {
+    MetadataOnly,
+    ScreenshotStored,
+    #[default]
+    ScreenshotNotStored,
+    Redacted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingTimeWindow {
+    pub start_at: DateTime<Utc>,
+    pub end_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScreenArtifactRef {
+    pub storage_uri: String,
+    pub media_type: String,
+    pub bytes: u64,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScreenStructuredObservation {
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub semantic_frame: Option<serde_json::Value>,
+    #[serde(default)]
+    pub visible_app: Option<String>,
+    #[serde(default)]
+    pub page_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeetingScreenContext {
+    #[serde(default = "new_meeting_artifact_id")]
+    pub context_id: String,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default = "utc_now")]
+    pub captured_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source: ScreenContextSource,
+    #[serde(default)]
+    pub attachment_mode: ScreenContextAttachmentMode,
+    #[serde(default)]
+    pub linked_transcript_segment_ids: Vec<String>,
+    #[serde(default)]
+    pub linked_time_window: Option<MeetingTimeWindow>,
+    pub summary: String,
+    #[serde(default)]
+    pub structured_observation: Option<ScreenStructuredObservation>,
+    #[serde(default)]
+    pub screenshot_ref: Option<ScreenArtifactRef>,
+    #[serde(default)]
+    pub redaction: ScreenContextRedaction,
+    #[serde(default)]
+    pub confidence: f32,
+    #[serde(default)]
+    pub diagnostics: Vec<MeetingDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1317,6 +1407,8 @@ pub struct ExportedMeeting {
     pub notes: Vec<NoteEntry>,
     #[serde(default)]
     pub intelligence: Option<MeetingIntelligenceResult>,
+    #[serde(default)]
+    pub screen_contexts: Vec<MeetingScreenContext>,
     pub metadata: serde_json::Value,
 }
 
@@ -1328,6 +1420,8 @@ pub struct MeetingSessionArchiveDocument {
     pub updated_at: DateTime<Utc>,
     pub state: MeetingSessionState,
     pub exported: ExportedMeeting,
+    #[serde(default)]
+    pub screen_contexts: Vec<MeetingScreenContext>,
     pub capture_health: CaptureHealth,
     pub system_capture_health: CaptureHealth,
     pub microphone_capture_health: CaptureHealth,
@@ -1380,6 +1474,8 @@ pub struct MeetingSessionListItem {
     pub stt_completeness_status: String,
     #[serde(default)]
     pub stt_completeness_detail: String,
+    #[serde(default)]
+    pub screen_context_count: usize,
     pub drain_status: String,
     pub last_updated_at: DateTime<Utc>,
 }
@@ -1434,6 +1530,27 @@ pub struct MeetingSessionSearchResult {
     pub speaker_display_name: Option<String>,
     #[serde(default)]
     pub timestamp_ms: Option<u64>,
+    #[serde(default)]
+    pub screen_context_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingScreenContextAttachRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub store_screenshot: bool,
+    #[serde(default = "default_true")]
+    pub capture_fresh: bool,
+    #[serde(default)]
+    pub attachment_mode: ScreenContextAttachmentMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingScreenContextAttachResponse {
+    pub context: MeetingScreenContext,
+    #[serde(default)]
+    pub diagnostics: Vec<MeetingDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

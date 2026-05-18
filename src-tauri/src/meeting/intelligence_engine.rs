@@ -173,6 +173,7 @@ pub struct MeetingIntelligenceInput {
     pub session_id: String,
     pub transcript_entries: Vec<TranscriptEntry>,
     pub speakers: Vec<SpeakerLabel>,
+    pub screen_contexts: Vec<MeetingScreenContext>,
     pub generation_options: MeetingIntelligenceGenerationOptions,
 }
 
@@ -1280,6 +1281,25 @@ fn meeting_llm_user_prompt(
         serde_json::to_string_pretty(&speaker_registry).unwrap_or_else(|_| "[]".to_string());
     let transcript_json =
         serde_json::to_string_pretty(&transcript).unwrap_or_else(|_| "[]".to_string());
+    let screen_context = input
+        .screen_contexts
+        .iter()
+        .rev()
+        .take(12)
+        .map(|context| {
+            json!({
+                "context_id": &context.context_id,
+                "captured_at": context.captured_at.to_rfc3339(),
+                "linked_transcript_segment_ids": &context.linked_transcript_segment_ids,
+                "summary": bounded_text(&context.summary, 700),
+                "screenshot_stored": context.screenshot_ref.is_some(),
+                "redaction": context.redaction,
+                "confidence": context.confidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    let screen_context_json =
+        serde_json::to_string_pretty(&screen_context).unwrap_or_else(|_| "[]".to_string());
     let language_instruction = meeting_language_instruction(stats.detected_language);
     let session_type_instruction = meeting_session_type_instruction(stats.session_type);
 
@@ -1309,6 +1329,9 @@ Speaker registry JSON:
 
 Transcript entries JSON:
 {transcript_json}
+
+Attached screen context JSON:
+{screen_context_json}
 
 Return JSON only, with this exact top-level shape:
 {{
@@ -1383,6 +1406,7 @@ Return JSON only, with this exact top-level shape:
 
 Rules:
 - Every meaningful artifact must include valid evidence_segment_ids from the transcript entries above.
+- Attached screen context is supplemental evidence only. Use it to improve wording and technical recap when it clarifies what was visible, but do not replace transcript evidence or fabricate facts from it.
 - Omit decisions/action_items/open_questions/risks that are not directly supported by evidence.
 - Summary: write a natural professional recap of what happened, what was discussed, and why it matters. Do not write a mechanical segment-count summary unless forced into rule-based fallback.
 - Decisions: include only real commitments, conclusions, confirmations, approvals, or rejections. Do not classify "we talked about X" as a decision.
@@ -1411,7 +1435,8 @@ Rules:
         language_source = meeting_language_source_label(stats.language_source),
         language_instruction = language_instruction,
         speaker_json = speaker_json,
-        transcript_json = transcript_json
+        transcript_json = transcript_json,
+        screen_context_json = screen_context_json
     )
 }
 
@@ -2746,6 +2771,7 @@ mod tests {
                 SpeakerLabel::source_default(TranscriptSource::Microphone),
                 SpeakerLabel::source_default(TranscriptSource::SystemAudio),
             ],
+            screen_contexts: Vec::new(),
             generation_options: MeetingIntelligenceGenerationOptions {
                 use_local_llm: true,
                 max_transcript_segments: 20,
@@ -2780,6 +2806,35 @@ mod tests {
         second.start_ms = Some(1_000);
         input.transcript_entries = vec![first, second];
         input
+    }
+
+    #[test]
+    fn prompt_includes_attached_screen_context_as_supplemental_evidence() {
+        let baseline_prompt = build_meeting_llm_prompt_input(&input()).prompt;
+        assert!(!baseline_prompt.contains("screen-context-1"));
+
+        let mut with_context = input();
+        with_context.screen_contexts.push(MeetingScreenContext {
+            context_id: "screen-context-1".to_string(),
+            session_id: "session".to_string(),
+            captured_at: Utc::now(),
+            source: ScreenContextSource::ManualCapture,
+            attachment_mode: ScreenContextAttachmentMode::CurrentMoment,
+            linked_transcript_segment_ids: vec!["seg-1".to_string()],
+            linked_time_window: None,
+            summary: "Visible screen shows a Cargo test failure in semantic_frame.rs".to_string(),
+            structured_observation: None,
+            screenshot_ref: None,
+            redaction: ScreenContextRedaction::ScreenshotNotStored,
+            confidence: 0.7,
+            diagnostics: Vec::new(),
+        });
+
+        let prompt = build_meeting_llm_prompt_input(&with_context).prompt;
+        assert!(prompt.contains("Attached screen context JSON"));
+        assert!(prompt.contains("screen-context-1"));
+        assert!(prompt.contains("semantic_frame.rs"));
+        assert!(prompt.contains("supplemental evidence only"));
     }
 
     #[test]

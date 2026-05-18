@@ -14,8 +14,8 @@ use std::{
 };
 use uuid::Uuid;
 
-const ARCHIVE_SCHEMA_VERSION: u32 = 1;
-const INDEX_SCHEMA_VERSION: u32 = 1;
+const ARCHIVE_SCHEMA_VERSION: u32 = 2;
+const INDEX_SCHEMA_VERSION: u32 = 2;
 const MAX_LIST_LIMIT: usize = 50;
 const MAX_SEARCH_LIMIT: usize = 50;
 const MAX_QUERY_CHARS: usize = 120;
@@ -55,6 +55,7 @@ impl SessionMemoryStore {
             updated_at: now,
             state: state.clone(),
             exported: exported.clone(),
+            screen_contexts: state.screen_contexts.clone(),
             capture_health: capture_health.clone(),
             system_capture_health: system_capture_health.clone(),
             microphone_capture_health: microphone_capture_health.clone(),
@@ -67,6 +68,10 @@ impl SessionMemoryStore {
         atomic_write_json(
             &session_dir.join("transcript.json"),
             &document.state.transcript,
+        )?;
+        atomic_write_json(
+            &session_dir.join("screen_context.json"),
+            &document.screen_contexts,
         )?;
         if let Some(intelligence) = &document.state.intelligence {
             atomic_write_json(&session_dir.join("intelligence.json"), intelligence)?;
@@ -473,6 +478,10 @@ fn list_item_from_document(document: &MeetingSessionArchiveDocument) -> MeetingS
                     || !recap.mentioned_commands.is_empty()
                     || !recap.mentioned_errors.is_empty()
             }),
+        screen_context_count: document
+            .screen_contexts
+            .len()
+            .max(document.state.screen_contexts.len()),
         speakers_preview: document
             .state
             .speakers
@@ -510,6 +519,7 @@ fn search_archive(
                 evidence_segment_ids: vec![entry.segment_id.clone()],
                 speaker_display_name: Some(entry.speaker_display_name().to_string()),
                 timestamp_ms: entry.start_ms,
+                screen_context_id: None,
             },
         );
         if results.len() >= limit {
@@ -530,6 +540,7 @@ fn search_archive(
                 evidence_segment_ids: summary.evidence_segment_ids.clone(),
                 speaker_display_name: None,
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -547,6 +558,7 @@ fn search_archive(
                 evidence_segment_ids: decision.evidence_segment_ids.clone(),
                 speaker_display_name: decision.made_by.as_ref().map(|value| value.name.clone()),
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -564,6 +576,25 @@ fn search_archive(
                 evidence_segment_ids: action.evidence_segment_ids.clone(),
                 speaker_display_name: action.assignee.as_ref().map(|value| value.name.clone()),
                 timestamp_ms: None,
+                screen_context_id: None,
+            },
+        );
+    }
+
+    for context in screen_contexts_for_archive(archive) {
+        maybe_push_result(
+            &mut results,
+            query,
+            SearchCandidate {
+                session_id: &archive.session_id,
+                session_title: &item.title,
+                matched_kind: "screen_context",
+                title: "Screen context".to_string(),
+                text: &context.summary,
+                evidence_segment_ids: context.linked_transcript_segment_ids.clone(),
+                speaker_display_name: None,
+                timestamp_ms: Some(context.captured_at.timestamp_millis().max(0) as u64),
+                screen_context_id: Some(context.context_id.clone()),
             },
         );
     }
@@ -574,6 +605,16 @@ fn search_archive(
 
     results.truncate(limit);
     results
+}
+
+fn screen_contexts_for_archive(
+    archive: &MeetingSessionArchiveDocument,
+) -> Vec<&MeetingScreenContext> {
+    if !archive.screen_contexts.is_empty() {
+        archive.screen_contexts.iter().collect()
+    } else {
+        archive.state.screen_contexts.iter().collect()
+    }
 }
 
 fn search_intelligence(
@@ -596,6 +637,7 @@ fn search_intelligence(
                 evidence_segment_ids: summary.evidence_segment_ids.clone(),
                 speaker_display_name: None,
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -617,6 +659,7 @@ fn search_intelligence(
                 evidence_segment_ids: decision.evidence_segment_ids.clone(),
                 speaker_display_name: decision.made_by_display_name.clone(),
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -633,6 +676,7 @@ fn search_intelligence(
                 evidence_segment_ids: action.evidence_segment_ids.clone(),
                 speaker_display_name: action.assignee_display_name.clone(),
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -649,6 +693,7 @@ fn search_intelligence(
                 evidence_segment_ids: question.evidence_segment_ids.clone(),
                 speaker_display_name: question.asked_by_display_name.clone(),
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -665,6 +710,7 @@ fn search_intelligence(
                 evidence_segment_ids: risk.evidence_segment_ids.clone(),
                 speaker_display_name: None,
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -688,6 +734,7 @@ fn search_intelligence(
                 evidence_segment_ids: recap.evidence_segment_ids.clone(),
                 speaker_display_name: None,
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -705,6 +752,7 @@ fn search_intelligence(
                 evidence_segment_ids: draft.evidence_segment_ids.clone(),
                 speaker_display_name: None,
                 timestamp_ms: None,
+                screen_context_id: None,
             },
         );
     }
@@ -722,6 +770,7 @@ fn search_intelligence(
                 evidence_segment_ids: timeline.evidence_segment_ids.clone(),
                 speaker_display_name: timeline.speaker_display_name.clone(),
                 timestamp_ms: timeline.timestamp_ms,
+                screen_context_id: None,
             },
         );
     }
@@ -737,6 +786,7 @@ struct SearchCandidate<'a> {
     evidence_segment_ids: Vec<String>,
     speaker_display_name: Option<String>,
     timestamp_ms: Option<u64>,
+    screen_context_id: Option<String>,
 }
 
 fn maybe_push_result(
@@ -758,6 +808,7 @@ fn maybe_push_result(
         evidence_segment_ids: candidate.evidence_segment_ids,
         speaker_display_name: candidate.speaker_display_name,
         timestamp_ms: candidate.timestamp_ms,
+        screen_context_id: candidate.screen_context_id,
     });
 }
 

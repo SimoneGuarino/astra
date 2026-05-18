@@ -2485,6 +2485,7 @@ fn follow_up_sender_is_not_supported() {
         decisions: Vec::new(),
         notes: Vec::new(),
         intelligence: None,
+        screen_contexts: Vec::new(),
         metadata: serde_json::json!({}),
     };
 
