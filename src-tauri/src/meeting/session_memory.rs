@@ -21,6 +21,7 @@ const MAX_SEARCH_LIMIT: usize = 50;
 const MAX_QUERY_CHARS: usize = 120;
 const MAX_SNIPPET_CHARS: usize = 180;
 const MAX_PREVIEW_CHARS: usize = 220;
+const TEMPORAL_SCREEN_CONTEXT_THRESHOLD_MS: i64 = 10 * 60 * 1_000;
 
 #[derive(Debug, Clone)]
 pub struct SessionMemoryStore {
@@ -32,6 +33,18 @@ struct MeetingSessionMemoryIndex {
     schema_version: u32,
     updated_at: Option<chrono::DateTime<Utc>>,
     sessions: Vec<MeetingSessionListItem>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MeetingRecallRetrieval {
+    pub intent: MeetingRecallIntent,
+    pub evidence: Vec<MeetingRecallEvidence>,
+    pub sessions: Vec<MeetingSessionListItem>,
+    pub searched_session_count: usize,
+    pub matched_session_count: usize,
+    pub truncated: bool,
+    pub corrupt_archive_count: usize,
+    pub diagnostics: Vec<MeetingDiagnostic>,
 }
 
 impl SessionMemoryStore {
@@ -229,6 +242,121 @@ impl SessionMemoryStore {
             results,
             searched_session_count,
             matched_session_count: matched_sessions.len(),
+            truncated,
+            corrupt_archive_count,
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn retrieve_recall_evidence(
+        &self,
+        request: &MeetingRecallRequest,
+    ) -> Result<MeetingRecallRetrieval, MeetingRuntimeError> {
+        let recall_intent = detect_recall_intent(&request.query);
+        let normalized_query = normalize_recall_query(&request.query);
+        if normalized_query.is_empty() {
+            return Ok(MeetingRecallRetrieval {
+                intent: recall_intent,
+                evidence: Vec::new(),
+                sessions: Vec::new(),
+                searched_session_count: 0,
+                matched_session_count: 0,
+                truncated: false,
+                corrupt_archive_count: 0,
+                diagnostics: vec![diagnostic(
+                    "recall_query_empty",
+                    MeetingDiagnosticSeverity::Warning,
+                    "Session recall query was empty after normalization",
+                )],
+            });
+        }
+
+        let limit = bounded_limit(request.limit, MAX_SEARCH_LIMIT);
+        let mut diagnostics = Vec::new();
+        let index = self.read_index_or_rebuild(&mut diagnostics)?;
+        let mut searched_session_count = 0usize;
+        let mut corrupt_archive_count = 0usize;
+        let mut matched_session_ids = HashSet::new();
+        let mut matched_session_items = Vec::new();
+        let mut evidence = Vec::new();
+
+        for item in index.sessions {
+            if request
+                .date_from
+                .is_some_and(|date_from| item.started_at < date_from)
+                || request
+                    .date_to
+                    .is_some_and(|date_to| item.started_at > date_to)
+            {
+                continue;
+            }
+            searched_session_count = searched_session_count.saturating_add(1);
+            let archive = match self.read_archive(&item.session_id) {
+                Ok(archive) => archive,
+                Err(_) => {
+                    corrupt_archive_count = corrupt_archive_count.saturating_add(1);
+                    diagnostics.push(diagnostic(
+                        "archive_corrupt",
+                        MeetingDiagnosticSeverity::Warning,
+                        format!(
+                            "Archived meeting session {} could not be read during recall",
+                            item.session_id
+                        ),
+                    ));
+                    continue;
+                }
+            };
+            let session_item = list_item_from_document(&archive);
+            let mut session_results = search_archive(&archive, &normalized_query, limit);
+            maybe_push_session_metadata_result(
+                &mut session_results,
+                &archive.session_id,
+                &session_item,
+                &normalized_query,
+            );
+            session_results.retain(|result| recall_result_allowed(result, request));
+            let expanded_screen_evidence =
+                if matches!(recall_intent, MeetingRecallIntent::ScreenContextForTopic)
+                    && request.include_screen_context
+                {
+                    expand_screen_context_evidence(
+                        &archive,
+                        &session_item,
+                        &session_results,
+                        &mut diagnostics,
+                    )
+                } else {
+                    Vec::new()
+                };
+
+            if (!session_results.is_empty() || !expanded_screen_evidence.is_empty())
+                && matched_session_ids.insert(session_item.session_id.clone())
+            {
+                matched_session_items.push(session_item);
+            }
+            evidence.extend(
+                session_results
+                    .into_iter()
+                    .map(recall_evidence_from_search_result),
+            );
+            evidence.extend(expanded_screen_evidence);
+        }
+
+        evidence.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let truncated = evidence.len() > limit;
+        evidence.truncate(limit);
+
+        Ok(MeetingRecallRetrieval {
+            intent: recall_intent,
+            evidence,
+            sessions: matched_session_items,
+            searched_session_count,
+            matched_session_count: matched_session_ids.len(),
             truncated,
             corrupt_archive_count,
             diagnostics,
@@ -607,6 +735,255 @@ fn search_archive(
     results
 }
 
+fn maybe_push_session_metadata_result(
+    results: &mut Vec<MeetingSessionSearchResult>,
+    session_id: &str,
+    item: &MeetingSessionListItem,
+    query: &str,
+) {
+    let speakers_preview = item.speakers_preview.join(" ");
+    let capture_sources = item.capture_sources.join(" ");
+    let metadata_text = [
+        item.title.as_str(),
+        item.platform.as_str(),
+        item.summary_preview.as_str(),
+        speakers_preview.as_str(),
+        capture_sources.as_str(),
+        item.stt_completeness_status.as_str(),
+        item.stt_completeness_detail.as_str(),
+    ]
+    .join(" ");
+    maybe_push_result(
+        results,
+        query,
+        SearchCandidate {
+            session_id,
+            session_title: &item.title,
+            matched_kind: "session_metadata",
+            title: "Session metadata".to_string(),
+            text: &metadata_text,
+            evidence_segment_ids: Vec::new(),
+            speaker_display_name: None,
+            timestamp_ms: None,
+            screen_context_id: None,
+        },
+    );
+}
+
+fn recall_result_allowed(
+    result: &MeetingSessionSearchResult,
+    request: &MeetingRecallRequest,
+) -> bool {
+    match result.matched_kind.as_str() {
+        "transcript" => request.include_transcript,
+        "screen_context" => request.include_screen_context,
+        "summary"
+        | "decision"
+        | "action_item"
+        | "intelligence_summary"
+        | "intelligence_decision"
+        | "intelligence_action_item"
+        | "open_question"
+        | "risk"
+        | "technical_recap"
+        | "follow_up_draft"
+        | "timeline" => request.include_intelligence,
+        "session_metadata" => true,
+        _ => true,
+    }
+}
+
+fn recall_evidence_from_search_result(result: MeetingSessionSearchResult) -> MeetingRecallEvidence {
+    MeetingRecallEvidence {
+        session_id: result.session_id,
+        session_title: result.session_title,
+        matched_kind: result.matched_kind,
+        title: result.title,
+        snippet: result.snippet,
+        relation: MeetingRecallEvidenceRelation::DirectMatch,
+        evidence_segment_ids: result.evidence_segment_ids,
+        screen_context_ids: result.screen_context_id.into_iter().collect(),
+        timestamp_ms: result.timestamp_ms,
+        score: result.score,
+    }
+}
+
+fn expand_screen_context_evidence(
+    archive: &MeetingSessionArchiveDocument,
+    item: &MeetingSessionListItem,
+    topic_matches: &[MeetingSessionSearchResult],
+    diagnostics: &mut Vec<MeetingDiagnostic>,
+) -> Vec<MeetingRecallEvidence> {
+    let matched_segment_ids = topic_matches
+        .iter()
+        .filter(|result| {
+            !matches!(
+                result.matched_kind.as_str(),
+                "screen_context" | "session_metadata"
+            )
+        })
+        .flat_map(|result| result.evidence_segment_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    if matched_segment_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let matched_entries = archive
+        .state
+        .transcript
+        .iter()
+        .filter(|entry| matched_segment_ids.contains(&entry.segment_id))
+        .collect::<Vec<_>>();
+    let contexts = screen_contexts_for_archive(archive);
+    if contexts.is_empty() {
+        diagnostics.push(diagnostic(
+            "screen_context_not_available",
+            MeetingDiagnosticSeverity::Info,
+            format!(
+                "Recall found transcript evidence in session {} but no archived screen context",
+                archive.session_id
+            ),
+        ));
+        return Vec::new();
+    }
+
+    let existing_context_ids = topic_matches
+        .iter()
+        .filter_map(|result| result.screen_context_id.as_deref())
+        .collect::<HashSet<_>>();
+
+    let direct = contexts
+        .iter()
+        .copied()
+        .filter(|context| !existing_context_ids.contains(context.context_id.as_str()))
+        .filter(|context| {
+            context
+                .linked_transcript_segment_ids
+                .iter()
+                .any(|id| matched_segment_ids.contains(id))
+        })
+        .take(3)
+        .map(|context| {
+            screen_context_recall_evidence(
+                archive,
+                item,
+                context,
+                &matched_segment_ids,
+                MeetingRecallEvidenceRelation::LinkedScreenContext,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    let nearest = contexts
+        .iter()
+        .copied()
+        .filter(|context| !existing_context_ids.contains(context.context_id.as_str()))
+        .filter_map(|context| {
+            screen_context_distance_ms(context, &matched_entries)
+                .map(|distance| (context, distance))
+        })
+        .filter(|(_, distance)| *distance <= TEMPORAL_SCREEN_CONTEXT_THRESHOLD_MS)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(context, _)| {
+            screen_context_recall_evidence(
+                archive,
+                item,
+                context,
+                &matched_segment_ids,
+                MeetingRecallEvidenceRelation::TemporalScreenContext,
+            )
+        });
+    if let Some(nearest) = nearest {
+        return vec![nearest];
+    }
+
+    diagnostics.push(diagnostic(
+        "session_level_screen_context",
+        MeetingDiagnosticSeverity::Info,
+        format!(
+            "Recall used same-session screen context for session {} because no direct or near link matched the topic segment",
+            archive.session_id
+        ),
+    ));
+    contexts
+        .into_iter()
+        .filter(|context| !existing_context_ids.contains(context.context_id.as_str()))
+        .take(1)
+        .map(|context| {
+            screen_context_recall_evidence(
+                archive,
+                item,
+                context,
+                &matched_segment_ids,
+                MeetingRecallEvidenceRelation::SameSessionScreenContext,
+            )
+        })
+        .collect()
+}
+
+fn screen_context_recall_evidence(
+    archive: &MeetingSessionArchiveDocument,
+    item: &MeetingSessionListItem,
+    context: &MeetingScreenContext,
+    matched_segment_ids: &HashSet<String>,
+    relation: MeetingRecallEvidenceRelation,
+) -> MeetingRecallEvidence {
+    let mut evidence_segment_ids = context.linked_transcript_segment_ids.clone();
+    for segment_id in matched_segment_ids {
+        if !evidence_segment_ids.contains(segment_id) {
+            evidence_segment_ids.push(segment_id.clone());
+        }
+    }
+    MeetingRecallEvidence {
+        session_id: archive.session_id.clone(),
+        session_title: item.title.clone(),
+        matched_kind: "screen_context".to_string(),
+        title: "Screen context".to_string(),
+        snippet: bounded_text(&context.summary, MAX_SNIPPET_CHARS),
+        relation,
+        evidence_segment_ids,
+        screen_context_ids: vec![context.context_id.clone()],
+        timestamp_ms: Some(context.captured_at.timestamp_millis().max(0) as u64),
+        score: match relation {
+            MeetingRecallEvidenceRelation::LinkedScreenContext => 1.35,
+            MeetingRecallEvidenceRelation::TemporalScreenContext => 1.05,
+            MeetingRecallEvidenceRelation::SameSessionScreenContext => 0.75,
+            MeetingRecallEvidenceRelation::DirectMatch => 1.0,
+        },
+    }
+}
+
+fn screen_context_distance_ms(
+    context: &MeetingScreenContext,
+    entries: &[&TranscriptEntry],
+) -> Option<i64> {
+    entries
+        .iter()
+        .flat_map(|entry| [entry.timestamp, entry.created_at])
+        .map(|timestamp| {
+            let captured_distance = (context.captured_at - timestamp).num_milliseconds().abs();
+            let window_distance = context
+                .linked_time_window
+                .as_ref()
+                .map(|window| {
+                    if timestamp >= window.start_at && timestamp <= window.end_at {
+                        0
+                    } else {
+                        (timestamp - window.start_at)
+                            .num_milliseconds()
+                            .abs()
+                            .min((timestamp - window.end_at).num_milliseconds().abs())
+                    }
+                })
+                .unwrap_or(captured_distance);
+            captured_distance.min(window_distance)
+        })
+        .min()
+}
+
 fn screen_contexts_for_archive(
     archive: &MeetingSessionArchiveDocument,
 ) -> Vec<&MeetingScreenContext> {
@@ -850,6 +1227,173 @@ fn normalize_query(query: &str) -> String {
         .take(MAX_QUERY_CHARS)
         .collect::<String>()
         .to_lowercase()
+}
+
+fn normalize_recall_query(query: &str) -> String {
+    normalize_recall_query_terms(query).join(" ")
+}
+
+fn normalize_recall_query_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for character in query.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            current.push(character);
+        } else if !current.is_empty() {
+            push_recall_query_term(&mut terms, &current);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        push_recall_query_term(&mut terms, &current);
+    }
+    terms.truncate(24);
+    terms
+}
+
+fn push_recall_query_term(terms: &mut Vec<String>, term: &str) {
+    if term.chars().count() < 2 || is_recall_stopword(term) {
+        return;
+    }
+    push_unique_term(terms, term);
+    match term {
+        "auto" => {
+            push_unique_term(terms, "car");
+            push_unique_term(terms, "macchina");
+        }
+        "macchina" => {
+            push_unique_term(terms, "auto");
+            push_unique_term(terms, "car");
+        }
+        "car" => {
+            push_unique_term(terms, "auto");
+            push_unique_term(terms, "macchina");
+        }
+        "bumper" => {
+            push_unique_term(terms, "paraurti");
+            push_unique_term(terms, "front");
+        }
+        "paraurti" => {
+            push_unique_term(terms, "bumper");
+            push_unique_term(terms, "front");
+        }
+        "fronte" => {
+            push_unique_term(terms, "front");
+        }
+        _ => {}
+    }
+}
+
+fn push_unique_term(terms: &mut Vec<String>, term: &str) {
+    if !terms.iter().any(|existing| existing == term) {
+        terms.push(term.to_string());
+    }
+}
+
+fn is_recall_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "quando"
+            | "stavamo"
+            | "stavo"
+            | "parlando"
+            | "parlare"
+            | "parlavamo"
+            | "mentre"
+            | "del"
+            | "della"
+            | "delle"
+            | "degli"
+            | "dei"
+            | "di"
+            | "cosa"
+            | "che"
+            | "era"
+            | "c"
+            | "sullo"
+            | "schermo"
+            | "nello"
+            | "nel"
+            | "una"
+            | "un"
+            | "il"
+            | "lo"
+            | "la"
+            | "le"
+            | "gli"
+            | "per"
+            | "con"
+            | "guardando"
+            | "guardavamo"
+            | "vedevamo"
+            | "vedendo"
+            | "when"
+            | "were"
+            | "was"
+            | "looking"
+            | "look"
+            | "at"
+            | "what"
+            | "on"
+            | "screen"
+            | "while"
+            | "discussing"
+            | "discussed"
+            | "the"
+            | "a"
+            | "an"
+            | "of"
+            | "for"
+            | "with"
+            | "we"
+    )
+}
+
+fn detect_recall_intent(query: &str) -> MeetingRecallIntent {
+    let lower = compact_text(query).to_lowercase();
+    let screen_for_topic_patterns = [
+        "cosa stavamo guardando",
+        "cosa c'era sullo schermo",
+        "cosa c era sullo schermo",
+        "cosa vedevamo",
+        "quando parlavamo di",
+        "quando stavamo parlando",
+        "mentre parlavamo di",
+        "mentre stavamo parlando",
+        "what were we looking at",
+        "what was on screen",
+        "what were we seeing",
+        "when we were discussing",
+        "while discussing",
+    ];
+    if screen_for_topic_patterns
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
+        return MeetingRecallIntent::ScreenContextForTopic;
+    }
+    if lower.contains("schermo")
+        || lower.contains("screen")
+        || lower.contains("guardando")
+        || lower.contains("looking at")
+    {
+        return MeetingRecallIntent::ScreenContext;
+    }
+    if lower.contains("decision") || lower.contains("deciso") || lower.contains("decidere") {
+        return MeetingRecallIntent::Decision;
+    }
+    if lower.contains("action item") || lower.contains("azione") || lower.contains("azioni") {
+        return MeetingRecallIntent::ActionItems;
+    }
+    if lower.contains("errore")
+        || lower.contains("error")
+        || lower.contains("build")
+        || lower.contains("test")
+        || lower.contains("debug")
+    {
+        return MeetingRecallIntent::Technical;
+    }
+    MeetingRecallIntent::General
 }
 
 fn list_item_matches_query(item: &MeetingSessionListItem, query: &str) -> bool {
@@ -1114,5 +1658,32 @@ fn diagnostic(
 fn storage_error(operation: &str, error: std::io::Error) -> MeetingRuntimeError {
     MeetingRuntimeError::StorageError {
         message: format!("{operation} failed: {}", error.kind()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recall_query_normalization_extracts_topic_terms_and_synonyms() {
+        let terms = normalize_recall_query_terms(
+            "quando stavamo parlando del bumper del auto, cosa stavamo guardando?",
+        );
+
+        assert!(terms.iter().any(|term| term == "bumper"));
+        assert!(terms.iter().any(|term| term == "auto"));
+        assert!(terms.iter().any(|term| term == "car"));
+        assert!(!terms.iter().any(|term| term == "quando"));
+        assert!(!terms.iter().any(|term| term == "auto,"));
+    }
+
+    #[test]
+    fn recall_detects_italian_screen_context_for_topic_intent() {
+        let intent = detect_recall_intent(
+            "quando stavamo parlando del bumper del auto, cosa stavamo guardando?",
+        );
+
+        assert_eq!(intent, MeetingRecallIntent::ScreenContextForTopic);
     }
 }

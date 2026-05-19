@@ -17,6 +17,8 @@ import type {
     MeetingIntelligenceGenerationOptions,
     MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
+    MeetingRecallRequest,
+    MeetingRecallResponse,
     MeetingSessionExportRequest,
     MeetingSessionExportResponse,
     MeetingSessionListRequest,
@@ -165,6 +167,12 @@ export function useMeeting() {
         []
     );
 
+    const answerRecall = useCallback(
+        (request: MeetingRecallRequest) =>
+            invoke<MeetingRecallResponse>("answer_meeting_recall", { request }),
+        []
+    );
+
     const exportSessionArchive = useCallback(
         (request: MeetingSessionExportRequest) =>
             invoke<MeetingSessionExportResponse>("export_meeting_session_archive", { request }),
@@ -241,6 +249,7 @@ export function useMeeting() {
             addActionItem,
             addDecision,
             addTranscript,
+            answerRecall,
             attachCurrentScreen,
             autoDetectAudioBackend,
             clearData,
@@ -280,6 +289,7 @@ export function useMeeting() {
             addActionItem,
             addDecision,
             addTranscript,
+            answerRecall,
             attachCurrentScreen,
             autoDetectAudioBackend,
             clearData,

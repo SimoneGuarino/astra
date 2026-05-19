@@ -138,6 +138,17 @@ impl ToolsRegistry {
                     false,
                 ),
                 tool(
+                    "meeting.recall.answer",
+                    "meeting",
+                    "Answer a governed local recall question from archived work-session evidence only",
+                    vec![
+                        Permission::MeetingSessionRead,
+                        Permission::MeetingIntelligenceGenerate,
+                    ],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
                     "meeting.session.export",
                     "meeting",
                     "Export a local archived meeting session as governed JSON or Markdown",

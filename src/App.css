@@ -900,6 +900,23 @@ input {
     font-size: 12px;
 }
 
+.meeting-session-memory__recall,
+.meeting-recall-answer {
+    display: grid;
+    gap: 10px;
+    border: 1px solid rgba(85, 108, 190, 0.14);
+    background: rgba(255, 255, 255, 0.62);
+    border-radius: 12px;
+    padding: 10px;
+}
+
+.meeting-recall-answer p {
+    margin: 0;
+    color: rgba(41, 49, 78, 0.92);
+    font-size: 13px;
+    line-height: 1.45;
+}
+
 .meeting-session-memory__grid {
     display: grid;
     grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);

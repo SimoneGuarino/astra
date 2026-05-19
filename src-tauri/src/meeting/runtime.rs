@@ -10,7 +10,8 @@ use super::{
     },
     intelligence_engine::{
         build_meeting_llm_language_retry_prompt_input, build_meeting_llm_prompt_input,
-        MeetingIntelligenceEngine, MeetingIntelligenceLlm, OllamaMeetingIntelligenceLlm,
+        MeetingIntelligenceEngine, MeetingIntelligenceLlm, MeetingLlmPromptInput,
+        MeetingLlmPromptSegment, MeetingLlmPromptStats, OllamaMeetingIntelligenceLlm,
     },
     note_organizer::NoteOrganizer,
     privacy_control::PrivacyState,
@@ -25,11 +26,14 @@ use super::{
         MeetingAudioFileTranscriptionResult, MeetingCapabilityReadiness, MeetingCapabilityState,
         MeetingConfig, MeetingDataClearPreview, MeetingDataClearResult,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult, MeetingLanguage,
-        MeetingLiveCapabilitySnapshot, MeetingScreenContext, MeetingScreenContextAttachResponse,
-        MeetingSession, MeetingSessionExportRequest, MeetingSessionExportResponse,
-        MeetingSessionListRequest, MeetingSessionListResponse, MeetingSessionMode,
-        MeetingSessionReadRequest, MeetingSessionReadResponse, MeetingSessionSearchRequest,
-        MeetingSessionSearchResponse, MeetingSessionState, MeetingStatus, RenameSpeakerRequest,
+        MeetingLanguageSource, MeetingLiveCapabilitySnapshot, MeetingRecallDiagnostics,
+        MeetingRecallEvidence, MeetingRecallEvidenceRelation, MeetingRecallIntent,
+        MeetingRecallRequest, MeetingRecallResponse, MeetingRecallStatus, MeetingScreenContext,
+        MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
+        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
+        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
+        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
+        MeetingSessionType, MeetingSessionTypeSource, MeetingStatus, RenameSpeakerRequest,
         RenameSpeakerResult, SpeakerAttributionMethod, TranscriptEntry, TranscriptSource,
         CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
@@ -47,6 +51,9 @@ use uuid::Uuid;
 
 pub const MAX_MEETING_TRANSCRIPTION_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
 const SUPPORTED_MEETING_AUDIO_EXTENSIONS: &[&str] = &["wav"];
+const MAX_RECALL_EVIDENCE: usize = 20;
+const MAX_RECALL_PROMPT_CHARS: usize = 12_000;
+const MAX_RECALL_ANSWER_CHARS: usize = 2_000;
 
 #[derive(Clone)]
 pub struct MeetingRuntime {
@@ -915,6 +922,133 @@ impl MeetingRuntime {
         self.session_memory.search_sessions(request)
     }
 
+    pub async fn answer_session_recall(
+        &self,
+        request: MeetingRecallRequest,
+    ) -> Result<MeetingRecallResponse, MeetingRuntimeError> {
+        let query_language = detect_recall_query_language(&request.query);
+        let mut bounded_request = request.clone();
+        bounded_request.limit = bounded_recall_limit(request.limit);
+        let retrieval = self
+            .session_memory
+            .retrieve_recall_evidence(&bounded_request)?;
+        let mut diagnostics = MeetingRecallDiagnostics {
+            generator: "extractive_fallback".to_string(),
+            use_local_llm: request.use_local_llm,
+            llm_used: false,
+            fallback_used: !request.use_local_llm,
+            model_provider: None,
+            model_name: None,
+            llm_endpoint: None,
+            query_char_count: request.query.chars().count(),
+            query_language,
+            recall_intent: retrieval.intent,
+            searched_session_count: retrieval.searched_session_count,
+            matched_session_count: retrieval.matched_session_count,
+            evidence_count: retrieval.evidence.len(),
+            max_evidence: bounded_request.limit,
+            retrieval_truncated: retrieval.truncated,
+            corrupt_archive_count: retrieval.corrupt_archive_count,
+            prompt_char_count: 0,
+            output_json_parse_failed: false,
+            invalid_evidence_indexes: 0,
+            follow_up_questions: Vec::new(),
+            warnings: retrieval
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.clone())
+                .collect(),
+            generated_at: Utc::now(),
+        };
+
+        if retrieval.evidence.is_empty() {
+            diagnostics.fallback_used = true;
+            return Ok(MeetingRecallResponse {
+                answer: no_recall_evidence_answer(query_language),
+                status: MeetingRecallStatus::InsufficientEvidence,
+                evidence: Vec::new(),
+                sessions: Vec::new(),
+                diagnostics,
+            });
+        }
+
+        if request.use_local_llm {
+            let prompt_input = build_recall_llm_prompt_input(
+                &request.query,
+                query_language,
+                retrieval.intent,
+                &retrieval.evidence,
+            );
+            diagnostics.prompt_char_count = prompt_input.prompt.chars().count();
+            match self
+                .intelligence_llm
+                .generate_intelligence_json(prompt_input)
+                .await
+            {
+                Ok(output) => {
+                    diagnostics.llm_used = true;
+                    diagnostics.generator = "local_llm".to_string();
+                    diagnostics.model_provider = Some(output.provider);
+                    diagnostics.model_name = Some(output.model);
+                    diagnostics.llm_endpoint = output.endpoint;
+                    match parse_recall_llm_output(&output.raw_json, &retrieval.evidence) {
+                        Ok(parsed) => {
+                            diagnostics.invalid_evidence_indexes = parsed.invalid_evidence_indexes;
+                            diagnostics.follow_up_questions = parsed.follow_up_questions.clone();
+                            if diagnostics.invalid_evidence_indexes > 0 {
+                                diagnostics.warnings.push(
+                                    "local_llm_returned_invalid_evidence_indexes".to_string(),
+                                );
+                            }
+                            return Ok(MeetingRecallResponse {
+                                answer: parsed.answer,
+                                status: parsed.status,
+                                evidence: parsed.evidence,
+                                sessions: retrieval.sessions,
+                                diagnostics,
+                            });
+                        }
+                        Err(failure) => {
+                            diagnostics.output_json_parse_failed = true;
+                            diagnostics.fallback_used = true;
+                            diagnostics.generator = "extractive_fallback".to_string();
+                            diagnostics.invalid_evidence_indexes = failure.invalid_evidence_indexes;
+                            diagnostics.warnings.push(failure.code);
+                        }
+                    }
+                }
+                Err(error) => {
+                    let reason_code = error.reason_code();
+                    diagnostics.fallback_used = true;
+                    diagnostics.generator = "extractive_fallback".to_string();
+                    diagnostics.model_provider = Some(error.provider);
+                    diagnostics.model_name = error.model;
+                    diagnostics.llm_endpoint = error.endpoint;
+                    diagnostics
+                        .warnings
+                        .push(format!("local_llm_failed:{reason_code}"));
+                }
+            }
+        }
+
+        Ok(MeetingRecallResponse {
+            answer: extractive_recall_answer(
+                query_language,
+                retrieval.intent,
+                &retrieval.evidence,
+                request.use_local_llm,
+            ),
+            status: if request.use_local_llm {
+                MeetingRecallStatus::Degraded
+            } else {
+                MeetingRecallStatus::Answered
+            },
+            evidence: retrieval.evidence,
+            sessions: retrieval.sessions,
+            diagnostics,
+        })
+    }
+
     pub fn export_archived_session(
         &self,
         request: MeetingSessionExportRequest,
@@ -1637,6 +1771,354 @@ impl MeetingRuntime {
     }
 }
 
+#[derive(Debug)]
+struct ParsedRecallLlmOutput {
+    answer: String,
+    status: MeetingRecallStatus,
+    evidence: Vec<MeetingRecallEvidence>,
+    invalid_evidence_indexes: usize,
+    follow_up_questions: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawRecallLlmOutput {
+    answer: Option<String>,
+    status: Option<String>,
+    #[serde(default)]
+    used_evidence_indexes: Vec<usize>,
+    #[serde(default)]
+    follow_up_questions: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RecallLlmParseFailure {
+    code: String,
+    invalid_evidence_indexes: usize,
+}
+
+fn bounded_recall_limit(limit: usize) -> usize {
+    if limit == 0 {
+        MAX_RECALL_EVIDENCE
+    } else {
+        limit.min(MAX_RECALL_EVIDENCE)
+    }
+}
+
+fn detect_recall_query_language(query: &str) -> MeetingLanguage {
+    let lower = query.to_lowercase();
+    let italian_terms = [
+        "cosa",
+        "quale",
+        "quali",
+        "quando",
+        "dove",
+        "abbiamo",
+        "avevamo",
+        "decisione",
+        "deciso",
+        "sessione",
+        "riassumimi",
+        "parlato",
+        "schermo",
+        "errore",
+        "azioni",
+    ];
+    if lower.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{00e0}' | '\u{00e8}' | '\u{00e9}' | '\u{00ec}' | '\u{00f2}' | '\u{00f9}'
+        )
+    }) || italian_terms.iter().any(|term| lower.contains(term))
+    {
+        return MeetingLanguage::Italian;
+    }
+    let english_terms = [
+        "what", "when", "where", "which", "decide", "decided", "session", "meeting", "screen",
+        "error", "action", "summary",
+    ];
+    if english_terms.iter().any(|term| lower.contains(term)) {
+        MeetingLanguage::English
+    } else {
+        MeetingLanguage::Unknown
+    }
+}
+
+fn no_recall_evidence_answer(language: MeetingLanguage) -> String {
+    if matches!(language, MeetingLanguage::Italian) {
+        "Non ho trovato evidenze negli archivi locali per rispondere a questa domanda.".to_string()
+    } else {
+        "I could not find evidence in archived sessions to answer this question.".to_string()
+    }
+}
+
+fn extractive_recall_answer(
+    language: MeetingLanguage,
+    intent: MeetingRecallIntent,
+    evidence: &[MeetingRecallEvidence],
+    degraded_from_llm: bool,
+) -> String {
+    if matches!(intent, MeetingRecallIntent::ScreenContextForTopic) {
+        if let Some(answer) = extractive_screen_context_answer(language, evidence) {
+            return answer;
+        }
+    }
+    let prefix = if matches!(language, MeetingLanguage::Italian) {
+        if degraded_from_llm {
+            "Il modello locale non ha prodotto una risposta valida; riporto le evidenze piu rilevanti."
+        } else {
+            "Ho trovato evidenze rilevanti negli archivi locali."
+        }
+    } else if degraded_from_llm {
+        "The local model did not produce a valid answer, so I am returning the most relevant evidence."
+    } else {
+        "I found relevant evidence in archived sessions."
+    };
+    let mut lines = vec![format!("{prefix} ({})", evidence.len())];
+    for item in evidence.iter().take(5) {
+        lines.push(format!(
+            "- {} / {}: {}",
+            item.session_title,
+            item.matched_kind,
+            bounded_recall_text(&item.snippet, 220)
+        ));
+    }
+    bounded_recall_text(&lines.join("\n"), MAX_RECALL_ANSWER_CHARS)
+}
+
+fn extractive_screen_context_answer(
+    language: MeetingLanguage,
+    evidence: &[MeetingRecallEvidence],
+) -> Option<String> {
+    let screen = evidence
+        .iter()
+        .find(|item| item.matched_kind == "screen_context" && !item.screen_context_ids.is_empty());
+    let transcript = evidence
+        .iter()
+        .find(|item| item.matched_kind == "transcript" || !item.evidence_segment_ids.is_empty());
+
+    match (screen, transcript) {
+        (Some(screen), Some(_)) => {
+            let approximate = matches!(
+                screen.relation,
+                MeetingRecallEvidenceRelation::SameSessionScreenContext
+            );
+            let temporal = matches!(
+                screen.relation,
+                MeetingRecallEvidenceRelation::TemporalScreenContext
+            );
+            let answer = if matches!(language, MeetingLanguage::Italian) {
+                if approximate {
+                    format!(
+                        "Non ho una prova perfettamente sincronizzata al segmento citato, ma nella stessa sessione lo screen context archiviato mostrava: {}",
+                        screen.snippet
+                    )
+                } else if temporal {
+                    format!(
+                        "Vicino al momento in cui si parlava dell'argomento, lo screen context archiviato mostrava: {}",
+                        screen.snippet
+                    )
+                } else {
+                    format!(
+                        "Nel contesto schermo collegato al segmento della discussione, lo schermo mostrava: {}",
+                        screen.snippet
+                    )
+                }
+            } else if approximate {
+                format!(
+                    "I do not have perfectly synchronized screen evidence for the exact segment, but the same archived session shows this screen context: {}",
+                    screen.snippet
+                )
+            } else if temporal {
+                format!(
+                    "Near the time this topic was discussed, the archived screen context showed: {}",
+                    screen.snippet
+                )
+            } else {
+                format!(
+                    "In the screen context linked to the discussion segment, the screen showed: {}",
+                    screen.snippet
+                )
+            };
+            Some(bounded_recall_text(&answer, MAX_RECALL_ANSWER_CHARS))
+        }
+        (None, Some(_)) => Some(if matches!(language, MeetingLanguage::Italian) {
+            "Ho trovato evidenze testuali sull'argomento, ma non ho trovato screen context archiviati per quella sessione.".to_string()
+        } else {
+            "I found transcript evidence for the topic, but no archived screen context was available for that session.".to_string()
+        }),
+        _ => None,
+    }
+}
+
+fn build_recall_llm_prompt_input(
+    query: &str,
+    language: MeetingLanguage,
+    intent: MeetingRecallIntent,
+    evidence: &[MeetingRecallEvidence],
+) -> MeetingLlmPromptInput {
+    let mut included_segment_ids = Vec::new();
+    for item in evidence {
+        for segment_id in &item.evidence_segment_ids {
+            if !included_segment_ids.contains(segment_id) {
+                included_segment_ids.push(segment_id.clone());
+            }
+        }
+    }
+    let evidence_json = recall_evidence_json(evidence);
+    let language_instruction = match language {
+        MeetingLanguage::Italian => "Rispondi in italiano.",
+        MeetingLanguage::English => "Answer in English.",
+        MeetingLanguage::Mixed => "Prefer the user's query language.",
+        MeetingLanguage::Unknown => "Use the language of the user's query when possible.",
+    };
+    let prompt = bounded_recall_text(
+        &format!(
+            r#"You are Astra's governed local work-session recall synthesizer.
+
+Use only the evidence provided below. Do not invent facts. If the evidence is insufficient, say so.
+Do not reveal chain-of-thought. Keep the answer concise and professional.
+{language_instruction}
+Recall intent: {intent:?}
+
+Evidence relation rules:
+- direct_match means the item directly matched the user query.
+- linked_screen_context means screen context was explicitly linked to the matching transcript segment.
+- temporal_screen_context means screen context was near the matching transcript segment in time.
+- same_session_screen_context means screen context came from the same session only; disclose that it is not exact timing.
+- Do not say "at that exact moment" unless the screen evidence relation is linked_screen_context or temporal_screen_context.
+
+Return only strict JSON with this schema:
+{{
+  "answer": "string",
+  "status": "answered|partial|insufficient_evidence",
+  "used_evidence_indexes": [0],
+  "confidence": 0.0,
+  "follow_up_questions": ["string"]
+}}
+
+User recall query:
+{query}
+
+Evidence items, indexed from 0:
+{evidence_json}
+"#
+        ),
+        MAX_RECALL_PROMPT_CHARS,
+    );
+    MeetingLlmPromptInput {
+        session_id: "meeting-recall".to_string(),
+        prompt,
+        segments: Vec::<MeetingLlmPromptSegment>::new(),
+        stats: MeetingLlmPromptStats {
+            input_segment_count: evidence.len(),
+            input_truncated: false,
+            input_char_count: evidence_json.chars().count(),
+            max_segments: evidence.len(),
+            max_chars_total: MAX_RECALL_PROMPT_CHARS,
+            max_chars_per_segment: 0,
+            included_segment_ids,
+            detected_language: language,
+            language_confidence: if matches!(language, MeetingLanguage::Unknown) {
+                0.0
+            } else {
+                0.75
+            },
+            language_source: MeetingLanguageSource::TranscriptHeuristic,
+            session_type: MeetingSessionType::General,
+            session_type_confidence: 0.0,
+            session_type_source: MeetingSessionTypeSource::Unknown,
+        },
+    }
+}
+
+fn recall_evidence_json(evidence: &[MeetingRecallEvidence]) -> String {
+    let value = evidence
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            serde_json::json!({
+                "index": index,
+                "session_id": item.session_id,
+                "session_title": item.session_title,
+                "matched_kind": item.matched_kind,
+                "title": item.title,
+                "snippet": item.snippet,
+                "relation": item.relation,
+                "evidence_segment_ids": item.evidence_segment_ids,
+                "screen_context_ids": item.screen_context_ids,
+                "timestamp_ms": item.timestamp_ms,
+                "score": item.score,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn parse_recall_llm_output(
+    raw_json: &str,
+    evidence: &[MeetingRecallEvidence],
+) -> Result<ParsedRecallLlmOutput, RecallLlmParseFailure> {
+    let raw: RawRecallLlmOutput = serde_json::from_str(raw_json)
+        .map_err(|_| recall_parse_failure("local_llm_recall_json_parse_failed", 0))?;
+    let status = match raw.status.as_deref().unwrap_or("partial") {
+        "answered" => MeetingRecallStatus::Answered,
+        "partial" => MeetingRecallStatus::Partial,
+        "insufficient_evidence" => MeetingRecallStatus::InsufficientEvidence,
+        _ => return Err(recall_parse_failure("local_llm_recall_status_invalid", 0)),
+    };
+    let answer = bounded_recall_text(raw.answer.as_deref().unwrap_or(""), MAX_RECALL_ANSWER_CHARS);
+    if answer.trim().is_empty() {
+        return Err(recall_parse_failure("local_llm_recall_answer_empty", 0));
+    }
+
+    let mut invalid_evidence_indexes = 0usize;
+    let mut used = Vec::new();
+    for index in raw.used_evidence_indexes {
+        if let Some(item) = evidence.get(index) {
+            used.push(item.clone());
+        } else {
+            invalid_evidence_indexes = invalid_evidence_indexes.saturating_add(1);
+        }
+    }
+
+    if !matches!(status, MeetingRecallStatus::InsufficientEvidence) && used.is_empty() {
+        return Err(recall_parse_failure(
+            "local_llm_recall_missing_valid_evidence",
+            invalid_evidence_indexes,
+        ));
+    }
+
+    Ok(ParsedRecallLlmOutput {
+        answer,
+        status,
+        evidence: used,
+        invalid_evidence_indexes,
+        follow_up_questions: raw
+            .follow_up_questions
+            .into_iter()
+            .map(|question| bounded_recall_text(&question, 180))
+            .filter(|question| !question.trim().is_empty())
+            .take(3)
+            .collect(),
+    })
+}
+
+fn recall_parse_failure(code: &str, invalid_evidence_indexes: usize) -> RecallLlmParseFailure {
+    RecallLlmParseFailure {
+        code: code.to_string(),
+        invalid_evidence_indexes,
+    }
+}
+
+fn bounded_recall_text(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        compact.chars().take(max_chars).collect()
+    }
+}
+
 struct CaptureStopForClearOutcome {
     attempted: bool,
     succeeded: bool,
@@ -2213,12 +2695,13 @@ mod tests {
     use crate::meeting::types::{
         derive_meeting_stt_source_completeness, ActionItemStatus, ArtifactGenerator,
         CaptureMetrics, ClearMeetingDataRequest, MeetingClearScope,
-        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus, MeetingScreenContext,
-        MeetingSessionExportFormat, MeetingSessionExportRequest, MeetingSessionListRequest,
-        MeetingSessionReadRequest, MeetingSessionSearchRequest, MeetingStatus,
-        MeetingSttCompletenessStatus, ScreenContextAttachmentMode, ScreenContextRedaction,
-        ScreenContextSource, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
-        LOCAL_USER_SPEAKER_ID, REMOTE_SPEAKER_1_ID,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceStatus,
+        MeetingRecallEvidenceRelation, MeetingRecallIntent, MeetingRecallRequest,
+        MeetingRecallStatus, MeetingScreenContext, MeetingSessionExportFormat,
+        MeetingSessionExportRequest, MeetingSessionListRequest, MeetingSessionReadRequest,
+        MeetingSessionSearchRequest, MeetingStatus, MeetingSttCompletenessStatus,
+        ScreenContextAttachmentMode, ScreenContextRedaction, ScreenContextSource, TranscriptSource,
+        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE, LOCAL_USER_SPEAKER_ID, REMOTE_SPEAKER_1_ID,
     };
     use crate::meeting::{
         intelligence_engine::{
@@ -2421,6 +2904,45 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CapturingMeetingLlm {
+        response: String,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CapturingMeetingLlm {
+        fn new(response: impl Into<String>) -> Self {
+            Self {
+                response: response.into(),
+                prompts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl MeetingIntelligenceLlm for CapturingMeetingLlm {
+        fn generate_intelligence_json<'a>(
+            &'a self,
+            input: MeetingLlmPromptInput,
+        ) -> MeetingLlmFuture<'a> {
+            let response = self.response.clone();
+            let prompts = self.prompts.clone();
+            Box::pin(async move {
+                prompts
+                    .lock()
+                    .expect("prompts mutex")
+                    .push(input.prompt.clone());
+                Ok(MeetingLlmRawOutput {
+                    raw_json: response,
+                    provider: "ollama".to_string(),
+                    model: "mock-meeting-model".to_string(),
+                    stats: input.stats,
+                    endpoint: Some("127.0.0.1:11434".to_string()),
+                    llm_generation_duration_ms: Some(1),
+                })
+            })
+        }
+    }
+
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("astra_meeting_runtime_{}", Uuid::new_v4()))
     }
@@ -2447,6 +2969,18 @@ mod tests {
         session_id: &str,
         captured_at: chrono::DateTime<Utc>,
     ) -> MeetingScreenContext {
+        screen_context_with_summary(
+            session_id,
+            captured_at,
+            "Visual Studio Code shows a GPU memory warning in the TTS module",
+        )
+    }
+
+    fn screen_context_with_summary(
+        session_id: &str,
+        captured_at: chrono::DateTime<Utc>,
+        summary: &str,
+    ) -> MeetingScreenContext {
         MeetingScreenContext {
             context_id: "screen-context-test".to_string(),
             session_id: session_id.to_string(),
@@ -2455,13 +2989,126 @@ mod tests {
             attachment_mode: ScreenContextAttachmentMode::CurrentMoment,
             linked_transcript_segment_ids: Vec::new(),
             linked_time_window: None,
-            summary: "Visual Studio Code shows a GPU memory warning in the TTS module".to_string(),
+            summary: summary.to_string(),
             structured_observation: None,
             screenshot_ref: None,
             redaction: ScreenContextRedaction::ScreenshotNotStored,
             confidence: 0.7,
             diagnostics: Vec::new(),
         }
+    }
+
+    fn transcript_at(text: &str, timestamp: chrono::DateTime<Utc>) -> TranscriptEntry {
+        let mut entry = TranscriptEntry::sourced("", TranscriptSource::Manual, "Simone", text, 0.9);
+        entry.timestamp = timestamp;
+        entry.created_at = timestamp;
+        entry
+    }
+
+    fn recall_request(query: &str, use_local_llm: bool) -> MeetingRecallRequest {
+        MeetingRecallRequest {
+            query: query.to_string(),
+            limit: 12,
+            date_from: None,
+            date_to: None,
+            include_transcript: true,
+            include_intelligence: true,
+            include_screen_context: true,
+            use_local_llm,
+        }
+    }
+
+    fn archive_recall_fixture(runtime: &MeetingRuntime) -> String {
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+
+        runtime
+            .add_transcript(TranscriptEntry::sourced(
+                "",
+                TranscriptSource::Manual,
+                "Simone",
+                "We discussed STT drain and decided to show incomplete export warnings when one segment remains in flight.",
+                0.91,
+            ))
+            .expect("add transcript");
+        let segment_id = runtime
+            .get_active_state()
+            .expect("active state")
+            .transcript
+            .first()
+            .expect("transcript")
+            .segment_id
+            .clone();
+        runtime
+            .add_decision(DecisionLogEntry {
+                id: "decision-recall-test".to_string(),
+                session_id: session.session_id.clone(),
+                timestamp: Utc::now(),
+                created_at: Utc::now(),
+                decision: "Ship the STT drain export warning".to_string(),
+                rationale:
+                    "The archive must not claim STT is complete when a segment is still in flight"
+                        .to_string(),
+                made_by: None,
+                evidence_segment_ids: vec![segment_id],
+            })
+            .expect("add decision");
+        runtime
+            .attach_screen_context(screen_context(&session.session_id, Utc::now()))
+            .expect("attach screen context");
+        runtime.stop_session().expect("stop session");
+        session.session_id
+    }
+
+    fn archive_bumper_screen_fixture(
+        runtime: &MeetingRuntime,
+        filler_offsets_minutes: &[i64],
+        screen_offset_minutes: Option<i64>,
+    ) -> String {
+        runtime.grant_consent("teams").expect("grant consent");
+        let session = runtime
+            .start_session(
+                "teams".to_string(),
+                MeetingConfig {
+                    session_mode: MeetingSessionMode::Manual,
+                    ..config()
+                },
+            )
+            .expect("start manual session");
+        let base = Utc::now();
+        runtime
+            .add_transcript(transcript_at(
+                "Il bumper del fronte dell auto era il problema principale.",
+                base,
+            ))
+            .expect("add bumper transcript");
+        for (index, offset) in filler_offsets_minutes.iter().enumerate() {
+            runtime
+                .add_transcript(transcript_at(
+                    &format!("Discussione intermedia su attrezzi da officina {index}."),
+                    base + chrono::Duration::minutes(*offset),
+                ))
+                .expect("add filler transcript");
+        }
+        if let Some(offset) = screen_offset_minutes {
+            runtime
+                .attach_screen_context(screen_context_with_summary(
+                    &session.session_id,
+                    base + chrono::Duration::minutes(offset),
+                    "YouTube video showing a person working on a Bugatti Veyron in a garage",
+                ))
+                .expect("attach screen context");
+        }
+        runtime.stop_session().expect("stop session");
+        session.session_id
     }
 
     #[test]
@@ -3227,6 +3874,303 @@ mod tests {
             .expect("search corrupt archives");
         assert!(searched.results.is_empty());
         assert_eq!(searched.corrupt_archive_count, 0);
+    }
+
+    #[tokio::test]
+    async fn recall_query_with_transcript_match_returns_evidence() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("STT drain", false))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(response.status, MeetingRecallStatus::Answered);
+        assert!(response
+            .evidence
+            .iter()
+            .any(|item| item.matched_kind == "transcript"));
+        assert!(!response.answer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_query_with_decision_artifact_returns_evidence() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("Ship STT drain export warning", false))
+            .await
+            .expect("recall answer");
+
+        assert!(response
+            .evidence
+            .iter()
+            .any(|item| item.matched_kind == "decision"));
+    }
+
+    #[tokio::test]
+    async fn recall_query_with_screen_context_match_returns_screen_context_evidence() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("GPU memory warning", false))
+            .await
+            .expect("recall answer");
+
+        assert!(response.evidence.iter().any(|item| {
+            item.matched_kind == "screen_context"
+                && item
+                    .screen_context_ids
+                    .iter()
+                    .any(|id| id == "screen-context-test")
+        }));
+    }
+
+    #[tokio::test]
+    async fn recall_no_evidence_returns_insufficient_evidence() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("unrelated banana invoice", false))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(response.status, MeetingRecallStatus::InsufficientEvidence);
+        assert!(response.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_local_llm_valid_json_is_validated_and_answered() {
+        let llm = FixedMeetingLlm::json(
+            r#"{"answer":"We decided to ship the STT drain export warning.","status":"answered","used_evidence_indexes":[0],"confidence":0.9,"follow_up_questions":[]}"#,
+        );
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("STT drain", true))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(response.status, MeetingRecallStatus::Answered);
+        assert!(response.diagnostics.llm_used);
+        assert_eq!(response.evidence.len(), 1);
+        assert!(response.answer.contains("STT drain"));
+    }
+
+    #[tokio::test]
+    async fn recall_local_llm_invalid_json_degrades_to_fallback() {
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(FixedMeetingLlm::json("not json")),
+        );
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("STT drain", true))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(response.status, MeetingRecallStatus::Degraded);
+        assert!(response.diagnostics.fallback_used);
+        assert!(response.diagnostics.output_json_parse_failed);
+        assert!(!response.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_local_llm_invalid_evidence_index_is_rejected() {
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(FixedMeetingLlm::json(
+                r#"{"answer":"Unsupported answer","status":"answered","used_evidence_indexes":[999],"confidence":0.9,"follow_up_questions":[]}"#,
+            )),
+        );
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("STT drain", true))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(response.status, MeetingRecallStatus::Degraded);
+        assert_eq!(response.diagnostics.invalid_evidence_indexes, 1);
+        assert!(response
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning == "local_llm_recall_missing_valid_evidence"));
+    }
+
+    #[tokio::test]
+    async fn recall_retrieval_is_bounded_by_limit() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_recall_fixture(&runtime);
+        let mut request = recall_request("STT drain warning", false);
+        request.limit = 1;
+
+        let response = runtime
+            .answer_session_recall(request)
+            .await
+            .expect("recall answer");
+
+        assert!(response.evidence.len() <= 1);
+        assert_eq!(response.diagnostics.max_evidence, 1);
+    }
+
+    #[tokio::test]
+    async fn recall_italian_query_prompts_italian_answer_language() {
+        let llm = CapturingMeetingLlm::new(
+            r#"{"answer":"Abbiamo deciso di mostrare un avviso sullo STT drain.","status":"answered","used_evidence_indexes":[0],"confidence":0.8,"follow_up_questions":[]}"#,
+        );
+        let prompts = llm.prompts.clone();
+        let runtime = MeetingRuntime::with_file_transcriber_and_intelligence_llm(
+            temp_root(),
+            Arc::new(FixedTranscriber),
+            Arc::new(llm),
+        );
+        archive_recall_fixture(&runtime);
+
+        let response = runtime
+            .answer_session_recall(recall_request("Cosa abbiamo deciso sullo STT drain?", true))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(
+            response.diagnostics.query_language,
+            MeetingLanguage::Italian
+        );
+        let prompt = prompts
+            .lock()
+            .expect("prompts mutex")
+            .first()
+            .expect("prompt")
+            .clone();
+        assert!(prompt.contains("Rispondi in italiano."));
+    }
+
+    #[tokio::test]
+    async fn recall_screen_topic_expands_to_directly_linked_screen_context() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_bumper_screen_fixture(&runtime, &[], Some(1));
+
+        let response = runtime
+            .answer_session_recall(recall_request(
+                "quando stavamo parlando del bumper del auto, cosa stavamo guardando?",
+                false,
+            ))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(
+            response.diagnostics.recall_intent,
+            MeetingRecallIntent::ScreenContextForTopic
+        );
+        assert!(response
+            .evidence
+            .iter()
+            .any(|item| item.matched_kind == "transcript"
+                && item.snippet.to_lowercase().contains("bumper")));
+        assert!(response.evidence.iter().any(|item| {
+            item.matched_kind == "screen_context"
+                && item.relation == MeetingRecallEvidenceRelation::LinkedScreenContext
+                && item.snippet.contains("Bugatti Veyron")
+        }));
+        assert!(response.answer.contains("Bugatti Veyron"));
+    }
+
+    #[tokio::test]
+    async fn recall_screen_topic_expands_to_temporal_screen_context() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_bumper_screen_fixture(&runtime, &[2, 3, 4], Some(5));
+
+        let response = runtime
+            .answer_session_recall(recall_request(
+                "quando stavamo parlando del bumper del auto, cosa stavamo guardando?",
+                false,
+            ))
+            .await
+            .expect("recall answer");
+
+        assert!(response.evidence.iter().any(|item| {
+            item.matched_kind == "screen_context"
+                && item.relation == MeetingRecallEvidenceRelation::TemporalScreenContext
+        }));
+        assert!(response.answer.contains("Vicino al momento"));
+    }
+
+    #[tokio::test]
+    async fn recall_screen_topic_expands_to_same_session_screen_context_with_uncertainty() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_bumper_screen_fixture(&runtime, &[30, 31, 32], Some(33));
+
+        let response = runtime
+            .answer_session_recall(recall_request(
+                "quando stavamo parlando del bumper del auto, cosa stavamo guardando?",
+                false,
+            ))
+            .await
+            .expect("recall answer");
+
+        assert!(response.evidence.iter().any(|item| {
+            item.matched_kind == "screen_context"
+                && item.relation == MeetingRecallEvidenceRelation::SameSessionScreenContext
+        }));
+        assert!(response
+            .answer
+            .contains("Non ho una prova perfettamente sincronizzata"));
+        assert!(response.answer.contains("Bugatti Veyron"));
+        assert!(response
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning == "session_level_screen_context"));
+    }
+
+    #[tokio::test]
+    async fn recall_screen_topic_with_transcript_but_no_screen_context_says_so() {
+        let runtime =
+            MeetingRuntime::with_file_transcriber(temp_root(), Arc::new(FixedTranscriber));
+        archive_bumper_screen_fixture(&runtime, &[], None);
+
+        let response = runtime
+            .answer_session_recall(recall_request(
+                "quando stavamo parlando del bumper del auto, cosa stavamo guardando?",
+                false,
+            ))
+            .await
+            .expect("recall answer");
+
+        assert_eq!(response.status, MeetingRecallStatus::Answered);
+        assert!(response
+            .evidence
+            .iter()
+            .all(|item| item.matched_kind != "screen_context"));
+        assert!(response
+            .answer
+            .contains("non ho trovato screen context archiviati"));
+        assert!(response
+            .diagnostics
+            .warnings
+            .iter()
+            .any(|warning| warning == "screen_context_not_available"));
     }
 
     #[tokio::test]

@@ -2643,6 +2643,7 @@ fn meeting_audit_data_category(tool_name: &str) -> &'static str {
         | "meeting.sessions.list"
         | "meeting.session.archive.read"
         | "meeting.session.search"
+        | "meeting.recall.answer"
         | "meeting.session.export"
         | "meeting.session.reindex"
         | "meeting.session.start"
@@ -3835,6 +3836,55 @@ mod tests {
         assert!(!serialized.contains("sensitive visible screen text"));
         assert!(!serialized.contains("screen.png"));
         assert!(!serialized.contains("C:/secret"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn meeting_recall_audit_is_metadata_only() {
+        let root =
+            std::env::temp_dir().join(format!("astra_meeting_recall_redact_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = DesktopAgentRuntime::new(root.clone());
+
+        runtime
+            .execute_governed_direct_action(
+                "meeting-recall-redacted".into(),
+                "meeting.recall.answer",
+                json!({
+                    "query_length": 32,
+                    "query_hash": "hash-only",
+                    "limit": 10,
+                    "use_local_llm": true,
+                    "metadata_only": true,
+                    "query_text_included": false,
+                    "answer_text_included": false,
+                    "transcript_text_included": false,
+                    "generated_text_included": false,
+                }),
+                false,
+                || {
+                    Ok(json!({
+                        "answer": "sensitive generated recall answer",
+                        "query": "sensitive raw recall query",
+                        "evidence": [
+                            {
+                                "snippet": "sensitive transcript evidence",
+                                "session_id": "session"
+                            }
+                        ]
+                    }))
+                },
+            )
+            .expect("recall action");
+
+        let events = runtime.recent_audit_events(10);
+        let serialized = serde_json::to_string(&events).expect("audit events json");
+        assert!(serialized.contains("meeting_session_metadata"));
+        assert!(serialized.contains("hash-only"));
+        assert!(!serialized.contains("sensitive generated recall answer"));
+        assert!(!serialized.contains("sensitive raw recall query"));
+        assert!(!serialized.contains("sensitive transcript evidence"));
 
         let _ = std::fs::remove_dir_all(root);
     }

@@ -66,7 +66,8 @@ use meeting::{
         MeetingAudioFileTranscriptionResult, MeetingConfig, MeetingDataClearPreview,
         MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLiveCapabilitySnapshot, MeetingScreenContext, MeetingScreenContextAttachRequest,
+        MeetingLiveCapabilitySnapshot, MeetingRecallRequest, MeetingRecallResponse,
+        MeetingScreenContext, MeetingScreenContextAttachRequest,
         MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
         MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
         MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
@@ -3064,6 +3065,48 @@ fn search_meeting_sessions(
 }
 
 #[tauri::command]
+async fn answer_meeting_recall(
+    state: State<'_, AssistantRuntime>,
+    request: MeetingRecallRequest,
+) -> Result<MeetingRecallResponse, String> {
+    let meeting = state.meeting_runtime.clone();
+    let desktop_agent = state.desktop_agent.clone();
+    let params = serde_json::json!({
+        "query_length": request.query.chars().count(),
+        "query_hash": sha256_hex(&request.query),
+        "limit": request.limit,
+        "date_from_present": request.date_from.is_some(),
+        "date_to_present": request.date_to.is_some(),
+        "include_transcript": request.include_transcript,
+        "include_intelligence": request.include_intelligence,
+        "include_screen_context": request.include_screen_context,
+        "use_local_llm": request.use_local_llm,
+        "metadata_only": true,
+        "query_text_included": false,
+        "answer_text_included": false,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.recall.answer",
+            params,
+            false,
+            move || async move {
+                meeting_value(
+                    meeting
+                        .answer_session_recall(request)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
 fn export_meeting_session_archive(
     state: State<'_, AssistantRuntime>,
     request: MeetingSessionExportRequest,
@@ -3851,6 +3894,7 @@ pub fn run() {
             list_meeting_sessions,
             read_meeting_session_archive,
             search_meeting_sessions,
+            answer_meeting_recall,
             export_meeting_session_archive,
             reindex_meeting_sessions,
             add_meeting_transcript,

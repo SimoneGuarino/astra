@@ -548,6 +548,84 @@ export type MeetingSessionSearchResponse = {
     diagnostics: MeetingDiagnostic[];
 };
 
+export type MeetingRecallRequest = {
+    query: string;
+    limit?: number;
+    date_from?: string | null;
+    date_to?: string | null;
+    include_transcript?: boolean;
+    include_intelligence?: boolean;
+    include_screen_context?: boolean;
+    use_local_llm?: boolean;
+};
+
+export type MeetingRecallStatus =
+    | "answered"
+    | "partial"
+    | "insufficient_evidence"
+    | "degraded"
+    | "failed";
+
+export type MeetingRecallIntent =
+    | "general"
+    | "decision"
+    | "action_items"
+    | "screen_context_for_topic"
+    | "screen_context"
+    | "technical";
+
+export type MeetingRecallEvidenceRelation =
+    | "direct_match"
+    | "linked_screen_context"
+    | "temporal_screen_context"
+    | "same_session_screen_context";
+
+export type MeetingRecallEvidence = {
+    session_id: string;
+    session_title: string;
+    matched_kind: string;
+    title: string;
+    snippet: string;
+    relation: MeetingRecallEvidenceRelation;
+    evidence_segment_ids: string[];
+    screen_context_ids: string[];
+    timestamp_ms?: number | null;
+    score: number;
+};
+
+export type MeetingRecallDiagnostics = {
+    generator: string;
+    use_local_llm: boolean;
+    llm_used: boolean;
+    fallback_used: boolean;
+    model_provider?: string | null;
+    model_name?: string | null;
+    llm_endpoint?: string | null;
+    query_char_count: number;
+    query_language: MeetingLanguage;
+    recall_intent: MeetingRecallIntent;
+    searched_session_count: number;
+    matched_session_count: number;
+    evidence_count: number;
+    max_evidence: number;
+    retrieval_truncated: boolean;
+    corrupt_archive_count: number;
+    prompt_char_count: number;
+    output_json_parse_failed: boolean;
+    invalid_evidence_indexes: number;
+    follow_up_questions: string[];
+    warnings: string[];
+    generated_at: string;
+};
+
+export type MeetingRecallResponse = {
+    answer: string;
+    status: MeetingRecallStatus;
+    evidence: MeetingRecallEvidence[];
+    sessions: MeetingSessionListItem[];
+    diagnostics: MeetingRecallDiagnostics;
+};
+
 export type MeetingSessionExportFormat = "markdown" | "json";
 
 export type MeetingSessionExportRequest = {

@@ -14,6 +14,7 @@ import type {
     MeetingDiagnostic,
     MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
+    MeetingRecallResponse,
     MeetingSession,
     MeetingSessionArchiveDocument,
     MeetingSessionExportResponse,
@@ -457,6 +458,21 @@ function artifactKindLabel(kind: string): string {
         .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function recallRelationLabel(relation?: string | null): string {
+    switch (relation) {
+        case "linked_screen_context":
+            return "linked screen context";
+        case "temporal_screen_context":
+            return "nearest screen context";
+        case "same_session_screen_context":
+            return "same-session screen context";
+        case "direct_match":
+            return "direct evidence match";
+        default:
+            return "evidence match";
+    }
+}
+
 function sttCompletenessLabel(status?: string | null): string {
     switch (status) {
         case "complete":
@@ -588,9 +604,12 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const [sessionMemoryDiagnostics, setSessionMemoryDiagnostics] = useState<MeetingDiagnostic[]>([]);
     const [sessionSearchQuery, setSessionSearchQuery] = useState("");
     const [sessionSearchResults, setSessionSearchResults] = useState<MeetingSessionSearchResult[]>([]);
+    const [recallQuery, setRecallQuery] = useState("");
+    const [recallResponse, setRecallResponse] = useState<MeetingRecallResponse | null>(null);
     const [openedArchive, setOpenedArchive] = useState<MeetingSessionArchiveDocument | null>(null);
     const [archiveExport, setArchiveExport] = useState<MeetingSessionExportResponse | null>(null);
     const [isSessionMemoryBusy, setIsSessionMemoryBusy] = useState(false);
+    const [isRecallBusy, setIsRecallBusy] = useState(false);
 
     const meetingTools = useMemo(
         () => capabilities?.tools.filter((tool) => tool.category === "meeting") ?? [],
@@ -1328,6 +1347,34 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         }
     }, [meeting, sessionSearchQuery]);
 
+    const handleAnswerRecall = useCallback(async () => {
+        const query = recallQuery.trim();
+        if (!query) {
+            setRecallResponse(null);
+            return;
+        }
+        try {
+            setIsRecallBusy(true);
+            setLastError(null);
+            const response = await meeting.answerRecall({
+                query,
+                limit: 12,
+                include_transcript: true,
+                include_intelligence: true,
+                include_screen_context: true,
+                use_local_llm: true,
+            });
+            setRecallResponse(response);
+            setLastResult(`ask session memory: ${summarizeOperationResult(response)}`);
+        } catch (error) {
+            setRecallResponse(null);
+            setLastResult(null);
+            setLastError(`ask session memory: ${errorText(error)}`);
+        } finally {
+            setIsRecallBusy(false);
+        }
+    }, [meeting, recallQuery]);
+
     const handleExportArchivedSession = useCallback(async (sessionId: string, format: "markdown" | "json") => {
         try {
             setIsSessionMemoryBusy(true);
@@ -1774,6 +1821,68 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     >
                         Reindex
                     </Button>
+                </div>
+
+                <div className="meeting-session-memory__recall">
+                    <div className="meeting-generated-block__header">
+                        <h4>Ask Session Memory</h4>
+                        <span>{recallResponse?.status ?? "local evidence"}</span>
+                    </div>
+                    <div className="meeting-session-memory__search">
+                        <input
+                            className="desktop-agent-input"
+                            value={recallQuery}
+                            onChange={(event) => setRecallQuery(event.target.value)}
+                            placeholder="Ask what was decided, discussed, or visible on screen"
+                            aria-label="Ask archived meeting sessions"
+                        />
+                        <Button
+                            variant="secondary"
+                            radius="full"
+                            size="xs"
+                            disabled={isRecallBusy || !recallQuery.trim()}
+                            onClick={() => void handleAnswerRecall()}
+                        >
+                            {isRecallBusy ? "Asking" : "Ask"}
+                        </Button>
+                    </div>
+                    {recallResponse ? (
+                        <div className="meeting-recall-answer">
+                            <p>{recallResponse.answer}</p>
+                            <div className="meeting-session-memory__diagnostics">
+                                <span>Status: {recallResponse.status}</span>
+                                <span>Generator: {recallResponse.diagnostics.generator}</span>
+                                <span>Intent: {artifactKindLabel(recallResponse.diagnostics.recall_intent)}</span>
+                                <span>Evidence: {recallResponse.evidence.length}</span>
+                                {recallResponse.diagnostics.fallback_used ? <span>fallback</span> : null}
+                            </div>
+                            {recallResponse.evidence.length ? (
+                                <div className="meeting-session-search-results">
+                                    {recallResponse.evidence.slice(0, 5).map((item, index) => (
+                                        <article key={`${item.session_id}-${item.matched_kind}-${index}`} className="meeting-session-search-result">
+                                            <span>{artifactKindLabel(item.matched_kind)} - {item.session_title}</span>
+                                            <strong>{item.title}</strong>
+                                            <p>{item.snippet}</p>
+                                            <small>
+                                                Relation: {recallRelationLabel(item.relation)} -{" "}
+                                                {item.screen_context_ids.length ? `Screen context: ${item.screen_context_ids.join(", ")} - ` : ""}
+                                                Evidence: {item.evidence_segment_ids.join(", ") || "none"}
+                                            </small>
+                                            <Button
+                                                variant="text"
+                                                radius="full"
+                                                size="xs"
+                                                disabled={isSessionMemoryBusy}
+                                                onClick={() => void handleOpenArchivedSession(item.session_id)}
+                                            >
+                                                Open session
+                                            </Button>
+                                        </article>
+                                    ))}
+                                </div>
+                            ) : null}
+                        </div>
+                    ) : null}
                 </div>
 
                 {sessionMemoryDiagnostics.length ? (
