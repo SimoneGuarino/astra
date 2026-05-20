@@ -1723,15 +1723,15 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 </div>
             </section>
 
-            <section className="desktop-agent-card meeting-section-card meeting-screen-context">
-                <div className="meeting-section-heading">
+            <details className="desktop-agent-card meeting-section-card meeting-screen-context meeting-collapsible-section">
+                <summary className="meeting-collapsible-summary">
                     <div>
                         <p className="meeting-section-kicker">Screen Context</p>
                         <h3>Attached Screen Context</h3>
                         <p>Manual, governed screen observation attached to this work session. Screenshots are not stored by default.</p>
                     </div>
                     <span className="meeting-count-pill">{screenContexts.length} saved</span>
-                </div>
+                </summary>
                 <div className="desktop-agent-inline-actions">
                     <Button
                         variant="secondary"
@@ -1783,7 +1783,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         Attach the current screen when visual context matters to the session. Astra stores a bounded local summary and links it to nearby transcript segments.
                     </div>
                 )}
-            </section>
+            </details>
 
             <section className="desktop-agent-card meeting-section-card meeting-session-memory">
                 <div className="meeting-section-heading">

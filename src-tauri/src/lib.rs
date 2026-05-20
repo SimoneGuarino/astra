@@ -38,6 +38,7 @@ mod ui_target_grounding;
 mod vad;
 mod voice_metrics;
 mod voice_session;
+mod work_session_chat;
 mod workflow_continuation;
 
 use assistant_context::build_capability_context;
@@ -63,17 +64,18 @@ use meeting::{
     types::{
         ActionItem, CallInfo, CaptureBackend, ClearMeetingDataRequest, ConsentState,
         DecisionLogEntry, ExportedMeeting, MeetingAudioFileTranscriptionRequest,
-        MeetingAudioFileTranscriptionResult, MeetingConfig, MeetingDataClearPreview,
-        MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
+        MeetingAudioFileTranscriptionResult, MeetingCaptureOptions, MeetingConfig,
+        MeetingDataClearPreview, MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
         MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
         MeetingLiveCapabilitySnapshot, MeetingRecallRequest, MeetingRecallResponse,
         MeetingScreenContext, MeetingScreenContextAttachRequest,
         MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
         MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
         MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
-        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState, NoteEntry,
-        RenameSpeakerRequest, RenameSpeakerResult, ScreenContextRedaction, ScreenContextSource,
-        ScreenStructuredObservation, SummaryEntry, TranscriptEntry,
+        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
+        MeetingStatus, NoteEntry, RenameSpeakerRequest, RenameSpeakerResult,
+        ScreenContextRedaction, ScreenContextSource, ScreenStructuredObservation, SummaryEntry,
+        TranscriptEntry,
     },
 };
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
@@ -106,6 +108,7 @@ use voice_metrics::{VoiceMetricsTracker, VoiceTurnMetricsSnapshot};
 use voice_session::{
     TranscriptDecision, VoiceSessionAction, VoiceSessionManager, VoiceSessionSnapshot,
 };
+use work_session_chat::{classify_work_session_chat_intent, WorkSessionChatIntent};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OllamaMessage {
@@ -386,6 +389,19 @@ async fn start_assistant_response(
     let history = runtime.conversation_history.recent_messages(10);
     let manifest = runtime.desktop_agent.capability_manifest().await;
 
+    if let Some(response) = try_handle_work_session_chat(
+        &window,
+        runtime.clone(),
+        &message,
+        display_user_message.clone(),
+        source,
+        response_options,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
     let route_result = route_message(&runtime.desktop_agent, &manifest, &message).await?;
     emit_route_diagnostic(&window, &route_result.diagnostic);
 
@@ -520,6 +536,800 @@ async fn start_assistant_response(
         model,
         audio_response_enabled: response_options.speech_enabled,
     })
+}
+
+async fn try_handle_work_session_chat(
+    window: &WebviewWindow,
+    runtime: AssistantRuntime,
+    message: &str,
+    display_user_message: Option<String>,
+    source: &str,
+    response_options: AssistantResponseOptions,
+) -> Result<Option<StartChatResponse>, String> {
+    let route = classify_work_session_chat_intent(message);
+    if !route.intent.is_actionable() {
+        return Ok(None);
+    }
+
+    let diagnostic = work_session_chat_route_diagnostic(message, route.intent, route.confidence);
+    emit_route_diagnostic(window, &diagnostic);
+    let _ = window.emit(
+        "work-session-chat-command-started",
+        serde_json::json!({
+            "intent": route.intent.as_str(),
+            "tool_name": route.intent.primary_tool_name(),
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "screen_pixels_included": false,
+            "generated_text_included": false,
+        }),
+    );
+    let display_text =
+        match execute_work_session_chat_intent(window, &runtime, route.intent, message).await {
+            Ok(response) => response,
+            Err(error) => render_work_session_error(route.intent, &error),
+        };
+    let _ = window.emit(
+        "work-session-chat-command-finished",
+        serde_json::json!({
+            "intent": route.intent.as_str(),
+            "tool_name": route.intent.primary_tool_name(),
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "screen_pixels_included": false,
+            "generated_text_included": false,
+        }),
+    );
+    let response = start_grounded_response(
+        window.clone(),
+        runtime,
+        message.to_string(),
+        display_user_message,
+        source,
+        RenderedAssistantResponse::from_display(display_text),
+        "work-session-chat",
+        response_options,
+    )
+    .await?;
+    Ok(Some(response))
+}
+
+async fn execute_work_session_chat_intent(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+    intent: WorkSessionChatIntent,
+    message: &str,
+) -> Result<String, String> {
+    match intent {
+        WorkSessionChatIntent::StartSession => start_work_session_from_chat(window, runtime),
+        WorkSessionChatIntent::StopSession => stop_work_session_from_chat(window, runtime)
+            .map(|exported| render_stop_work_session_response(&exported)),
+        WorkSessionChatIntent::StopAndGenerateRecap => {
+            let intelligence = maybe_generate_intelligence_before_stop(runtime).await.ok();
+            let exported = stop_work_session_from_chat(window, runtime)?;
+            Ok(render_stop_and_recap_response(
+                &exported,
+                intelligence.as_ref(),
+            ))
+        }
+        WorkSessionChatIntent::AttachScreenContext => {
+            attach_screen_context_from_chat(window, runtime).await
+        }
+        WorkSessionChatIntent::GenerateIntelligence => {
+            let intelligence = generate_intelligence_from_chat(window, runtime).await?;
+            Ok(render_intelligence_response(&intelligence))
+        }
+        WorkSessionChatIntent::GenerateTechnicalRecap => {
+            let intelligence = generate_intelligence_from_chat(window, runtime).await?;
+            Ok(render_technical_recap_response(&intelligence))
+        }
+        WorkSessionChatIntent::GenerateFollowUpDraft => {
+            generate_followup_from_chat(window, runtime).await
+        }
+        WorkSessionChatIntent::RecallSessionMemory => {
+            answer_recall_from_chat(runtime, message).await
+        }
+        WorkSessionChatIntent::SearchSessionMemory => {
+            search_session_memory_from_chat(runtime, message)
+        }
+        WorkSessionChatIntent::ShowSessionStatus => render_work_session_status(runtime),
+        WorkSessionChatIntent::OpenMeetingPanel => {
+            let _ = window.emit("work-session-open-details-requested", serde_json::json!({}));
+            Ok("Ho aperto il pannello dettagli della Work Session. La chat resta il punto principale per avviare, fermare, allegare schermo e fare domande alla memoria.".to_string())
+        }
+        WorkSessionChatIntent::Unknown => Err("unsupported work session intent".to_string()),
+    }
+}
+
+fn work_session_chat_route_diagnostic(
+    message: &str,
+    intent: WorkSessionChatIntent,
+    confidence: f32,
+) -> ConversationRouteDiagnostic {
+    ConversationRouteDiagnostic {
+        message_excerpt: message.chars().take(160).collect(),
+        classifier_source: "work_session_chat_heuristic".to_string(),
+        intent: intent.as_str().to_string(),
+        target: Some("meeting_work_session".to_string()),
+        action: Some(intent.as_str().to_string()),
+        tool_name: intent.primary_tool_name().map(str::to_string),
+        extracted_params: Some(serde_json::json!({
+            "intent": intent.as_str(),
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "screen_pixels_included": false,
+        })),
+        confidence: Some(confidence),
+        routed_to: "work_session_chat".to_string(),
+        grounded: true,
+        fallback_used: false,
+        submit_action_called: intent.primary_tool_name().is_some(),
+        action_id: None,
+        action_status: None,
+        approval_created: false,
+        audit_expected: intent.primary_tool_name().is_some(),
+        rationale: Some(
+            "common Meeting / Work Session chat command routed to governed meeting tools"
+                .to_string(),
+        ),
+        error: None,
+    }
+}
+
+fn default_chat_work_session_config() -> MeetingConfig {
+    MeetingConfig {
+        platform: "teams".to_string(),
+        capture_backend: CaptureBackend::Wasapi,
+        transcription_model: "local".to_string(),
+        sample_rate: 16_000,
+        diarization_enabled: false,
+        privacy_mode: "default".to_string(),
+        session_mode: MeetingSessionMode::RealCapture,
+        live_transcription_enabled: true,
+        capture_options: MeetingCaptureOptions {
+            system_audio: true,
+            microphone: true,
+            segment_transcription: true,
+        },
+    }
+}
+
+fn start_work_session_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+) -> Result<String, String> {
+    let platform = "teams".to_string();
+    let config = default_chat_work_session_config();
+    let meeting = runtime.meeting_runtime.clone();
+    let desktop_agent = runtime.desktop_agent.clone();
+    let params = serde_json::json!({
+        "platform": platform,
+        "capture_backend": config.capture_backend,
+        "transcription_model": config.transcription_model,
+        "session_mode": config.session_mode,
+        "segment_transcription_enabled": true,
+        "capture_options": config.capture_options,
+        "chat_initiated": true,
+        "metadata_only": true,
+        "raw_audio_included": false,
+        "transcript_text_included": false,
+    });
+    let value = governed_meeting_command(runtime, "meeting.session.start", params, move || {
+        confirmed_meeting_start_preflight_checks(&desktop_agent, "teams", &config)?;
+        meeting_value(
+            meeting
+                .start_session("teams".to_string(), config)
+                .map_err(|error| error.to_string())?,
+        )
+    })?;
+    let session: MeetingSession = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        window,
+        &[
+            "meeting-session-updated",
+            "meeting-diagnostics-updated",
+            "meeting-artifacts-updated",
+        ],
+    );
+    Ok(format!(
+        "Ho avviato una Work Session.\nSto catturando microfono e audio del PC quando disponibili, con STT locale su segmenti gestiti.\nSessione: {}",
+        session.session_id
+    ))
+}
+
+fn stop_work_session_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+) -> Result<ExportedMeeting, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.session.stop",
+        serde_json::json!({
+            "chat_initiated": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+        }),
+        move || meeting_value(meeting.stop_session().map_err(|error| error.to_string())?),
+    )?;
+    let exported = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        window,
+        &[
+            "meeting-session-updated",
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(exported)
+}
+
+async fn maybe_generate_intelligence_before_stop(
+    runtime: &AssistantRuntime,
+) -> Result<MeetingIntelligenceResult, String> {
+    let state = read_work_session_state_governed(runtime)?;
+    if state.transcript.is_empty() {
+        return Err("meeting intelligence requires transcript evidence".to_string());
+    }
+    let meeting = runtime.meeting_runtime.clone();
+    let desktop_agent = runtime.desktop_agent.clone();
+    let options = MeetingIntelligenceGenerationOptions::default();
+    let params =
+        meeting_intelligence_chat_params(options.use_local_llm, options.max_transcript_segments);
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.intelligence.generate",
+            params,
+            false,
+            move || async move {
+                meeting_value(
+                    meeting
+                        .generate_intelligence(options)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    meeting_from_value(value)
+}
+
+async fn generate_intelligence_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+) -> Result<MeetingIntelligenceResult, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let desktop_agent = runtime.desktop_agent.clone();
+    let options = MeetingIntelligenceGenerationOptions::default();
+    let params =
+        meeting_intelligence_chat_params(options.use_local_llm, options.max_transcript_segments);
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.intelligence.generate",
+            params,
+            false,
+            move || async move {
+                meeting_value(
+                    meeting
+                        .generate_intelligence(options)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    let intelligence = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        window,
+        &[
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(intelligence)
+}
+
+fn meeting_intelligence_chat_params(
+    use_local_llm: bool,
+    max_transcript_segments: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "artifact_types_requested": [
+            "summary",
+            "decisions",
+            "action_items",
+            "open_questions",
+            "risks",
+            "technical_recap",
+            "follow_up_draft",
+            "timeline"
+        ],
+        "use_local_llm_requested": use_local_llm,
+        "max_transcript_segments": max_transcript_segments,
+        "chat_initiated": true,
+        "metadata_only": true,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+        "audit_redacted": true,
+    })
+}
+
+async fn generate_followup_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+) -> Result<String, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let desktop_agent = runtime.desktop_agent.clone();
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.followup.draft",
+            serde_json::json!({
+                "chat_initiated": true,
+                "metadata_only": true,
+                "transcript_text_included": false,
+                "generated_text_included": false,
+                "send_email": false,
+            }),
+            false,
+            move || async move {
+                let existing = meeting
+                    .read_intelligence()
+                    .map_err(|error| error.to_string())?;
+                let intelligence = match existing {
+                    Some(result) if result.follow_up_draft.is_some() => result,
+                    _ => meeting
+                        .generate_intelligence(MeetingIntelligenceGenerationOptions::default())
+                        .await
+                        .map_err(|error| error.to_string())?,
+                };
+                meeting_value(intelligence.follow_up_draft)
+            },
+        )
+        .await?;
+    let draft: Option<MeetingFollowUpDraft> = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        window,
+        &[
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+            "meeting-session-updated",
+        ],
+    );
+    Ok(match draft {
+        Some(draft) => format!(
+            "Ho preparato una bozza di follow-up, solo da copiare: {}\n\n{}",
+            draft.subject, draft.body
+        ),
+        None => "Non ho trovato evidenze sufficienti per una bozza di follow-up.".to_string(),
+    })
+}
+
+async fn attach_screen_context_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+) -> Result<String, String> {
+    let request = MeetingScreenContextAttachRequest {
+        session_id: None,
+        store_screenshot: false,
+        capture_fresh: true,
+        attachment_mode: Default::default(),
+    };
+    let meeting = runtime.meeting_runtime.clone();
+    let governing_agent = runtime.desktop_agent.clone();
+    let capture_agent = governing_agent.clone();
+    let params = meeting_screen_context_preflight_params(&request);
+    let value = governing_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.screen_context.attach_current",
+            params,
+            false,
+            move || async move {
+                let (capture, analysis, diagnostic_codes) = capture_agent
+                    .capture_screen_for_meeting_context(request.store_screenshot)
+                    .await?;
+                let context = build_meeting_screen_context(
+                    &request,
+                    &capture,
+                    analysis.as_ref(),
+                    diagnostic_codes,
+                );
+                meeting_value(
+                    meeting
+                        .attach_screen_context(context)
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    let response: MeetingScreenContextAttachResponse = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        window,
+        &[
+            "meeting-session-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(format!(
+        "Ho allegato lo schermo corrente alla sessione.\nSummary: {}\nEvidenze collegate: {} segmenti transcript.",
+        response.context.summary,
+        response.context.linked_transcript_segment_ids.len()
+    ))
+}
+
+async fn answer_recall_from_chat(
+    runtime: &AssistantRuntime,
+    message: &str,
+) -> Result<String, String> {
+    let request = MeetingRecallRequest {
+        query: message.to_string(),
+        limit: 12,
+        date_from: None,
+        date_to: None,
+        include_transcript: true,
+        include_intelligence: true,
+        include_screen_context: true,
+        use_local_llm: true,
+    };
+    let meeting = runtime.meeting_runtime.clone();
+    let desktop_agent = runtime.desktop_agent.clone();
+    let params = serde_json::json!({
+        "query_length": request.query.chars().count(),
+        "query_hash": sha256_hex(&request.query),
+        "limit": request.limit,
+        "date_from_present": false,
+        "date_to_present": false,
+        "include_transcript": true,
+        "include_intelligence": true,
+        "include_screen_context": true,
+        "use_local_llm": true,
+        "chat_initiated": true,
+        "metadata_only": true,
+        "query_text_included": false,
+        "answer_text_included": false,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value = desktop_agent
+        .execute_governed_direct_action_async(
+            Uuid::new_v4().to_string(),
+            "meeting.recall.answer",
+            params,
+            false,
+            move || async move {
+                meeting_value(
+                    meeting
+                        .answer_session_recall(request)
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            },
+        )
+        .await?;
+    let response: MeetingRecallResponse = meeting_from_value(value)?;
+    Ok(render_recall_response(&response))
+}
+
+fn search_session_memory_from_chat(
+    runtime: &AssistantRuntime,
+    message: &str,
+) -> Result<String, String> {
+    let request = MeetingSessionSearchRequest {
+        query: strip_search_session_prefix(message),
+        limit: 8,
+    };
+    let meeting = runtime.meeting_runtime.clone();
+    let params = serde_json::json!({
+        "query_length": request.query.chars().count(),
+        "query_hash": sha256_hex(&request.query),
+        "limit": request.limit,
+        "chat_initiated": true,
+        "metadata_only": true,
+        "query_text_included": false,
+        "transcript_text_included": false,
+        "generated_text_included": false,
+    });
+    let value = governed_meeting_command(runtime, "meeting.session.search", params, move || {
+        meeting_value(
+            meeting
+                .search_archived_sessions(request)
+                .map_err(|error| error.to_string())?,
+        )
+    })?;
+    let response: MeetingSessionSearchResponse = meeting_from_value(value)?;
+    if response.results.is_empty() {
+        return Ok("Non ho trovato risultati nella memoria locale delle sessioni.".to_string());
+    }
+    let mut lines = vec![format!(
+        "Ho trovato {} risultato/i nella memoria locale delle sessioni.",
+        response.results.len()
+    )];
+    for item in response.results.iter().take(4) {
+        lines.push(format!(
+            "- {} / {}: {}",
+            item.session_title, item.matched_kind, item.snippet
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn read_work_session_state_governed(
+    runtime: &AssistantRuntime,
+) -> Result<MeetingSessionState, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.session.read",
+        serde_json::json!({
+            "read": "active_state",
+            "data_category": "meeting_state",
+            "chat_initiated": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .get_active_state()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+fn read_active_work_session_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<MeetingSession>, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.session.read",
+        serde_json::json!({
+            "read": "active_session",
+            "chat_initiated": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .get_active_session()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+fn read_last_completed_work_session_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<MeetingSessionState>, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.session.read",
+        serde_json::json!({
+            "read": "last_completed_state",
+            "chat_initiated": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .get_last_completed_state()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+fn read_live_capabilities_governed(
+    runtime: &AssistantRuntime,
+) -> Result<MeetingLiveCapabilitySnapshot, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.session.read",
+        serde_json::json!({
+            "read": "live_capabilities",
+            "chat_initiated": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .live_capabilities()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+fn render_work_session_status(runtime: &AssistantRuntime) -> Result<String, String> {
+    let active_session = read_active_work_session_governed(runtime)?;
+    let state = if active_session.is_some() {
+        Some(read_work_session_state_governed(runtime)?)
+    } else {
+        read_last_completed_work_session_governed(runtime)?
+    };
+    let capabilities = read_live_capabilities_governed(runtime)?;
+    let Some(state) = state else {
+        return Ok("Nessuna Work Session attiva o archiviata in questa esecuzione.".to_string());
+    };
+    let metrics = &capabilities.capture_health.metrics;
+    let status = if active_session.is_some() {
+        format!("attiva ({})", meeting_status_label(&state.status))
+    } else {
+        format!(
+            "non attiva; ultima sessione {}",
+            meeting_status_label(&state.status)
+        )
+    };
+    Ok(format!(
+        "Work Session: {status}\nTranscript: {} entrate\nSTT: {}/{} trascritti, queue {}, in-flight {}\nScreen contexts: {}\nIntelligence: {}",
+        state.transcript.len(),
+        metrics.segments_transcribed,
+        metrics.segments_written,
+        metrics.current_queue_depth,
+        metrics.segments_in_flight,
+        state.screen_contexts.len(),
+        if state.intelligence.is_some() { "generata" } else { "non generata" }
+    ))
+}
+
+fn render_intelligence_response(intelligence: &MeetingIntelligenceResult) -> String {
+    if let Some(summary) = intelligence.summary.as_ref() {
+        format!(
+            "Ho generato il recap della Work Session.\nSummary: {}\nEvidenze: {} segmenti transcript.",
+            summary.text,
+            summary.evidence_segment_ids.len()
+        )
+    } else {
+        format!(
+            "Ho aggiornato la Meeting Intelligence. Decisioni: {}, action item: {}, screen-aware context disponibile: {}.",
+            intelligence.decisions.len(),
+            intelligence.action_items.len(),
+            intelligence.source_transcript_segment_count
+        )
+    }
+}
+
+fn render_technical_recap_response(intelligence: &MeetingIntelligenceResult) -> String {
+    if let Some(recap) = intelligence.technical_recap.as_ref() {
+        if recap.bullets.is_empty() {
+            return "Ho generato la Meeting Intelligence, ma non ho trovato dettagli tecnici abbastanza solidi.".to_string();
+        }
+        let mut lines = vec!["Recap tecnico generato:".to_string()];
+        for bullet in recap.bullets.iter().take(5) {
+            lines.push(format!("- {bullet}"));
+        }
+        if !recap.mentioned_errors.is_empty() {
+            lines.push(format!(
+                "Errori citati: {}",
+                recap.mentioned_errors.join(", ")
+            ));
+        }
+        lines.push(format!(
+            "Evidenze: {} segmenti transcript.",
+            recap.evidence_segment_ids.len()
+        ));
+        lines.join("\n")
+    } else {
+        "Ho generato la Meeting Intelligence, ma non è emerso un recap tecnico.".to_string()
+    }
+}
+
+fn render_recall_response(response: &MeetingRecallResponse) -> String {
+    if response.evidence.is_empty() {
+        return response.answer.clone();
+    }
+    let screen_count = response
+        .evidence
+        .iter()
+        .filter(|item| item.matched_kind == "screen_context")
+        .count();
+    let transcript_count = response
+        .evidence
+        .iter()
+        .filter(|item| item.matched_kind == "transcript")
+        .count();
+    format!(
+        "{}\n\nEvidenze: {} transcript, {} screen context, {} totali.",
+        response.answer,
+        transcript_count,
+        screen_count,
+        response.evidence.len()
+    )
+}
+
+fn render_stop_work_session_response(exported: &ExportedMeeting) -> String {
+    format!(
+        "Sessione salvata.\nTranscript: {} entrate.\nScreen contexts: {}.\nMeeting Intelligence: {}.",
+        exported.transcript.len(),
+        exported.screen_contexts.len(),
+        if exported.intelligence.is_some() { "presente" } else { "non generata" }
+    )
+}
+
+fn render_stop_and_recap_response(
+    exported: &ExportedMeeting,
+    intelligence: Option<&MeetingIntelligenceResult>,
+) -> String {
+    let recap = intelligence
+        .and_then(|result| result.summary.as_ref())
+        .map(|summary| format!("\nSummary: {}", summary.text))
+        .unwrap_or_else(|| "\nRecap non generato: servono segmenti transcript validi.".to_string());
+    format!(
+        "Ho fermato la Work Session e salvato l'archivio.\nTranscript: {} entrate.{}",
+        exported.transcript.len(),
+        recap
+    )
+}
+
+fn render_work_session_error(intent: WorkSessionChatIntent, error: &str) -> String {
+    let sanitized = sanitize_chat_meeting_error(error);
+    match intent {
+        WorkSessionChatIntent::StartSession if sanitized.contains("consent") => {
+            "Per avviare una Work Session serve prima il consenso Meeting. Apri Dettagli > Meeting e concedi il consenso, poi puoi scrivere di nuovo: Avvia una sessione di lavoro.".to_string()
+        }
+        WorkSessionChatIntent::AttachScreenContext if sanitized.contains("NoActiveSession") || sanitized.contains("no active") => {
+            "Non c'è una Work Session attiva a cui allegare lo schermo. Avvia prima una sessione di lavoro.".to_string()
+        }
+        _ => format!(
+            "Non sono riuscito a completare il comando Work Session ({}) in modo sicuro: {}",
+            intent.as_str(),
+            sanitized
+        ),
+    }
+}
+
+fn sanitize_chat_meeting_error(error: &str) -> String {
+    let compact = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact
+        .chars()
+        .map(|ch| if ch == '\\' || ch == '/' { ' ' } else { ch })
+        .take(220)
+        .collect()
+}
+
+fn strip_search_session_prefix(message: &str) -> String {
+    let mut normalized = message.trim().to_string();
+    for prefix in [
+        "cerca nelle sessioni",
+        "cerca nella memoria",
+        "search session memory",
+        "search sessions",
+    ] {
+        if normalized.to_lowercase().starts_with(prefix) {
+            normalized = normalized[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+    if normalized.is_empty() {
+        message.trim().to_string()
+    } else {
+        normalized
+    }
+}
+
+fn meeting_status_label(status: &MeetingStatus) -> String {
+    match status {
+        MeetingStatus::Failed(reason) => format!("failed:{reason}"),
+        MeetingStatus::Error(reason) => format!("error:{reason}"),
+        other => format!("{other:?}").to_ascii_lowercase(),
+    }
 }
 
 async fn start_grounded_response(
@@ -3594,6 +4404,62 @@ mod tests {
 
         assert!(options.speech_enabled);
         assert_eq!(options.tts_skip_reason, None);
+    }
+
+    #[test]
+    fn typed_chat_work_session_command_remains_text_only() {
+        let request = ChatStartRequest {
+            message: "Avvia una sessione di lavoro".to_string(),
+            input_modality: AssistantInputModality::Typed,
+            audio_response: AssistantAudioResponsePolicy::Auto,
+        };
+        let options = AssistantResponseOptions::from_chat_request(&request);
+
+        assert!(!options.speech_enabled);
+        assert_eq!(options.tts_skip_reason, Some("typed_input"));
+    }
+
+    #[test]
+    fn voice_chat_work_session_command_preserves_voice_policy() {
+        let request = ChatStartRequest {
+            message: "Avvia una sessione di lavoro".to_string(),
+            input_modality: AssistantInputModality::Voice,
+            audio_response: AssistantAudioResponsePolicy::Auto,
+        };
+        let options = AssistantResponseOptions::from_chat_request(&request);
+
+        assert!(options.speech_enabled);
+        assert_eq!(options.tts_skip_reason, None);
+    }
+
+    #[test]
+    fn work_session_chat_route_diagnostic_is_metadata_only() {
+        let diagnostic = work_session_chat_route_diagnostic(
+            "Cosa avevamo deciso sullo STT drain?",
+            WorkSessionChatIntent::RecallSessionMemory,
+            0.86,
+        );
+
+        assert_eq!(
+            diagnostic.tool_name.as_deref(),
+            Some("meeting.recall.answer")
+        );
+        assert!(diagnostic.audit_expected);
+        let params = diagnostic.extracted_params.expect("route params");
+        assert_eq!(params["metadata_only"], true);
+        assert_eq!(params["transcript_text_included"], false);
+        assert_eq!(params["screen_pixels_included"], false);
+    }
+
+    #[test]
+    fn chat_work_session_default_config_uses_governed_real_capture_sources() {
+        let config = default_chat_work_session_config();
+
+        assert_eq!(config.session_mode, MeetingSessionMode::RealCapture);
+        assert!(config.capture_options.system_audio);
+        assert!(config.capture_options.microphone);
+        assert!(config.capture_options.segment_transcription);
+        assert!(meeting_segment_transcription_requested(&config));
     }
 
     #[test]

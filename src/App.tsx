@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { gsap } from "gsap";
 import "./App.css";
 import { AssistantChat } from "./components/AssistantChat";
 import { AssistantHeader } from "./components/AssistantHeader";
 import { AssistantInputBar } from "./components/AssistantInputBar";
-import { DesktopAgentPanel } from "./components/DesktopAgentPanel";
+import { DesktopAgentPanel, type DesktopAgentPanelViewKey } from "./components/DesktopAgentPanel";
+import { WorkSessionStatusStrip } from "./components/WorkSessionStatusStrip";
 import AstraOrb from "./components/AstraOrb";
 import { useAssistantSession } from "./hooks/useAssistantSession";
 import { useAssistantVisualState } from "./hooks/useAssistantVisualState";
@@ -18,6 +20,8 @@ type IntroPhase = "logo" | "splitText" | "main";
 function App() {
     const session = useAssistantSession();
     const [isDesktopPanelOpen, setIsDesktopPanelOpen] = useState(false);
+    const [desktopPanelInitialView, setDesktopPanelInitialView] =
+        useState<DesktopAgentPanelViewKey>("overview");
 
     const [introPhase, setIntroPhase] = useState<IntroPhase>("logo");
     const [splitTextDone, setSplitTextDone] = useState(false);
@@ -35,6 +39,11 @@ function App() {
     const inputWrapRef = useRef<HTMLDivElement | null>(null);
 
     const revealTimeoutRef = useRef<number | null>(null);
+
+    const openDesktopPanel = (view: DesktopAgentPanelViewKey = "overview") => {
+        setDesktopPanelInitialView(view);
+        setIsDesktopPanelOpen(true);
+    };
 
     useEffect(() => {
         if (headerWrapRef.current) {
@@ -155,6 +164,24 @@ function App() {
         };
     }, [introPhase, splitTextDone]);
 
+    useEffect(() => {
+        let cancelled = false;
+        let unlisten: (() => void) | null = null;
+
+        const subscribe = async () => {
+            unlisten = await listen("work-session-open-details-requested", () => {
+                if (!cancelled) openDesktopPanel("meeting");
+            });
+        };
+
+        void subscribe();
+
+        return () => {
+            cancelled = true;
+            if (unlisten) unlisten();
+        };
+    }, []);
+
     return (
         <main className="overlay-shell">
             <section
@@ -174,7 +201,10 @@ function App() {
                         isDesktopPanelOpen={isDesktopPanelOpen}
                         onClose={windowControls.close}
                         onMinimize={windowControls.minimize}
-                        onToggleDesktopPanel={() => setIsDesktopPanelOpen((current) => !current)}
+                        onToggleDesktopPanel={() => {
+                            setDesktopPanelInitialView("overview");
+                            setIsDesktopPanelOpen((current) => !current);
+                        }}
                         onTogglePin={windowControls.togglePin}
                         startDrag={windowControls.startDrag}
                         statusLabel={statusLabel}
@@ -253,6 +283,7 @@ function App() {
                 </div>
 
                 <div ref={chatWrapRef} className="h-full chat-area overflow-auto" style={{ flex: 1, minHeight: 0 }}>
+                    <WorkSessionStatusStrip onOpenDetails={() => openDesktopPanel("meeting")} />
                     <AssistantChat messages={session.messages} chatRef={chatWrapRef} />
                 </div>
 
@@ -271,6 +302,7 @@ function App() {
                 </div>
 
                 <DesktopAgentPanel
+                    initialView={desktopPanelInitialView}
                     isOpen={isDesktopPanelOpen}
                     onClose={() => setIsDesktopPanelOpen(false)}
                 />

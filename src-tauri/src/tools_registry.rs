@@ -617,4 +617,20 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn meeting_screen_context_attach_uses_observe_without_desktop_control() {
+        let registry = ToolsRegistry::new();
+        let attach_screen = registry
+            .get("meeting.screen_context.attach_current")
+            .expect("screen context attach");
+
+        assert!(attach_screen.available);
+        assert!(attach_screen
+            .required_permissions
+            .contains(&Permission::DesktopObserve));
+        assert!(!attach_screen
+            .required_permissions
+            .contains(&Permission::DesktopControl));
+    }
 }

@@ -25,13 +25,14 @@ import { VscTools } from "react-icons/vsc";
 type DesktopAgentPanelProps = {
     isOpen: boolean;
     onClose: () => void;
+    initialView?: DesktopAgentPanelViewKey;
 };
 
-type ViewKey = "overview" | "approvals" | "audit" | "screen" | "meeting";
+export type DesktopAgentPanelViewKey = "overview" | "approvals" | "audit" | "screen" | "meeting";
 
-export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
+export function DesktopAgentPanel({ isOpen, onClose, initialView = "overview" }: DesktopAgentPanelProps) {
     const agent = useDesktopAgent();
-    const [view, setView] = useState<ViewKey>("overview");
+    const [view, setView] = useState<DesktopAgentPanelViewKey>(initialView);
     const [tools, setTools] = useState<ToolDescriptor[]>([]);
     const [policy, setPolicy] = useState<DesktopPolicySnapshot | null>(null);
     const [capabilities, setCapabilities] = useState<CapabilityManifest | null>(null);
@@ -72,12 +73,13 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
 
     useEffect(() => {
         if (!isOpen) return;
+        setView(initialView);
         void refresh();
         const timer = window.setInterval(() => {
             void refresh();
         }, 4000);
         return () => window.clearInterval(timer);
-    }, [isOpen, refresh]);
+    }, [initialView, isOpen, refresh]);
 
     const approvalCountLabel = useMemo(() => {
         if (approvals.length === 0) return "No pending approvals";
@@ -203,7 +205,7 @@ export function DesktopAgentPanel({ isOpen, onClose }: DesktopAgentPanelProps) {
             </div>
 
             <div className="desktop-agent-tabs">
-                {(["overview", "screen", "meeting", "approvals", "audit"] as ViewKey[]).map((key) => (
+                {(["overview", "screen", "meeting", "approvals", "audit"] as DesktopAgentPanelViewKey[]).map((key) => (
                     <button
                         key={key}
                         className={`desktop-agent-tab ${view === key ? "active" : ""}`}

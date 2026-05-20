@@ -1,7 +1,39 @@
 {
   "schema_version": 2,
-  "updated_at": "2026-05-19T19:24:26.257586600Z",
+  "updated_at": "2026-05-20T08:07:17.304387300Z",
   "sessions": [
+    {
+      "session_id": "40e127cc-5822-4ec2-98ea-dbd5de4d7eac",
+      "title": "Speaking: Speaker 1",
+      "platform": "teams",
+      "session_mode": "real_capture",
+      "started_at": "2026-05-20T08:04:24.426964800Z",
+      "ended_at": "2026-05-20T08:07:17.296502Z",
+      "duration_ms": 172869,
+      "transcript_count": 6,
+      "intelligence_present": false,
+      "summary_preview": "Speaking: Speaker 1",
+      "action_item_count": 0,
+      "decision_count": 1,
+      "open_question_count": 0,
+      "risk_count": 0,
+      "technical_recap_present": false,
+      "speakers_preview": [
+        "You",
+        "Speaker 1",
+        "Manual",
+        "Imported",
+        "Unknown"
+      ],
+      "capture_sources": [
+        "system_audio"
+      ],
+      "stt_completeness_status": "incomplete_drain_timeout",
+      "stt_completeness_detail": "incomplete_drain_timeout; system incomplete_drain_timeout (6/7 transcribed, 0 queued, 1 in-flight, 0 failed, 1 timeout); microphone complete_no_speech (0/0 transcribed, 0 queued, 0 in-flight, 0 failed, 0 timeout)",
+      "screen_context_count": 1,
+      "drain_status": "timed_out",
+      "last_updated_at": "2026-05-20T08:07:17.296088200Z"
+    },
     {
       "session_id": "f2c3f4a7-8f67-4df8-9e65-720987c1ecb9",
       "title": "Speaking: Speaker 1",
