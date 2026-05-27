@@ -3,10 +3,13 @@ import { listen } from "@tauri-apps/api/event";
 import type {
     AssistantErrorEvent,
     AssistantInterruptedEvent,
+    AssistantOrchestratorDiagnostic,
     AssistantRequestFinishedEvent,
     AssistantRequestSettledEvent,
     AssistantRequestStartedEvent,
+    AssistantRouterDiagnostic,
     AssistantStatus,
+    AssistantToolSynthesisDiagnostic,
     RequestMetricsSnapshot,
     SpeechSegmentQueuedEvent,
     StreamChunkEvent,
@@ -37,6 +40,9 @@ type UseAssistantEventsParams = {
     onVoiceSessionTranscript: (event: VoiceSessionTranscriptEvent) => void;
     onVoiceTurnMetrics: (metrics: VoiceTurnMetricsSnapshot) => void;
     onRouteDiagnostic?: (diagnostic: ConversationRouteDiagnostic) => void;
+    onOrchestratorDiagnostic?: (diagnostic: AssistantOrchestratorDiagnostic) => void;
+    onRouterDiagnostic?: (diagnostic: AssistantRouterDiagnostic) => void;
+    onToolSynthesisDiagnostic?: (diagnostic: AssistantToolSynthesisDiagnostic) => void;
 };
 
 export function useAssistantEvents({
@@ -56,6 +62,9 @@ export function useAssistantEvents({
     onVoiceSessionTranscript,
     onVoiceTurnMetrics,
     onRouteDiagnostic,
+    onOrchestratorDiagnostic,
+    onRouterDiagnostic,
+    onToolSynthesisDiagnostic,
 }: UseAssistantEventsParams) {
     useEffect(() => {
         let cleanupFns: Array<() => void> = [];
@@ -153,6 +162,24 @@ export function useAssistantEvents({
                         if (!disposed) onRouteDiagnostic?.(event.payload);
                     }
                 );
+                const unlistenOrchestratorDiagnostic = await listen<AssistantOrchestratorDiagnostic>(
+                    "assistant-orchestrator-diagnostic",
+                    (event) => {
+                        if (!disposed) onOrchestratorDiagnostic?.(event.payload);
+                    }
+                );
+                const unlistenRouterDiagnostic = await listen<AssistantRouterDiagnostic>(
+                    "assistant-router-diagnostic",
+                    (event) => {
+                        if (!disposed) onRouterDiagnostic?.(event.payload);
+                    }
+                );
+                const unlistenToolSynthesisDiagnostic = await listen<AssistantToolSynthesisDiagnostic>(
+                    "assistant-tool-synthesis-diagnostic",
+                    (event) => {
+                        if (!disposed) onToolSynthesisDiagnostic?.(event.payload);
+                    }
+                );
 
                 cleanupFns = [
                     unlistenRequestStarted,
@@ -171,6 +198,9 @@ export function useAssistantEvents({
                     unlistenVoiceTranscript,
                     unlistenVoiceMetrics,
                     unlistenRouteDiagnostic,
+                    unlistenOrchestratorDiagnostic,
+                    unlistenRouterDiagnostic,
+                    unlistenToolSynthesisDiagnostic,
                 ];
             } catch (error) {
                 console.error("Listener registration failed:", error);
@@ -198,5 +228,8 @@ export function useAssistantEvents({
         onVoiceSessionTranscript,
         onVoiceTurnMetrics,
         onRouteDiagnostic,
+        onOrchestratorDiagnostic,
+        onRouterDiagnostic,
+        onToolSynthesisDiagnostic,
     ]);
 }

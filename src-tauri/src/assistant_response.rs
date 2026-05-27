@@ -245,7 +245,8 @@ pub fn fallback_display_for_empty_response(original_message: &str) -> String {
         };
     }
 
-    "Non ho ricevuto una risposta testuale dal modello. Riprova o cambia modello.".into()
+    "Il modello non ha prodotto una risposta testuale per la chat normale. Riprova o cambia modello."
+        .into()
 }
 
 fn render_executed_action(response: &DesktopActionResponse, italian: bool) -> String {
@@ -1095,5 +1096,13 @@ Ho letto il file."#;
         let fallback = fallback_display_for_empty_response("astra, mi fai un esempio di tabella?");
         assert!(fallback.contains("| Prodotto | Quantita | Prezzo |"));
         assert!(!fallback.contains("classifier_source"));
+    }
+
+    #[test]
+    fn normal_chat_empty_fallback_is_distinct_from_router_failure() {
+        let fallback = fallback_display_for_empty_response("chi sei?");
+        assert!(fallback.contains("chat normale"));
+        assert!(!fallback.contains("routing tool-aware"));
+        assert!(!fallback.starts_with("Non ho ricevuto"));
     }
 }

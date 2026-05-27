@@ -1,0 +1,25 @@
+{
+  "capture_active": true,
+  "capture_backend_status": "capture active sources: system_audio:Capturing:segments_written=0; segment_file_stt=enabled",
+  "config": {
+    "capture_backend": "wasapi",
+    "capture_options": {
+      "microphone": true,
+      "segment_transcription": true,
+      "system_audio": true
+    },
+    "diarization_enabled": false,
+    "live_transcription_enabled": true,
+    "platform": "teams",
+    "privacy_mode": "default",
+    "sample_rate": 16000,
+    "session_mode": "real_capture",
+    "transcription_model": "local"
+  },
+  "participants": [],
+  "platform": "teams",
+  "session_id": "4eb42b1a-a3a1-4082-9e2e-c89a8581c2fc",
+  "session_mode": "real_capture",
+  "started_at": "2026-05-25T18:58:12.014602200+00:00",
+  "status": "Starting"
+}

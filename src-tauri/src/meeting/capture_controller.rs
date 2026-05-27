@@ -219,6 +219,12 @@ impl CaptureController {
 
     pub fn stop(&mut self) -> Result<CaptureHealth, MeetingRuntimeError> {
         let Some(mut handle) = self.active_handle.take() else {
+            if matches!(
+                self.state,
+                CaptureControllerState::Failed | CaptureControllerState::Unsupported
+            ) {
+                return Ok(self.health_snapshot());
+            }
             self.state = CaptureControllerState::Idle;
             return Ok(self.refresh_health(CaptureHealthStatus::Idle, None));
         };
@@ -258,6 +264,17 @@ impl CaptureController {
 
     pub fn abort_capture(&mut self, reason: String) -> Result<CaptureHealth, MeetingRuntimeError> {
         self.abort(reason)
+    }
+
+    pub fn quarantine_after_poison(&mut self, component: &str) -> CaptureHealth {
+        let mut reason = format!("{component}_poisoned");
+        if let Some(mut handle) = self.active_handle.take() {
+            if let Err(error) = handle.stop() {
+                reason = format!("{reason}; poison recovery stop failed: {error}");
+            }
+        }
+        self.state = CaptureControllerState::Failed;
+        self.refresh_health(CaptureHealthStatus::Failed, Some(reason))
     }
 
     pub fn record_segment_written(&mut self, byte_length: u64, duration_ms: u64) -> CaptureHealth {
@@ -637,12 +654,21 @@ impl AudioCaptureHandle {
 }
 
 fn meeting_stt_drain_timeout() -> Duration {
-    let seconds = std::env::var("ASTRA_MEETING_STT_DRAIN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(60)
-        .clamp(1, 300);
+    let foreground = std::env::var("ASTRA_MEETING_STT_FOREGROUND_DRAIN_TIMEOUT_SECS").ok();
+    let legacy = std::env::var("ASTRA_MEETING_STT_DRAIN_TIMEOUT_SECS").ok();
+    let seconds = meeting_stt_drain_timeout_secs_from_env(foreground.as_deref(), legacy.as_deref());
     Duration::from_secs(seconds)
+}
+
+fn meeting_stt_drain_timeout_secs_from_env(
+    foreground_override: Option<&str>,
+    legacy_override: Option<&str>,
+) -> u64 {
+    foreground_override
+        .or(legacy_override)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(5)
+        .clamp(1, 300)
 }
 
 fn default_channels_for_backend(
@@ -683,6 +709,31 @@ mod tests {
         assert_eq!(health.state, CaptureControllerState::Idle);
         assert_eq!(health.status, CaptureHealthStatus::Idle);
         assert!(!health.active_handle_present);
+    }
+
+    #[test]
+    fn meeting_stt_drain_timeout_default_is_foreground_safe() {
+        assert_eq!(meeting_stt_drain_timeout_secs_from_env(None, None), 5);
+    }
+
+    #[test]
+    fn meeting_stt_drain_timeout_honors_foreground_override_first() {
+        assert_eq!(
+            meeting_stt_drain_timeout_secs_from_env(Some("4"), Some("60")),
+            4
+        );
+        assert_eq!(
+            meeting_stt_drain_timeout_secs_from_env(Some("999"), Some("60")),
+            300
+        );
+    }
+
+    #[test]
+    fn meeting_stt_drain_timeout_honors_legacy_override() {
+        assert_eq!(
+            meeting_stt_drain_timeout_secs_from_env(None, Some("12")),
+            12
+        );
     }
 
     #[test]

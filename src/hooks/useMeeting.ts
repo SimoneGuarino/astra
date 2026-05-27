@@ -149,6 +149,16 @@ export function useMeeting() {
         []
     );
 
+    const recoverFailedCapture = useCallback(
+        () => invoke<MeetingSessionState>("recover_failed_meeting_capture"),
+        []
+    );
+
+    const forceFinalizeFailedCapture = useCallback(
+        () => invoke<ExportedMeeting>("force_finalize_failed_meeting_capture"),
+        []
+    );
+
     const listSessions = useCallback(
         (request: MeetingSessionListRequest = {}) =>
             invoke<MeetingSessionListResponse>("list_meeting_sessions", { request }),
@@ -274,6 +284,7 @@ export function useMeeting() {
             readDiagnostics,
             readIntelligence,
             readNotes,
+            recoverFailedCapture,
             readSummary,
             readSessionArchive,
             reindexSessions,
@@ -283,6 +294,7 @@ export function useMeeting() {
             searchSessions,
             startSession,
             stopSession,
+            forceFinalizeFailedCapture,
             transcribeAudioFile,
         }),
         [
@@ -314,6 +326,7 @@ export function useMeeting() {
             readDiagnostics,
             readIntelligence,
             readNotes,
+            recoverFailedCapture,
             readSummary,
             readSessionArchive,
             reindexSessions,
@@ -323,6 +336,7 @@ export function useMeeting() {
             searchSessions,
             startSession,
             stopSession,
+            forceFinalizeFailedCapture,
             transcribeAudioFile,
         ]
     );

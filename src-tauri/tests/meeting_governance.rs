@@ -1208,6 +1208,110 @@ fn consent_revoke_stops_active_capture_immediately() {
     ));
 }
 
+#[test]
+fn poisoned_capture_controller_does_not_break_live_capabilities() {
+    let (runtime, _root) =
+        runtime_with_fake_transcriber("meeting_poison_live_capabilities", "unused");
+    start_manual_session(&runtime);
+    runtime
+        .install_fake_active_capture_for_test(true, Duration::from_millis(25))
+        .expect("fake active capture");
+
+    runtime.poison_system_capture_for_test();
+
+    let health = runtime.capture_health().expect("poison recovered health");
+    assert_eq!(health.state, CaptureControllerState::Failed);
+    assert!(!health.active_handle_present);
+    assert!(health
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.contains("poison")));
+
+    let capabilities = runtime
+        .live_capabilities()
+        .expect("capabilities survive poison");
+    assert_eq!(
+        capabilities.system_capture_health.state,
+        CaptureControllerState::Failed
+    );
+    let diagnostics = runtime.read_diagnostics().expect("diagnostics");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "system_audio_capture_controller_poisoned"));
+}
+
+#[test]
+fn stop_session_with_poisoned_controller_finalizes_instead_of_bricking() {
+    let (runtime, _root) = runtime_with_fake_transcriber("meeting_poison_stop_finalizes", "unused");
+    start_manual_session(&runtime);
+    runtime
+        .install_fake_active_capture_for_test(true, Duration::from_millis(25))
+        .expect("fake active capture");
+    runtime.poison_system_capture_for_test();
+
+    let exported = runtime
+        .stop_session()
+        .expect("poisoned capture stop is degraded but finalizes");
+
+    assert!(!exported.session_id.is_empty());
+    assert!(runtime
+        .get_active_session()
+        .expect("active session read")
+        .is_none());
+    assert!(runtime
+        .get_last_completed_state()
+        .expect("last completed")
+        .is_some());
+}
+
+#[test]
+fn stale_capture_stop_failed_state_reconciles_to_recoverable() {
+    let (runtime, _root) =
+        runtime_with_fake_transcriber("meeting_reconcile_capture_failed", "unused");
+    start_manual_session(&runtime);
+    runtime
+        .mark_active_capture_stop_failed_for_test()
+        .expect("mark failed");
+
+    let state = runtime.get_active_state().expect("reconciled active state");
+
+    assert!(matches!(
+        state.status,
+        MeetingStatus::Failed(ref reason) if reason == "capture_failed_recoverable"
+    ));
+    assert!(!state.session.capture_active);
+    assert!(state
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "session_reconciled_from_active_failed"));
+}
+
+#[test]
+fn force_finalize_failed_capture_preserves_existing_archives() {
+    let (runtime, root) =
+        runtime_with_fake_transcriber("meeting_force_finalize_preserves_archives", "unused");
+    let archived_dir = root
+        .join(".astra")
+        .join("meetings")
+        .join("existing_archive");
+    std::fs::create_dir_all(&archived_dir).expect("archive dir");
+    std::fs::write(archived_dir.join("session.json"), "{}").expect("archive file");
+    start_manual_session(&runtime);
+    runtime
+        .mark_active_capture_stop_failed_for_test()
+        .expect("mark failed");
+
+    runtime
+        .force_finalize_failed_capture_session()
+        .expect("force finalize");
+
+    assert!(archived_dir.join("session.json").exists());
+    assert!(runtime
+        .get_active_session()
+        .expect("active session read")
+        .is_none());
+}
+
 #[tokio::test]
 async fn consent_revoke_prevents_late_segment_transcription() {
     let started = Arc::new(tokio::sync::Notify::new());

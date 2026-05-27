@@ -21,21 +21,21 @@ use super::{
     stt_adapter::{ExistingSttClientMeetingAdapter, MeetingFileTranscriber},
     types::{
         derive_meeting_stt_completeness, normalize_meeting_app_name, ActionItem, CallInfo,
-        CaptureBackend, CaptureControllerState, CaptureHealth, ClearMeetingDataRequest,
-        ConsentState, DecisionLogEntry, ExportedMeeting, MeetingAudioFileTranscriptionRequest,
-        MeetingAudioFileTranscriptionResult, MeetingCapabilityReadiness, MeetingCapabilityState,
-        MeetingConfig, MeetingDataClearPreview, MeetingDataClearResult,
-        MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult, MeetingLanguage,
-        MeetingLanguageSource, MeetingLiveCapabilitySnapshot, MeetingRecallDiagnostics,
-        MeetingRecallEvidence, MeetingRecallEvidenceRelation, MeetingRecallIntent,
-        MeetingRecallRequest, MeetingRecallResponse, MeetingRecallStatus, MeetingScreenContext,
-        MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
-        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
-        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
-        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
-        MeetingSessionType, MeetingSessionTypeSource, MeetingStatus, RenameSpeakerRequest,
-        RenameSpeakerResult, SpeakerAttributionMethod, TranscriptEntry, TranscriptSource,
-        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        CaptureBackend, CaptureControllerState, CaptureHealth, CaptureHealthStatus,
+        CaptureSummaryStatus, ClearMeetingDataRequest, ConsentState, DecisionLogEntry,
+        ExportedMeeting, MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
+        MeetingCapabilityReadiness, MeetingCapabilityState, MeetingConfig, MeetingDataClearPreview,
+        MeetingDataClearResult, MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
+        MeetingLanguage, MeetingLanguageSource, MeetingLiveCapabilitySnapshot,
+        MeetingRecallDiagnostics, MeetingRecallEvidence, MeetingRecallEvidenceRelation,
+        MeetingRecallIntent, MeetingRecallRequest, MeetingRecallResponse, MeetingRecallStatus,
+        MeetingScreenContext, MeetingScreenContextAttachResponse, MeetingSession,
+        MeetingSessionExportRequest, MeetingSessionExportResponse, MeetingSessionListRequest,
+        MeetingSessionListResponse, MeetingSessionMode, MeetingSessionReadRequest,
+        MeetingSessionReadResponse, MeetingSessionSearchRequest, MeetingSessionSearchResponse,
+        MeetingSessionState, MeetingSessionType, MeetingSessionTypeSource, MeetingStatus,
+        RenameSpeakerRequest, RenameSpeakerResult, SpeakerAttributionMethod, TranscriptEntry,
+        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
 };
 use crate::stt_client::SttClient;
@@ -44,7 +44,7 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -661,11 +661,13 @@ impl MeetingRuntime {
     }
 
     pub fn get_active_session(&self) -> Result<Option<MeetingSession>, MeetingRuntimeError> {
+        self.reconcile_active_capture_state()?;
         let registry = self.lock_registry()?;
         Ok(registry.get_active_session().cloned())
     }
 
     pub fn get_active_state(&self) -> Result<MeetingSessionState, MeetingRuntimeError> {
+        self.reconcile_active_capture_state()?;
         let registry = self.lock_registry()?;
         Ok(registry.get_active_state().clone())
     }
@@ -843,27 +845,52 @@ impl MeetingRuntime {
     }
 
     pub fn stop_session(&self) -> Result<ExportedMeeting, MeetingRuntimeError> {
+        self.reconcile_active_capture_state()?;
         {
             let mut registry = self.lock_registry()?;
             if registry.get_active_session().is_some() {
                 let _ = registry.transition_to(MeetingStatus::Stopping);
             }
         }
-        let stop_result = self.stop_all_captures();
-        if let Err(error) = stop_result {
+        let stop_outcome = self.stop_all_captures_best_effort()?;
+        if !stop_outcome.error_kinds.is_empty()
+            || stop_outcome.poison_recovered
+            || stop_outcome.idempotent_no_handle
+        {
             let mut registry = self.lock_registry()?;
             if registry.get_active_session().is_some() {
-                let _ = registry.update_capture_status(
-                    false,
-                    Some("capture stop failed: redacted_failure".to_string()),
-                );
-                let _ = registry
-                    .transition_to(MeetingStatus::Failed("capture_stop_failed".to_string()));
+                if stop_outcome.idempotent_no_handle {
+                    registry.add_diagnostic(
+                        "capture_stop_idempotent_no_handle".to_string(),
+                        super::types::MeetingDiagnosticSeverity::Info,
+                        "Stop requested with no active capture handle; session finalization continued".to_string(),
+                    )?;
+                }
+                for error_kind in &stop_outcome.error_kinds {
+                    registry.add_diagnostic(
+                        "capture_stop_degraded".to_string(),
+                        super::types::MeetingDiagnosticSeverity::Warning,
+                        format!("Capture stop was degraded but session finalization continued: {error_kind}"),
+                    )?;
+                }
+                if stop_outcome.poison_recovered {
+                    registry.add_diagnostic(
+                        "capture_stop_poison_recovered".to_string(),
+                        super::types::MeetingDiagnosticSeverity::Warning,
+                        "Capture controller poison was quarantined during stop; session finalization continued".to_string(),
+                    )?;
+                }
+                let status_message =
+                    if stop_outcome.error_kinds.is_empty() && !stop_outcome.poison_recovered {
+                        "capture stopped: no active handle".to_string()
+                    } else {
+                        "capture stopped with recoverable diagnostics".to_string()
+                    };
+                registry.update_capture_status(false, Some(status_message))?;
             }
-            return Err(error);
         }
-        let system_capture_health = self.capture_health()?;
-        let microphone_capture_health = self.microphone_capture_health()?;
+        let system_capture_health = stop_outcome.system_health.clone();
+        let microphone_capture_health = stop_outcome.microphone_health.clone();
         self.record_segment_stt_stop_diagnostics(
             &system_capture_health,
             &microphone_capture_health,
@@ -899,6 +926,21 @@ impl MeetingRuntime {
             &microphone_capture_health,
         )?;
         Ok(exported)
+    }
+
+    pub fn recover_failed_capture_session(
+        &self,
+    ) -> Result<MeetingSessionState, MeetingRuntimeError> {
+        self.quarantine_all_captures_for_recovery("manual_recover_failed_capture")?;
+        self.reconcile_active_capture_state()?;
+        self.get_active_state()
+    }
+
+    pub fn force_finalize_failed_capture_session(
+        &self,
+    ) -> Result<ExportedMeeting, MeetingRuntimeError> {
+        self.quarantine_all_captures_for_recovery("force_finalize_failed_capture")?;
+        self.stop_session()
     }
 
     pub fn list_archived_sessions(
@@ -1175,12 +1217,15 @@ impl MeetingRuntime {
     }
 
     pub fn live_capabilities(&self) -> Result<MeetingLiveCapabilitySnapshot, MeetingRuntimeError> {
+        self.reconcile_active_capture_state()?;
         let system_capture_health = self.capture_health()?;
         let microphone_capture_health = self.microphone_capture_health()?;
         let capture_health = aggregate_capture_health(
             system_capture_health.clone(),
             microphone_capture_health.clone(),
         );
+        let capture_summary =
+            capture_summary_from_sources(&system_capture_health, &microphone_capture_health);
         let stt_status = self.stt_adapter.status();
         let wasapi_available = wasapi_backend_available();
         let live_segment_transcription_ready =
@@ -1289,9 +1334,9 @@ impl MeetingRuntime {
             ),
             live_summarization: readiness(
                 "meeting.summarization.live",
-                true,
-                MeetingCapabilityState::Ready,
-                Some("Rule-based transcript-derived notes, decisions, action items, and rolling summaries are active; no model-only summaries are fabricated".to_string()),
+                false,
+                MeetingCapabilityState::Unavailable,
+                Some("No governed MeetingRuntime live-summary adapter is connected; summaries are generated after transcript evidence is available".to_string()),
             ),
             follow_up: readiness(
                 "meeting.followup.send",
@@ -1300,6 +1345,10 @@ impl MeetingRuntime {
                 Some("Follow-up sending remains disabled until draft-first outbound integrations are governed".to_string()),
             ),
             capture_health,
+            capture_summary_status: capture_summary.status,
+            capture_summary_reason: capture_summary.reason,
+            active_sources: capture_summary.active_sources,
+            failed_sources: capture_summary.failed_sources,
             stt_adapter: stt_status,
         })
     }
@@ -1333,10 +1382,7 @@ impl MeetingRuntime {
                             "{}_segment_transcription_failure_threshold",
                             source.as_str()
                         ));
-                        Some(format!(
-                            "{}_segment_transcription_failure_threshold",
-                            source.as_str()
-                        ))
+                        Some("segment_transcription_failure_threshold".to_string())
                     } else {
                         None
                     }
@@ -1376,6 +1422,132 @@ impl MeetingRuntime {
             let _ =
                 registry.update_capture_status(false, Some(format!("capture failed: {reason}")));
             let _ = registry.transition_to(MeetingStatus::Failed(reason.to_string()));
+        }
+        Ok(())
+    }
+
+    fn record_capture_controller_poison_recovered(
+        &self,
+        source: TranscriptSource,
+        component: &str,
+        health: &CaptureHealth,
+    ) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        if registry.get_active_session().is_none() {
+            return Ok(());
+        }
+        let poisoned_code = format!("{}_capture_controller_poisoned", source.as_str());
+        let recovered_code = format!("{}_capture_controller_recovered", source.as_str());
+        let existing_codes = registry
+            .get_active_state()
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.clone())
+            .collect::<Vec<_>>();
+        if !existing_codes.iter().any(|code| code == &poisoned_code) {
+            registry.add_diagnostic(
+                poisoned_code,
+                super::types::MeetingDiagnosticSeverity::Error,
+                format!("{component} entered an inconsistent state and was quarantined"),
+            )?;
+        }
+        if !existing_codes.iter().any(|code| code == &recovered_code) {
+            registry.add_diagnostic(
+                recovered_code,
+                super::types::MeetingDiagnosticSeverity::Warning,
+                format!(
+                    "{} capture controller recovered as failed; active_handle_present={}",
+                    source.as_str(),
+                    health.active_handle_present
+                ),
+            )?;
+        }
+        registry.update_capture_status(
+            false,
+            Some("capture failed/recoverable: capture controller quarantined".to_string()),
+        )?;
+        let _ = registry.transition_to(MeetingStatus::Failed(
+            "capture_failed_recoverable".to_string(),
+        ));
+        Ok(())
+    }
+
+    fn reconcile_active_capture_state(&self) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        let Some(session) = registry.get_active_session().cloned() else {
+            return Ok(());
+        };
+        if session.capture_active {
+            return Ok(());
+        }
+        let reason = match &registry.get_active_state().status {
+            MeetingStatus::Failed(reason) => reason.clone(),
+            _ => return Ok(()),
+        };
+        if reason == "capture_failed_recoverable" {
+            return Ok(());
+        }
+        if !matches!(
+            reason.as_str(),
+            "capture_stop_failed"
+                | "capture_stream_error"
+                | "capture_controller_poisoned"
+                | "microphone_capture_controller_poisoned"
+        ) {
+            return Ok(());
+        }
+
+        let already_recorded = registry
+            .get_active_state()
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "session_reconciled_from_active_failed");
+        if !already_recorded {
+            registry.add_diagnostic(
+                "session_reconciled_from_active_failed".to_string(),
+                super::types::MeetingDiagnosticSeverity::Warning,
+                "Active real-capture session had failed capture with no active handle; marked recoverable for stop/finalize".to_string(),
+            )?;
+        }
+        registry.update_capture_status(
+            false,
+            Some("capture failed/recoverable: stop or force finalize is available".to_string()),
+        )?;
+        let _ = registry.transition_to(MeetingStatus::Failed(
+            "capture_failed_recoverable".to_string(),
+        ));
+        Ok(())
+    }
+
+    fn quarantine_all_captures_for_recovery(
+        &self,
+        reason: &str,
+    ) -> Result<(), MeetingRuntimeError> {
+        let system_health = {
+            let mut capture = self.lock_capture()?;
+            capture.abort(reason.to_string())?
+        };
+        let microphone_health = {
+            let mut capture = self.lock_microphone_capture()?;
+            capture.abort(reason.to_string())?
+        };
+        let mut registry = self.lock_registry()?;
+        if registry.get_active_session().is_some() {
+            registry.add_diagnostic(
+                "capture_controller_reset".to_string(),
+                super::types::MeetingDiagnosticSeverity::Warning,
+                format!(
+                    "Capture controllers reset for recovery; system_handle={}; microphone_handle={}",
+                    system_health.active_handle_present, microphone_health.active_handle_present
+                ),
+            )?;
+            registry.update_capture_status(
+                false,
+                Some("capture failed/recoverable: controllers reset".to_string()),
+            )?;
+            let _ = registry.transition_to(MeetingStatus::Failed(
+                "capture_failed_recoverable".to_string(),
+            ));
         }
         Ok(())
     }
@@ -1436,21 +1608,39 @@ impl MeetingRuntime {
     }
 
     fn lock_capture(&self) -> Result<MutexGuard<'_, CaptureController>, MeetingRuntimeError> {
-        self.capture
-            .lock()
-            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
-                component: "capture_controller".to_string(),
-            })
+        match self.capture.lock() {
+            Ok(capture) => Ok(capture),
+            Err(poisoned) => {
+                let mut capture = poisoned.into_inner();
+                let health = capture.quarantine_after_poison("capture_controller");
+                self.capture.clear_poison();
+                self.record_capture_controller_poison_recovered(
+                    TranscriptSource::SystemAudio,
+                    "capture_controller",
+                    &health,
+                )?;
+                Ok(capture)
+            }
+        }
     }
 
     fn lock_microphone_capture(
         &self,
     ) -> Result<MutexGuard<'_, CaptureController>, MeetingRuntimeError> {
-        self.microphone_capture
-            .lock()
-            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
-                component: "microphone_capture_controller".to_string(),
-            })
+        match self.microphone_capture.lock() {
+            Ok(capture) => Ok(capture),
+            Err(poisoned) => {
+                let mut capture = poisoned.into_inner();
+                let health = capture.quarantine_after_poison("microphone_capture_controller");
+                self.microphone_capture.clear_poison();
+                self.record_capture_controller_poison_recovered(
+                    TranscriptSource::Microphone,
+                    "microphone_capture_controller",
+                    &health,
+                )?;
+                Ok(capture)
+            }
+        }
     }
 
     fn with_capture_mut_for_source<T>(
@@ -1534,6 +1724,71 @@ impl MeetingRuntime {
         system_result?;
         microphone_result?;
         Ok(())
+    }
+
+    fn stop_all_captures_best_effort(&self) -> Result<CaptureStopOutcome, MeetingRuntimeError> {
+        let (system_health, _system_attempted, system_no_handle, system_error) =
+            self.stop_capture_source_best_effort(TranscriptSource::SystemAudio)?;
+        let (microphone_health, _microphone_attempted, microphone_no_handle, microphone_error) =
+            self.stop_capture_source_best_effort(TranscriptSource::Microphone)?;
+        let error_kinds = [system_error, microphone_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let poison_recovered = error_kinds
+            .iter()
+            .any(|kind| kind == "mutex_poisoned" || kind.contains("poison"))
+            || [&system_health, &microphone_health].iter().any(|health| {
+                health
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("poison"))
+            });
+        Ok(CaptureStopOutcome {
+            system_health,
+            microphone_health,
+            idempotent_no_handle: system_no_handle || microphone_no_handle,
+            error_kinds,
+            poison_recovered,
+        })
+    }
+
+    fn stop_capture_source_best_effort(
+        &self,
+        source: TranscriptSource,
+    ) -> Result<(CaptureHealth, bool, bool, Option<String>), MeetingRuntimeError> {
+        self.with_capture_mut_for_source(source, |capture| {
+            let attempted = capture.has_active_handle()
+                || matches!(
+                    capture.state(),
+                    CaptureControllerState::Starting
+                        | CaptureControllerState::Capturing
+                        | CaptureControllerState::Paused
+                        | CaptureControllerState::Stopping
+                        | CaptureControllerState::Failed
+                );
+            let poison_recovered = capture
+                .health_snapshot()
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("poison"));
+            match capture.stop() {
+                Ok(health) => {
+                    let no_handle = !attempted && !health.active_handle_present;
+                    let error_kind = poison_recovered.then(|| "mutex_poisoned".to_string());
+                    (health, attempted, no_handle, error_kind)
+                }
+                Err(error) => {
+                    let error_kind = capture_stop_error_kind(&error).to_string();
+                    (
+                        capture.health_snapshot(),
+                        attempted,
+                        false,
+                        Some(error_kind),
+                    )
+                }
+            }
+        })
     }
 
     fn record_segment_stt_stop_diagnostics(
@@ -1768,6 +2023,37 @@ impl MeetingRuntime {
             )?;
         }
         Ok(health)
+    }
+
+    #[doc(hidden)]
+    pub fn poison_system_capture_for_test(&self) {
+        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let capture = self.capture.clone();
+        let _hook_guard = PANIC_HOOK_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("panic hook test lock");
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = capture.lock().expect("capture controller test lock");
+            panic!("poison capture controller for recovery test");
+        });
+        std::panic::set_hook(previous_hook);
+    }
+
+    #[doc(hidden)]
+    pub fn mark_active_capture_stop_failed_for_test(&self) -> Result<(), MeetingRuntimeError> {
+        let mut registry = self.lock_registry()?;
+        if registry.get_active_session().is_some() {
+            registry.update_capture_status(
+                false,
+                Some("capture stop failed: redacted_failure".to_string()),
+            )?;
+            let _ =
+                registry.transition_to(MeetingStatus::Failed("capture_stop_failed".to_string()));
+        }
+        Ok(())
     }
 }
 
@@ -2125,6 +2411,14 @@ struct CaptureStopForClearOutcome {
     error_kind: Option<String>,
 }
 
+struct CaptureStopOutcome {
+    system_health: CaptureHealth,
+    microphone_health: CaptureHealth,
+    idempotent_no_handle: bool,
+    error_kinds: Vec<String>,
+    poison_recovered: bool,
+}
+
 struct ManagedAudioTranscriptionInput<'a> {
     active_session: &'a MeetingSession,
     managed_path: PathBuf,
@@ -2183,7 +2477,12 @@ fn captured_segment_error_kind(error: &MeetingRuntimeError) -> String {
         MeetingRuntimeError::ConsentRequired { .. } => "consent_required".to_string(),
         MeetingRuntimeError::ConsentRevoked { .. } => "consent_revoked".to_string(),
         MeetingRuntimeError::TranscriptionUnavailable { reason } => {
-            classify_stt_failure_reason(reason).to_string()
+            let classified = classify_stt_failure_reason(reason);
+            if classified == "stt_unknown" {
+                "transcription_unavailable".to_string()
+            } else {
+                classified.to_string()
+            }
         }
         MeetingRuntimeError::SttUnavailable { .. } => "stt_worker_unavailable".to_string(),
         MeetingRuntimeError::TranscriptionInactive => "transcription_inactive".to_string(),
@@ -2498,11 +2797,9 @@ fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) ->
     aggregate.active_handle_present =
         system.active_handle_present || microphone.active_handle_present;
     aggregate.backpressure_active = system.backpressure_active || microphone.backpressure_active;
-    aggregate.state = if matches!(system.state, CaptureControllerState::Failed)
-        || matches!(microphone.state, CaptureControllerState::Failed)
-    {
-        CaptureControllerState::Failed
-    } else if matches!(system.state, CaptureControllerState::Capturing)
+    let any_failed = capture_source_failed(&system) || capture_source_failed(&microphone);
+    let any_active = capture_source_active(&system) || capture_source_active(&microphone);
+    aggregate.state = if matches!(system.state, CaptureControllerState::Capturing)
         || matches!(microphone.state, CaptureControllerState::Capturing)
     {
         CaptureControllerState::Capturing
@@ -2514,9 +2811,18 @@ fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) ->
         || matches!(microphone.state, CaptureControllerState::Starting)
     {
         CaptureControllerState::Starting
+    } else if any_failed {
+        CaptureControllerState::Failed
     } else {
-        system.state
+        system.state.clone()
     };
+    if any_active && any_failed {
+        aggregate.status = CaptureHealthStatus::Healthy;
+        aggregate.last_error = capture_summary_from_sources(&system, &microphone).reason;
+    } else if any_failed {
+        aggregate.status = CaptureHealthStatus::Failed;
+        aggregate.last_error = microphone.last_error.clone().or(system.last_error.clone());
+    }
     aggregate.metrics.segments_written = system
         .metrics
         .segments_written
@@ -2583,6 +2889,98 @@ fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) ->
         .clone()
         .or(system.metrics.last_segment_transcription_error_kind.clone());
     aggregate
+}
+
+#[derive(Debug, Clone)]
+struct CaptureSummary {
+    status: CaptureSummaryStatus,
+    reason: Option<String>,
+    active_sources: Vec<String>,
+    failed_sources: Vec<String>,
+}
+
+fn capture_source_active(health: &CaptureHealth) -> bool {
+    health.active_handle_present
+        || matches!(
+            health.state,
+            CaptureControllerState::Starting
+                | CaptureControllerState::Capturing
+                | CaptureControllerState::Paused
+                | CaptureControllerState::Stopping
+        )
+}
+
+fn capture_source_failed(health: &CaptureHealth) -> bool {
+    matches!(
+        health.state,
+        CaptureControllerState::Failed | CaptureControllerState::Unsupported
+    ) || matches!(
+        health.status,
+        CaptureHealthStatus::Failed
+            | CaptureHealthStatus::Unsupported
+            | CaptureHealthStatus::ConsentRevoked
+    )
+}
+
+fn capture_source_label(health: &CaptureHealth, fallback: &str) -> String {
+    match health.backend {
+        Some(CaptureBackend::Wasapi) if fallback == "system_audio" => "system_audio".to_string(),
+        Some(CaptureBackend::Wasapi) if fallback == "microphone" => "microphone".to_string(),
+        Some(backend) => format!("{backend:?}").to_ascii_lowercase(),
+        None => fallback.to_string(),
+    }
+}
+
+fn capture_summary_from_sources(
+    system: &CaptureHealth,
+    microphone: &CaptureHealth,
+) -> CaptureSummary {
+    let mut active_sources = Vec::new();
+    let mut failed_sources = Vec::new();
+    if capture_source_active(system) {
+        active_sources.push(capture_source_label(system, "system_audio"));
+    }
+    if capture_source_active(microphone) {
+        active_sources.push(capture_source_label(microphone, "microphone"));
+    }
+    if capture_source_failed(system) {
+        failed_sources.push(capture_source_label(system, "system_audio"));
+    }
+    if capture_source_failed(microphone) {
+        failed_sources.push(capture_source_label(microphone, "microphone"));
+    }
+
+    let status = if !active_sources.is_empty() && !failed_sources.is_empty() {
+        CaptureSummaryStatus::Degraded
+    } else if !active_sources.is_empty() {
+        CaptureSummaryStatus::Active
+    } else if !failed_sources.is_empty() {
+        CaptureSummaryStatus::Failed
+    } else {
+        CaptureSummaryStatus::Inactive
+    };
+    let reason = match status {
+        CaptureSummaryStatus::Degraded => Some(format!(
+            "Partial capture active. Active sources: {}; failed sources: {}.",
+            active_sources.join(", "),
+            failed_sources.join(", ")
+        )),
+        CaptureSummaryStatus::Failed => {
+            let error = microphone
+                .last_error
+                .as_deref()
+                .or(system.last_error.as_deref())
+                .unwrap_or("capture source failed");
+            Some(error.to_string())
+        }
+        _ => None,
+    };
+    CaptureSummary {
+        status,
+        reason,
+        active_sources,
+        failed_sources,
+    }
 }
 
 fn aggregate_drain_status(
@@ -2790,6 +3188,50 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[test]
+    fn aggregate_capture_health_degrades_when_one_source_is_active_and_one_failed() {
+        let system = CaptureHealth {
+            state: CaptureControllerState::Capturing,
+            status: CaptureHealthStatus::Healthy,
+            active_handle_present: true,
+            backend: Some(CaptureBackend::Wasapi),
+            ..CaptureHealth::default()
+        };
+        let microphone = CaptureHealth {
+            state: CaptureControllerState::Failed,
+            status: CaptureHealthStatus::Failed,
+            last_error: Some("microphone unavailable".to_string()),
+            ..CaptureHealth::default()
+        };
+
+        let aggregate = aggregate_capture_health(system.clone(), microphone.clone());
+        let summary = capture_summary_from_sources(&system, &microphone);
+
+        assert_eq!(aggregate.state, CaptureControllerState::Capturing);
+        assert_ne!(aggregate.status, CaptureHealthStatus::Failed);
+        assert!(aggregate.active_handle_present);
+        assert_eq!(summary.status, CaptureSummaryStatus::Degraded);
+        assert!(summary.active_sources.contains(&"system_audio".to_string()));
+        assert!(summary.failed_sources.contains(&"microphone".to_string()));
+    }
+
+    #[test]
+    fn aggregate_capture_health_fails_when_no_source_is_active() {
+        let system = CaptureHealth::default();
+        let microphone = CaptureHealth {
+            state: CaptureControllerState::Failed,
+            status: CaptureHealthStatus::Failed,
+            ..CaptureHealth::default()
+        };
+
+        let aggregate = aggregate_capture_health(system.clone(), microphone.clone());
+        let summary = capture_summary_from_sources(&system, &microphone);
+
+        assert_eq!(aggregate.state, CaptureControllerState::Failed);
+        assert_eq!(aggregate.status, CaptureHealthStatus::Failed);
+        assert_eq!(summary.status, CaptureSummaryStatus::Failed);
     }
 
     #[derive(Clone)]

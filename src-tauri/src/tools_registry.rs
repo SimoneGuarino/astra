@@ -205,6 +205,22 @@ impl ToolsRegistry {
                     false,
                 ),
                 tool(
+                    "meeting.session.recover_failed_capture",
+                    "meeting",
+                    "Recover a failed capture controller state without deleting meeting data",
+                    vec![Permission::MeetingSessionManage, Permission::MeetingSessionRead],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.force_finalize_failed_capture",
+                    "meeting",
+                    "Force-finalize a failed capture session and preserve captured artifacts",
+                    vec![Permission::MeetingSessionManage, Permission::MeetingExport],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
                     "meeting.session.clear",
                     "meeting",
                     "Clear only the active in-memory meeting session state",
@@ -572,6 +588,12 @@ mod tests {
         let clear_preview = registry
             .get("meeting.clear_data.preview")
             .expect("clear data preview");
+        let recover_failed_capture = registry
+            .get("meeting.session.recover_failed_capture")
+            .expect("recover failed capture");
+        let force_finalize_failed_capture = registry
+            .get("meeting.session.force_finalize_failed_capture")
+            .expect("force finalize failed capture");
 
         assert!(consent_read.available);
         assert!(session_start.available);
@@ -593,6 +615,10 @@ mod tests {
         assert_eq!(capture.available, cfg!(target_os = "windows"));
         assert_eq!(system_capture.available, cfg!(target_os = "windows"));
         assert_eq!(microphone_capture.available, cfg!(target_os = "windows"));
+        assert!(recover_failed_capture.available);
+        assert_eq!(recover_failed_capture.default_risk, RiskLevel::Medium);
+        assert!(force_finalize_failed_capture.available);
+        assert!(!force_finalize_failed_capture.requires_confirmation);
         assert!(segment_transcription.available);
         assert!(!live_transcription.available);
         assert_eq!(file_transcription.default_risk, RiskLevel::High);

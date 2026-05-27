@@ -1,0 +1,12 @@
+{
+  "action_items_count": 0,
+  "decisions_count": 0,
+  "intelligence_present": false,
+  "last_updated_at": "2026-05-24T14:28:22.789664800+00:00",
+  "paused_from": null,
+  "screen_context_count": 0,
+  "session_id": "22478028-08d5-429f-a0cd-a0b02a587b3d",
+  "status": "Failed(\"capture_stop_failed\")",
+  "summary_count": 0,
+  "transcript_count": 0
+}

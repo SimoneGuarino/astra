@@ -4,12 +4,15 @@ mod action_resolution;
 mod assistant_context;
 mod assistant_memory;
 mod assistant_response;
+mod assistant_tool_router;
 mod audio_files;
 mod audit_log;
 mod browser_agent;
 mod capability_manifest;
+mod context_broker;
 mod contextual_learning;
 mod conversation_history;
+mod conversation_orchestrator;
 mod conversation_router;
 mod desktop_agent;
 mod desktop_agent_types;
@@ -47,9 +50,20 @@ use assistant_response::{
     fallback_display_for_empty_response, present_display_text, render_action_response,
     speech_safe_text, RenderedAssistantResponse, StreamPresentationState,
 };
+use assistant_tool_router::{
+    compact_tool_manifest_json, parse_router_runtime_result,
+    parse_router_runtime_result_with_repair, AssistantRouteDecision, AssistantToolIntent,
+    AssistantToolRouterRuntimeResult, RouterFailureReason, ToolTarget,
+};
 use audio_files::AudioFileRegistry;
 use chrono::{DateTime, Utc};
-use conversation_history::ConversationHistoryManager;
+use conversation_history::{ConversationHistoryManager, ConversationMessage};
+use conversation_orchestrator::{
+    apply_orchestrator_policy, apply_policy_to_diagnostic, build_normal_chat_with_context_preamble,
+    plan_with_active_model, render_context_answer, synthesize_context_answer_with_active_model,
+    AssistantOrchestratorDiagnostic, ConversationOrchestratorDecision, OrchestratorPolicyAction,
+    ToolResultFrame, WorkingContextFrame,
+};
 use conversation_router::{route_message, ConversationRoute};
 use desktop_agent::DesktopAgentRuntime;
 use desktop_agent_types::{
@@ -62,24 +76,27 @@ use futures_util::StreamExt;
 use meeting::{
     runtime::MeetingRuntime,
     types::{
-        ActionItem, CallInfo, CaptureBackend, ClearMeetingDataRequest, ConsentState,
-        DecisionLogEntry, ExportedMeeting, MeetingAudioFileTranscriptionRequest,
-        MeetingAudioFileTranscriptionResult, MeetingCaptureOptions, MeetingConfig,
-        MeetingDataClearPreview, MeetingDataClearResult, MeetingDiagnostic, MeetingFollowUpDraft,
-        MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLiveCapabilitySnapshot, MeetingRecallRequest, MeetingRecallResponse,
-        MeetingScreenContext, MeetingScreenContextAttachRequest,
-        MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
-        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
-        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
-        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
-        MeetingStatus, NoteEntry, RenameSpeakerRequest, RenameSpeakerResult,
-        ScreenContextRedaction, ScreenContextSource, ScreenStructuredObservation, SummaryEntry,
-        TranscriptEntry,
+        derive_meeting_stt_completeness, ActionItem, CallInfo, CaptureBackend,
+        ClearMeetingDataRequest, ConsentState, DecisionLogEntry, ExportedMeeting,
+        MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
+        MeetingCaptureOptions, MeetingConfig, MeetingDataClearPreview, MeetingDataClearResult,
+        MeetingDiagnostic, MeetingFollowUpDraft, MeetingIntelligenceGenerationOptions,
+        MeetingIntelligenceResult, MeetingLiveCapabilitySnapshot, MeetingRecallRequest,
+        MeetingRecallResponse, MeetingScreenContext, MeetingScreenContextAttachRequest,
+        MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionArchiveDocument,
+        MeetingSessionExportRequest, MeetingSessionExportResponse, MeetingSessionListItem,
+        MeetingSessionListRequest, MeetingSessionListResponse, MeetingSessionMode,
+        MeetingSessionReadRequest, MeetingSessionReadResponse, MeetingSessionSearchRequest,
+        MeetingSessionSearchResponse, MeetingSessionState, MeetingStatus, NoteEntry,
+        RenameSpeakerRequest, RenameSpeakerResult, ScreenContextRedaction, ScreenContextSource,
+        ScreenStructuredObservation, SummaryEntry, TranscriptEntry,
     },
 };
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
-use model_routing::resolve_ollama_request;
+use model_routing::{
+    ollama_endpoint, resolve_active_ollama_model, resolve_ollama_base_url, resolve_ollama_request,
+    sanitize_ollama_endpoint_label,
+};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -98,6 +115,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use stt_client::SttClient;
 use tauri::{Emitter, Manager, State, WebviewWindow};
@@ -108,7 +126,10 @@ use voice_metrics::{VoiceMetricsTracker, VoiceTurnMetricsSnapshot};
 use voice_session::{
     TranscriptDecision, VoiceSessionAction, VoiceSessionManager, VoiceSessionSnapshot,
 };
-use work_session_chat::{classify_work_session_chat_intent, WorkSessionChatIntent};
+use work_session_chat::{
+    parse_work_session_target_kind, WorkSessionChatIntent, WorkSessionChatRoute,
+    WorkSessionExecutionTarget, WorkSessionTargetKind,
+};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct OllamaMessage {
@@ -122,10 +143,173 @@ struct OllamaStreamChunk {
     done: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    message: Option<OllamaMessage>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AssistantResponseOptions {
     speech_enabled: bool,
     tts_skip_reason: Option<&'static str>,
+}
+
+struct WorkSessionChatRoutingContext<'a> {
+    request_id: &'a str,
+    source: &'a str,
+    history: &'a [ConversationMessage],
+    response_options: AssistantResponseOptions,
+    full_router_invoked_reason: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkSessionChatEvidenceMemory {
+    session_id: String,
+    session_title: String,
+    matched_kind: String,
+    snippet: String,
+    evidence_segment_ids: Vec<String>,
+    screen_context_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkSessionChatMemory {
+    last_user_message: Option<String>,
+    last_assistant_summary: Option<String>,
+    last_intent: WorkSessionChatIntent,
+    last_target: String,
+    last_referenced_session_id: Option<String>,
+    last_referenced_session_title: Option<String>,
+    last_referenced_object_type: Option<String>,
+    last_referenced_object_ids: Vec<String>,
+    last_answer_kind: String,
+    last_query: Option<String>,
+    last_query_hash: Option<String>,
+    evidence: Vec<WorkSessionChatEvidenceMemory>,
+    last_screen_context_ids: Vec<String>,
+    last_response_had_details: bool,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AssistantToolEvidencePacket {
+    tool_name: String,
+    target: ToolTarget,
+    source_kind: String,
+    session_id: Option<String>,
+    title: Option<String>,
+    metadata: serde_json::Value,
+    evidence_items: Vec<AssistantToolEvidenceItem>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AssistantToolEvidenceItem {
+    evidence_id: String,
+    kind: String,
+    timestamp: Option<String>,
+    speaker: Option<String>,
+    text: String,
+    relation: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AssistantToolSynthesisOutput {
+    answer: String,
+    status: String,
+    #[serde(default)]
+    used_evidence_ids: Vec<String>,
+    #[serde(default)]
+    confidence: f32,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AssistantToolSynthesisDiagnostics {
+    request_id: Option<String>,
+    model: Option<String>,
+    endpoint_label: Option<String>,
+    source_kind: String,
+    evidence_count: usize,
+    evidence_chars: usize,
+    used_json_mode: bool,
+    duration_ms: Option<u64>,
+    status: Option<String>,
+    failure_reason: Option<String>,
+    fallback_used: bool,
+    repair_attempted: bool,
+    repair_succeeded: bool,
+    metadata_only: bool,
+    raw_message_included: bool,
+    raw_prompt_included: bool,
+    raw_model_output_included: bool,
+    transcript_text_included: bool,
+    answer_text_included: bool,
+    screen_summary_included: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AssistantToolSynthesisAttempt {
+    answer: Option<String>,
+    output: Option<AssistantToolSynthesisOutput>,
+    failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AssistantToolSynthesisParseOutcome {
+    output: Option<AssistantToolSynthesisOutput>,
+    failure_reason: Option<String>,
+    repair_attempted: bool,
+    repair_succeeded: bool,
+}
+
+enum WorkSessionRoutingDecision {
+    Tool {
+        route: WorkSessionChatRoute,
+        classifier_source: &'static str,
+        model_label: Option<String>,
+    },
+    Clarify {
+        message: String,
+        confidence: f32,
+    },
+    ActiveModel,
+    NormalChat,
+}
+
+#[derive(Debug, Clone)]
+struct AssistantRouterCallOutcome {
+    result: AssistantToolRouterRuntimeResult,
+    diagnostics: AssistantRouterDiagnostics,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AssistantRouterDiagnostics {
+    request_id: Option<String>,
+    router_called: bool,
+    model: Option<String>,
+    endpoint_label: Option<String>,
+    route: Option<String>,
+    tool: Option<String>,
+    target_kind: Option<String>,
+    confidence: Option<f32>,
+    reason_code: Option<String>,
+    failure_reason: Option<String>,
+    used_json_mode: bool,
+    duration_ms: Option<u64>,
+    fallback_kind: Option<String>,
+    repair_attempted: bool,
+    repair_succeeded: bool,
+    prompt_char_count: Option<usize>,
+    full_router_invoked_reason: Option<String>,
+    metadata_only: bool,
+    raw_message_included: bool,
+    raw_router_prompt_included: bool,
+    raw_model_output_included: bool,
+    transcript_text_included: bool,
+    answer_text_included: bool,
+    screen_summary_included: bool,
 }
 
 impl AssistantResponseOptions {
@@ -180,6 +364,8 @@ struct AssistantRuntime {
     conversation_history: ConversationHistoryManager,
     desktop_agent: DesktopAgentRuntime,
     recent_artifacts: RecentArtifactMemory,
+    work_session_chat_memory: Arc<Mutex<Option<WorkSessionChatMemory>>>,
+    working_context: Arc<Mutex<WorkingContextFrame>>,
     tts_segment_fingerprints: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     meeting_runtime: MeetingRuntime,
 }
@@ -199,6 +385,7 @@ impl AssistantRuntime {
         }
         audio_files.cleanup_stale_files();
         let stt_client = SttClient::new(project_root.clone());
+        let meeting_stt_client = SttClient::new_for_meeting(project_root.clone());
 
         Self {
             active_request_id: Arc::new(Mutex::new(None)),
@@ -212,9 +399,62 @@ impl AssistantRuntime {
             conversation_history: ConversationHistoryManager::new(),
             desktop_agent: DesktopAgentRuntime::new(project_root.clone()),
             recent_artifacts: RecentArtifactMemory::default(),
+            work_session_chat_memory: Arc::new(Mutex::new(None)),
+            working_context: Arc::new(Mutex::new(WorkingContextFrame::default())),
             tts_segment_fingerprints: Arc::new(Mutex::new(HashMap::new())),
-            meeting_runtime: MeetingRuntime::with_stt_client(project_root, stt_client),
+            meeting_runtime: MeetingRuntime::with_stt_client(project_root, meeting_stt_client),
         }
+    }
+
+    fn remember_work_session_chat_memory(&self, memory: WorkSessionChatMemory) {
+        let tool_result = tool_result_frame_from_work_session_memory(&memory);
+        let mut state = self
+            .work_session_chat_memory
+            .lock()
+            .expect("work_session_chat_memory mutex poisoned");
+        *state = Some(memory);
+        drop(state);
+        if let Some(tool_result) = tool_result {
+            self.remember_tool_result_frame(tool_result);
+        }
+    }
+
+    fn work_session_chat_memory(&self) -> Option<WorkSessionChatMemory> {
+        self.work_session_chat_memory
+            .lock()
+            .expect("work_session_chat_memory mutex poisoned")
+            .clone()
+    }
+
+    fn working_context(&self) -> WorkingContextFrame {
+        self.working_context
+            .lock()
+            .expect("working_context mutex poisoned")
+            .clone()
+    }
+
+    fn remember_tool_result_frame(&self, tool_result: ToolResultFrame) {
+        let mut context = self
+            .working_context
+            .lock()
+            .expect("working_context mutex poisoned");
+        context.update_from_tool_result(tool_result);
+    }
+
+    fn remember_normal_chat_turn(&self, user_message: &str, assistant_answer: &str) {
+        let mut context = self
+            .working_context
+            .lock()
+            .expect("working_context mutex poisoned");
+        context.update_from_normal_chat(user_message, assistant_answer);
+    }
+
+    fn remember_context_answer_turn(&self, user_message: &str, assistant_answer: &str) {
+        let mut context = self
+            .working_context
+            .lock()
+            .expect("working_context mutex poisoned");
+        context.update_from_context_answer(user_message, assistant_answer);
     }
 
     fn begin_request(&self, request_id: String) {
@@ -386,97 +626,256 @@ async fn start_assistant_response(
         );
     }
 
+    let request_id = Uuid::new_v4().to_string();
     let history = runtime.conversation_history.recent_messages(10);
     let manifest = runtime.desktop_agent.capability_manifest().await;
+    let assistant_context = build_assistant_context_with_work_session(&manifest, &runtime);
+    let mut skip_work_session_router = false;
+    let mut skip_legacy_route_message = false;
+    let mut normal_chat_context_preamble: Option<String> = None;
+    let mut full_router_invoked_reason: Option<String> = None;
 
-    if let Some(response) = try_handle_work_session_chat(
-        &window,
-        runtime.clone(),
-        &message,
-        display_user_message.clone(),
-        source,
-        response_options,
-    )
-    .await?
-    {
-        return Ok(response);
-    }
-
-    let route_result = route_message(&runtime.desktop_agent, &manifest, &message).await?;
-    emit_route_diagnostic(&window, &route_result.diagnostic);
-
-    match route_result.route {
-        ConversationRoute::DirectResponse(response_text) => {
-            return start_grounded_response(
-                window,
-                runtime,
-                message,
-                display_user_message,
-                source,
-                RenderedAssistantResponse::from_display(response_text),
-                "capability-router",
-                response_options,
-            )
-            .await;
-        }
-        ConversationRoute::ActionResponse(action_response) => {
-            runtime
-                .recent_artifacts
-                .remember_action_response(&action_response);
-            let rendered = render_action_response(&action_response, &message);
-            return start_grounded_response(
-                window,
-                runtime,
-                message,
-                display_user_message,
-                source,
-                rendered,
-                "desktop-agent",
-                response_options,
-            )
-            .await;
-        }
-        ConversationRoute::ScreenAnalysis(result) => {
-            if let Some(analysis) = result.analysis.as_ref() {
-                runtime.recent_artifacts.remember_screen_analysis(analysis);
+    if classify_explicit_tool_shortcut(&message).is_none() {
+        let working_context = runtime.working_context();
+        let mut orchestrator_attempt =
+            plan_with_active_model(source, &message, &history, &working_context).await;
+        orchestrator_attempt.diagnostic.request_id = Some(request_id.clone());
+        let policy = apply_orchestrator_policy(&orchestrator_attempt, &working_context);
+        apply_policy_to_diagnostic(&mut orchestrator_attempt.diagnostic, &policy);
+        emit_orchestrator_diagnostic(&window, &orchestrator_attempt.diagnostic);
+        match policy {
+            OrchestratorPolicyAction::AcceptDecision => match orchestrator_attempt.decision {
+                ConversationOrchestratorDecision::AnswerFromContext(plan)
+                | ConversationOrchestratorDecision::AnswerFromContextBoundary(plan) => {
+                    let mut answer_attempt = synthesize_context_answer_with_active_model(
+                        source,
+                        &message,
+                        &working_context,
+                        &plan,
+                    )
+                    .await;
+                    answer_attempt.diagnostic.request_id = Some(request_id.clone());
+                    emit_orchestrator_diagnostic(&window, &answer_attempt.diagnostic);
+                    if let (Some(tool_result), Some(output)) = (
+                        working_context.last_tool_result.as_ref(),
+                        answer_attempt.output.as_ref(),
+                    ) {
+                        let display_text = render_context_answer(tool_result, output);
+                        runtime.remember_context_answer_turn(&message, &display_text);
+                        let model_label = answer_attempt
+                            .diagnostic
+                            .planner_model
+                            .as_deref()
+                            .unwrap_or(default_assistant_model_label());
+                        return start_grounded_response_with_request_id(
+                            request_id,
+                            window,
+                            runtime,
+                            message,
+                            display_user_message,
+                            source,
+                            RenderedAssistantResponse::from_display(display_text),
+                            model_label,
+                            response_options,
+                        )
+                        .await;
+                    }
+                }
+                ConversationOrchestratorDecision::NormalChat(_) => {
+                    skip_work_session_router = true;
+                }
+                ConversationOrchestratorDecision::NormalChatWithContext(plan) => {
+                    skip_work_session_router = true;
+                    skip_legacy_route_message = true;
+                    normal_chat_context_preamble =
+                        build_normal_chat_with_context_preamble(&working_context, &plan);
+                }
+                ConversationOrchestratorDecision::Clarify(plan) => {
+                    return start_grounded_response_with_request_id(
+                        request_id,
+                        window,
+                        runtime,
+                        message,
+                        display_user_message,
+                        source,
+                        RenderedAssistantResponse::from_display(plan.message),
+                        default_assistant_model_label(),
+                        response_options,
+                    )
+                    .await;
+                }
+                ConversationOrchestratorDecision::Refuse(plan) => {
+                    return start_grounded_response_with_request_id(
+                        request_id,
+                        window,
+                        runtime,
+                        message,
+                        display_user_message,
+                        source,
+                        RenderedAssistantResponse::from_display(plan.message),
+                        default_assistant_model_label(),
+                        response_options,
+                    )
+                    .await;
+                }
+                ConversationOrchestratorDecision::ToolCall(_)
+                | ConversationOrchestratorDecision::DeferToToolRouter(_) => {
+                    full_router_invoked_reason = orchestrator_attempt
+                        .diagnostic
+                        .tool_router_invoked_reason
+                        .clone();
+                }
+            },
+            OrchestratorPolicyAction::UseFullToolRouter { .. }
+            | OrchestratorPolicyAction::DeferToFullToolRouter { .. } => {
+                full_router_invoked_reason = orchestrator_attempt
+                    .diagnostic
+                    .tool_router_invoked_reason
+                    .clone();
             }
-            return start_grounded_response(
+            OrchestratorPolicyAction::DowngradeToNormalChatWithContext { .. }
+            | OrchestratorPolicyAction::DowngradeToContextBoundary { .. } => {
+                skip_work_session_router = true;
+                skip_legacy_route_message = true;
+                normal_chat_context_preamble = build_normal_chat_with_context_preamble(
+                    &working_context,
+                    &conversation_orchestrator::ContextualChatPlan {
+                        context_ref: "last_tool_result".to_string(),
+                        reason_code: "needs_tool_policy_downgrade".to_string(),
+                        confidence: orchestrator_attempt
+                            .diagnostic
+                            .planner_confidence
+                            .unwrap_or(0.0),
+                    },
+                );
+            }
+            OrchestratorPolicyAction::SafeClarify { reason } => {
+                return start_grounded_response_with_request_id(
+                    request_id,
+                    window,
+                    runtime,
+                    message,
+                    display_user_message,
+                    source,
+                    RenderedAssistantResponse::from_display(format!(
+                        "Mi serve un riferimento in piu per procedere in modo sicuro. Motivo: {}.",
+                        reason.as_str()
+                    )),
+                    default_assistant_model_label(),
+                    response_options,
+                )
+                .await;
+            }
+        }
+    }
+
+    if !skip_work_session_router {
+        if let Some(response) = try_handle_work_session_chat(
+            &window,
+            runtime.clone(),
+            &message,
+            display_user_message.clone(),
+            WorkSessionChatRoutingContext {
+                request_id: &request_id,
+                source,
+                history: &history,
+                response_options,
+                full_router_invoked_reason: full_router_invoked_reason.as_deref(),
+            },
+        )
+        .await?
+        {
+            return Ok(response);
+        }
+    }
+
+    if !skip_legacy_route_message {
+        let route_result = route_message(&runtime.desktop_agent, &manifest, &message).await?;
+        emit_route_diagnostic(&window, &route_result.diagnostic);
+
+        match route_result.route {
+            ConversationRoute::DirectResponse(response_text) => {
+                return start_grounded_response_with_request_id(
+                    request_id,
+                    window,
+                    runtime,
+                    message,
+                    display_user_message,
+                    source,
+                    RenderedAssistantResponse::from_display(response_text),
+                    "capability-router",
+                    response_options,
+                )
+                .await;
+            }
+            ConversationRoute::ActionResponse(action_response) => {
+                runtime
+                    .recent_artifacts
+                    .remember_action_response(&action_response);
+                let rendered = render_action_response(&action_response, &message);
+                return start_grounded_response_with_request_id(
+                    request_id,
+                    window,
+                    runtime,
+                    message,
+                    display_user_message,
+                    source,
+                    rendered,
+                    "desktop-agent",
+                    response_options,
+                )
+                .await;
+            }
+            ConversationRoute::ScreenAnalysis(result) => {
+                if let Some(analysis) = result.analysis.as_ref() {
+                    runtime.recent_artifacts.remember_screen_analysis(analysis);
+                }
+                return start_grounded_response_with_request_id(
+                    request_id,
+                    window,
+                    runtime,
+                    message,
+                    display_user_message,
+                    source,
+                    RenderedAssistantResponse::from_display(result.response_text),
+                    "screen-vision",
+                    response_options,
+                )
+                .await;
+            }
+            ConversationRoute::Continue => {}
+        }
+
+        if let Some(memory_response) = runtime.recent_artifacts.answer_followup(&message) {
+            emit_route_diagnostic(
+                &window,
+                &recent_artifact_diagnostic(&message, "recent_artifact_memory"),
+            );
+            return start_grounded_response_with_request_id(
+                request_id,
                 window,
                 runtime,
                 message,
                 display_user_message,
                 source,
-                RenderedAssistantResponse::from_display(result.response_text),
-                "screen-vision",
+                RenderedAssistantResponse::from_display(memory_response),
+                "artifact-memory",
                 response_options,
             )
             .await;
         }
-        ConversationRoute::Continue => {}
     }
 
-    if let Some(memory_response) = runtime.recent_artifacts.answer_followup(&message) {
-        emit_route_diagnostic(
-            &window,
-            &recent_artifact_diagnostic(&message, "recent_artifact_memory"),
-        );
-        return start_grounded_response(
-            window,
-            runtime,
-            message,
-            display_user_message,
-            source,
-            RenderedAssistantResponse::from_display(memory_response),
-            "artifact-memory",
-            response_options,
-        )
-        .await;
-    }
-
-    let request_id = Uuid::new_v4().to_string();
-    let assistant_context = build_capability_context(&manifest);
+    let combined_assistant_context;
+    let assistant_context_for_request =
+        if let Some(context_preamble) = normal_chat_context_preamble.as_ref() {
+            combined_assistant_context = format!("{assistant_context}\n\n{context_preamble}");
+            Some(combined_assistant_context.as_str())
+        } else {
+            Some(assistant_context.as_str())
+        };
     let resolved =
-        resolve_ollama_request(&message, source, &history, Some(&assistant_context)).await?;
+        resolve_ollama_request(&message, source, &history, assistant_context_for_request).await?;
     let model = resolved.model.clone();
 
     runtime.begin_request(request_id.clone());
@@ -543,15 +942,158 @@ async fn try_handle_work_session_chat(
     runtime: AssistantRuntime,
     message: &str,
     display_user_message: Option<String>,
-    source: &str,
-    response_options: AssistantResponseOptions,
+    routing: WorkSessionChatRoutingContext<'_>,
 ) -> Result<Option<StartChatResponse>, String> {
-    let route = classify_work_session_chat_intent(message);
-    if !route.intent.is_actionable() {
-        return Ok(None);
-    }
+    let memory = runtime.work_session_chat_memory();
+    let decision = decide_work_session_routing(message, &memory);
+    let (route, classifier_source, route_model_label) = match decision {
+        WorkSessionRoutingDecision::Tool {
+            route,
+            classifier_source,
+            model_label,
+        } => (route, classifier_source, model_label),
+        WorkSessionRoutingDecision::Clarify {
+            message: clarify_text,
+            confidence,
+        } => {
+            let clarify_route = WorkSessionChatRoute {
+                intent: WorkSessionChatIntent::Unknown,
+                confidence,
+                target: Some(WorkSessionExecutionTarget::none()),
+                query: None,
+                reason_code: Some("work_session_chat_contextual_clarifier".to_string()),
+            };
+            let diagnostic = work_session_chat_route_diagnostic(
+                message,
+                &clarify_route,
+                "work_session_chat_contextual_clarifier",
+            );
+            emit_route_diagnostic(window, &diagnostic);
+            let response = start_grounded_response_with_request_id(
+                routing.request_id.to_string(),
+                window.clone(),
+                runtime,
+                message.to_string(),
+                display_user_message,
+                routing.source,
+                RenderedAssistantResponse::from_display(clarify_text),
+                default_assistant_model_label(),
+                routing.response_options,
+            )
+            .await?;
+            return Ok(Some(response));
+        }
+        WorkSessionRoutingDecision::ActiveModel => {
+            let work_session_context = work_session_context_for_assistant(&runtime);
+            let _ = window.emit(
+                "work-session-chat-command-started",
+                serde_json::json!({
+                    "intent": "route_request",
+                    "metadata_only": true,
+                    "transcript_text_included": false,
+                    "screen_pixels_included": false,
+                    "generated_text_included": false,
+                }),
+            );
+            let mut outcome = classify_work_session_routing_with_active_model(
+                routing.source,
+                message,
+                routing.history,
+                memory.as_ref(),
+                work_session_context.as_ref(),
+                Some(&runtime.working_context()),
+            )
+            .await;
+            outcome.diagnostics.request_id = Some(routing.request_id.to_string());
+            let full_router_invoked_reason = routing
+                .full_router_invoked_reason
+                .unwrap_or("work_session_active_model_router");
+            outcome.diagnostics.full_router_invoked_reason =
+                Some(full_router_invoked_reason.to_string());
+            emit_router_diagnostic(window, &outcome.diagnostics);
+            let _ = window.emit(
+                "work-session-chat-command-finished",
+                serde_json::json!({
+                    "intent": "route_request",
+                    "metadata_only": true,
+                    "transcript_text_included": false,
+                    "screen_pixels_included": false,
+                    "generated_text_included": false,
+                }),
+            );
+            let route_model_label = outcome.diagnostics.model.clone();
+            match assistant_router_runtime_result_to_work_session_decision(outcome.result.clone()) {
+                Some(WorkSessionRoutingDecision::Tool {
+                    route,
+                    classifier_source,
+                    model_label,
+                }) => (route, classifier_source, model_label.or(route_model_label)),
+                Some(WorkSessionRoutingDecision::Clarify {
+                    message: clarify_text,
+                    confidence,
+                }) => {
+                    let model_label = route_model_label
+                        .clone()
+                        .unwrap_or_else(|| default_assistant_model_label().to_string());
+                    let clarify_route = WorkSessionChatRoute {
+                        intent: WorkSessionChatIntent::Unknown,
+                        confidence,
+                        target: Some(WorkSessionExecutionTarget::none()),
+                        query: None,
+                        reason_code: Some("work_session_chat_active_model_clarifier".to_string()),
+                    };
+                    let diagnostic = work_session_chat_route_diagnostic(
+                        message,
+                        &clarify_route,
+                        "work_session_chat_active_model_clarifier",
+                    );
+                    emit_route_diagnostic(window, &diagnostic);
+                    let response = start_grounded_response_with_request_id(
+                        routing.request_id.to_string(),
+                        window.clone(),
+                        runtime,
+                        message.to_string(),
+                        display_user_message,
+                        routing.source,
+                        RenderedAssistantResponse::from_display(clarify_text),
+                        &model_label,
+                        routing.response_options,
+                    )
+                    .await?;
+                    return Ok(Some(response));
+                }
+                Some(WorkSessionRoutingDecision::NormalChat) => return Ok(None),
+                Some(WorkSessionRoutingDecision::ActiveModel) => return Ok(None),
+                None => {
+                    if routing.full_router_invoked_reason
+                        == Some("planner_empty_no_grounded_context")
+                    {
+                        return Ok(None);
+                    }
+                    let model_label = route_model_label
+                        .clone()
+                        .unwrap_or_else(|| default_assistant_model_label().to_string());
+                    let response_text = render_router_runtime_failure_response(&outcome.result);
+                    let response = start_grounded_response_with_request_id(
+                        routing.request_id.to_string(),
+                        window.clone(),
+                        runtime,
+                        message.to_string(),
+                        display_user_message,
+                        routing.source,
+                        RenderedAssistantResponse::from_display(response_text),
+                        &model_label,
+                        routing.response_options,
+                    )
+                    .await?;
+                    return Ok(Some(response));
+                }
+            }
+        }
+        WorkSessionRoutingDecision::NormalChat => return Ok(None),
+    };
 
-    let diagnostic = work_session_chat_route_diagnostic(message, route.intent, route.confidence);
+    let diagnostic = work_session_chat_route_diagnostic(message, &route, classifier_source);
     emit_route_diagnostic(window, &diagnostic);
     let _ = window.emit(
         "work-session-chat-command-started",
@@ -564,11 +1106,21 @@ async fn try_handle_work_session_chat(
             "generated_text_included": false,
         }),
     );
-    let display_text =
-        match execute_work_session_chat_intent(window, &runtime, route.intent, message).await {
-            Ok(response) => response,
-            Err(error) => render_work_session_error(route.intent, &error),
-        };
+    let display_text = match execute_work_session_chat_intent(
+        window,
+        &runtime,
+        &route,
+        message,
+        routing.source,
+        routing.history,
+        routing.request_id,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => render_work_session_error(route.intent, &error),
+    };
+    let display_text = ensure_work_session_chat_response_text(route.intent, display_text);
     let _ = window.emit(
         "work-session-chat-command-finished",
         serde_json::json!({
@@ -580,26 +1132,712 @@ async fn try_handle_work_session_chat(
             "generated_text_included": false,
         }),
     );
-    let response = start_grounded_response(
+    let model_label =
+        route_model_label.unwrap_or_else(|| default_assistant_model_label().to_string());
+    let response = start_grounded_response_with_request_id(
+        routing.request_id.to_string(),
         window.clone(),
         runtime,
         message.to_string(),
         display_user_message,
-        source,
+        routing.source,
         RenderedAssistantResponse::from_display(display_text),
-        "work-session-chat",
-        response_options,
+        &model_label,
+        routing.response_options,
     )
     .await?;
     Ok(Some(response))
 }
 
+fn decide_work_session_routing(
+    message: &str,
+    memory: &Option<WorkSessionChatMemory>,
+) -> WorkSessionRoutingDecision {
+    if let Some(route) = classify_explicit_tool_shortcut(message) {
+        return WorkSessionRoutingDecision::Tool {
+            route,
+            classifier_source: "assistant_tool_router_explicit_shortcut",
+            model_label: None,
+        };
+    }
+
+    let _ = memory;
+    WorkSessionRoutingDecision::ActiveModel
+}
+
+fn classify_explicit_tool_shortcut(message: &str) -> Option<WorkSessionChatRoute> {
+    let command = message.trim().to_ascii_lowercase();
+    let intent = match command.as_str() {
+        "/work-session start" | "/session start" => WorkSessionChatIntent::StartSession,
+        "/work-session stop" | "/session stop" => WorkSessionChatIntent::StopSession,
+        "/work-session stop-recap" | "/session stop-recap" => {
+            WorkSessionChatIntent::StopAndGenerateRecap
+        }
+        "/work-session status" | "/session status" => WorkSessionChatIntent::ShowSessionStatus,
+        "/work-session attach-screen" | "/session attach-screen" => {
+            WorkSessionChatIntent::AttachScreenContext
+        }
+        _ => return None,
+    };
+    Some(WorkSessionChatRoute {
+        intent,
+        confidence: 1.0,
+        target: Some(WorkSessionExecutionTarget::none()),
+        query: None,
+        reason_code: Some("explicit_shortcut".to_string()),
+    })
+}
+
+async fn classify_work_session_routing_with_active_model(
+    source: &str,
+    message: &str,
+    history: &[ConversationMessage],
+    memory: Option<&WorkSessionChatMemory>,
+    work_session_context: Option<&serde_json::Value>,
+    working_context: Option<&WorkingContextFrame>,
+) -> AssistantRouterCallOutcome {
+    let started = Instant::now();
+    let base_url = resolve_ollama_base_url();
+    let endpoint_label = sanitize_ollama_endpoint_label(&base_url);
+    let mut diagnostics = AssistantRouterDiagnostics {
+        request_id: None,
+        router_called: true,
+        model: None,
+        endpoint_label: Some(endpoint_label),
+        route: None,
+        tool: None,
+        target_kind: None,
+        confidence: None,
+        reason_code: None,
+        failure_reason: None,
+        used_json_mode: true,
+        duration_ms: None,
+        fallback_kind: None,
+        repair_attempted: false,
+        repair_succeeded: false,
+        prompt_char_count: None,
+        full_router_invoked_reason: None,
+        metadata_only: true,
+        raw_message_included: false,
+        raw_router_prompt_included: false,
+        raw_model_output_included: false,
+        transcript_text_included: false,
+        answer_text_included: false,
+        screen_summary_included: false,
+    };
+    let model = resolve_active_ollama_model(message, source).await;
+    diagnostics.model = Some(model.clone());
+    let timeout_ms = router_timeout_ms_for_model(&model);
+    let messages = build_assistant_tool_router_messages_budgeted(
+        message,
+        history,
+        memory,
+        work_session_context,
+        working_context,
+    );
+    diagnostics.prompt_char_count = Some(
+        messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .map(str::len)
+            .sum(),
+    );
+    let options = serde_json::json!({
+        "temperature": 0.0,
+        "top_p": 0.7,
+        "repeat_penalty": 1.05,
+        "num_predict": 320
+    });
+    let client = match Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(value) => value,
+        Err(_) => {
+            let result = AssistantToolRouterRuntimeResult::Unavailable {
+                reason: RouterFailureReason::EndpointConfig,
+            };
+            update_router_diagnostics_from_result(&mut diagnostics, &result);
+            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+            return AssistantRouterCallOutcome {
+                result,
+                diagnostics,
+            };
+        }
+    };
+    let response = match client
+        .post(ollama_endpoint("/api/chat"))
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "messages": messages,
+            "options": options,
+            "keep_alive": "30m"
+        }))
+        .send()
+        .await
+    {
+        Ok(value) => value,
+        Err(error) if error.is_timeout() => {
+            let result = AssistantToolRouterRuntimeResult::Timeout { timeout_ms };
+            update_router_diagnostics_from_result(&mut diagnostics, &result);
+            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+            return AssistantRouterCallOutcome {
+                result,
+                diagnostics,
+            };
+        }
+        Err(_) => {
+            let result = AssistantToolRouterRuntimeResult::Unavailable {
+                reason: RouterFailureReason::OllamaUnavailable,
+            };
+            update_router_diagnostics_from_result(&mut diagnostics, &result);
+            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+            return AssistantRouterCallOutcome {
+                result,
+                diagnostics,
+            };
+        }
+    };
+    if !response.status().is_success() {
+        let result = AssistantToolRouterRuntimeResult::Unavailable {
+            reason: RouterFailureReason::OllamaUnavailable,
+        };
+        update_router_diagnostics_from_result(&mut diagnostics, &result);
+        diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+        return AssistantRouterCallOutcome {
+            result,
+            diagnostics,
+        };
+    }
+    let body: OllamaChatResponse = match response.json().await {
+        Ok(value) => value,
+        Err(_) => {
+            let result = AssistantToolRouterRuntimeResult::Malformed {
+                reason: RouterFailureReason::InvalidSchema,
+                raw_len: 0,
+            };
+            update_router_diagnostics_from_result(&mut diagnostics, &result);
+            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+            return AssistantRouterCallOutcome {
+                result,
+                diagnostics,
+            };
+        }
+    };
+    let content = body
+        .message
+        .map(|message| message.content)
+        .unwrap_or_default();
+    let parse_outcome = parse_router_runtime_result_with_repair(
+        &content,
+        diagnostics.model.as_deref().unwrap_or(""),
+    );
+    diagnostics.repair_attempted = parse_outcome.repair_attempted;
+    diagnostics.repair_succeeded = parse_outcome.repair_succeeded;
+    let result = parse_outcome.result;
+    update_router_diagnostics_from_result(&mut diagnostics, &result);
+    diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+    AssistantRouterCallOutcome {
+        result,
+        diagnostics,
+    }
+}
+
+fn router_timeout_ms_for_model(model: &str) -> u64 {
+    router_timeout_ms_from_env(
+        model,
+        std::env::var("ASTRA_TOOL_ROUTER_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn router_timeout_ms_from_env(model: &str, override_value: Option<&str>) -> u64 {
+    if let Some(value) = override_value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1_000..=120_000).contains(value))
+    {
+        return value;
+    }
+
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("70b")
+        || lower.contains("32b")
+        || lower.contains("30b")
+        || lower.contains("20b")
+        || lower.contains("gpt-oss")
+    {
+        25_000
+    } else {
+        12_000
+    }
+}
+
+fn emit_router_diagnostic(window: &WebviewWindow, diagnostic: &AssistantRouterDiagnostics) {
+    let _ = window.emit("assistant-router-diagnostic", diagnostic.clone());
+}
+
+fn emit_orchestrator_diagnostic(
+    window: &WebviewWindow,
+    diagnostic: &AssistantOrchestratorDiagnostic,
+) {
+    let _ = window.emit("assistant-orchestrator-diagnostic", diagnostic.clone());
+}
+
+fn update_router_diagnostics_from_result(
+    diagnostics: &mut AssistantRouterDiagnostics,
+    result: &AssistantToolRouterRuntimeResult,
+) {
+    match result {
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::ToolCall(intent)) => {
+            diagnostics.route = Some("tool_call".to_string());
+            diagnostics.tool = Some(intent.tool_name.clone());
+            diagnostics.target_kind = Some(intent.target.kind.clone());
+            diagnostics.confidence = Some(intent.confidence);
+            diagnostics.reason_code = Some(intent.reason_code.clone());
+        }
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::NormalChat)
+        | AssistantToolRouterRuntimeResult::NormalChat { .. } => {
+            diagnostics.route = Some("normal_chat".to_string());
+            if let AssistantToolRouterRuntimeResult::NormalChat {
+                confidence,
+                reason_code,
+            } = result
+            {
+                diagnostics.confidence = Some(*confidence);
+                diagnostics.reason_code = Some(reason_code.clone());
+            }
+        }
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::Clarify(clarify)) => {
+            diagnostics.route = Some("clarify".to_string());
+            diagnostics.confidence = Some(clarify.confidence);
+            diagnostics.reason_code = Some(clarify.reason_code.clone());
+        }
+        AssistantToolRouterRuntimeResult::Clarify { reason_code, .. } => {
+            diagnostics.route = Some("clarify".to_string());
+            diagnostics.reason_code = Some(reason_code.clone());
+        }
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::Refuse(refusal)) => {
+            diagnostics.route = Some("refuse".to_string());
+            diagnostics.reason_code = Some(refusal.reason_code.clone());
+        }
+        AssistantToolRouterRuntimeResult::Refuse { reason_code, .. } => {
+            diagnostics.route = Some("refuse".to_string());
+            diagnostics.reason_code = Some(reason_code.clone());
+        }
+        AssistantToolRouterRuntimeResult::Unavailable { reason }
+        | AssistantToolRouterRuntimeResult::Malformed { reason, .. } => {
+            diagnostics.failure_reason = Some(format!("{reason:?}"));
+            diagnostics.fallback_kind = Some("safe_router_failure_response".to_string());
+        }
+        AssistantToolRouterRuntimeResult::EmptyModelContent { .. } => {
+            diagnostics.failure_reason = Some("EmptyModelContent".to_string());
+            diagnostics.fallback_kind = Some("safe_router_failure_response".to_string());
+        }
+        AssistantToolRouterRuntimeResult::Timeout { .. } => {
+            diagnostics.failure_reason = Some("Timeout".to_string());
+            diagnostics.fallback_kind = Some("safe_router_failure_response".to_string());
+        }
+    }
+}
+
+fn render_router_runtime_failure_response(result: &AssistantToolRouterRuntimeResult) -> String {
+    match result {
+        AssistantToolRouterRuntimeResult::EmptyModelContent { .. } => {
+            "Non sono riuscito a completare il routing tool-aware con il modello locale: il router non ha prodotto contenuto testuale. Posso riprovare, oppure puoi usare un comando esplicito come /work-session status.".to_string()
+        }
+        AssistantToolRouterRuntimeResult::Malformed { reason, .. } => match reason {
+            RouterFailureReason::InvalidTool => {
+                "Il router tool-aware ha proposto uno strumento non supportato, quindi non eseguo alcuna azione. Posso riprovare con il modello locale o aprire i dettagli della Work Session.".to_string()
+            }
+            RouterFailureReason::InvalidTarget => {
+                "Il router tool-aware ha indicato un target non valido per lo strumento richiesto, quindi non eseguo alcuna azione. Dimmi se ti riferisci alla sessione attiva, all'ultima archiviata o al riferimento precedente.".to_string()
+            }
+            RouterFailureReason::MalformedJson | RouterFailureReason::InvalidSchema => {
+                "Non sono riuscito a completare il routing tool-aware con il modello locale: il router non ha prodotto JSON valido. Posso riprovare oppure puoi aprire i dettagli della Work Session.".to_string()
+            }
+            other => format!(
+                "Non sono riuscito a completare il routing tool-aware con il modello locale ({other:?}). Nessuna azione Work Session e stata eseguita."
+            ),
+        },
+        AssistantToolRouterRuntimeResult::Unavailable { reason } => match reason {
+            RouterFailureReason::OllamaUnavailable => {
+                "Non riesco a raggiungere il modello locale per il routing tool-aware. Nessuna azione Work Session e stata eseguita; puoi riprovare quando Ollama e disponibile.".to_string()
+            }
+            RouterFailureReason::ModelRoutingUnavailable => {
+                "Non sono riuscito a preparare la richiesta per il router tool-aware locale. Nessuna azione Work Session e stata eseguita.".to_string()
+            }
+            RouterFailureReason::EndpointConfig => {
+                "La configurazione dell'endpoint Ollama non e valida per il router tool-aware. Nessuna azione Work Session e stata eseguita.".to_string()
+            }
+            other => format!(
+                "Il router tool-aware locale non e disponibile ({other:?}). Nessuna azione Work Session e stata eseguita."
+            ),
+        },
+        AssistantToolRouterRuntimeResult::Timeout { timeout_ms } => format!(
+            "Il router tool-aware locale non ha risposto entro {timeout_ms} ms. Nessuna azione Work Session e stata eseguita; puoi riprovare."
+        ),
+        _ => {
+            "Non sono riuscito a completare il routing tool-aware locale. Nessuna azione Work Session e stata eseguita.".to_string()
+        }
+    }
+}
+
+fn default_assistant_model_label() -> &'static str {
+    "gpt-oss:20b"
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_active_model_work_session_route(content: &str) -> Option<WorkSessionChatRoute> {
+    match parse_active_model_work_session_decision(content)? {
+        WorkSessionRoutingDecision::Tool { route, .. } => Some(route),
+        _ => None,
+    }
+}
+
+fn parse_active_model_work_session_decision(content: &str) -> Option<WorkSessionRoutingDecision> {
+    assistant_router_runtime_result_to_work_session_decision(parse_router_runtime_result(
+        content,
+        "test-model",
+    ))
+}
+
+fn assistant_router_runtime_result_to_work_session_decision(
+    result: AssistantToolRouterRuntimeResult,
+) -> Option<WorkSessionRoutingDecision> {
+    match result {
+        AssistantToolRouterRuntimeResult::Routed(decision) => {
+            assistant_tool_decision_to_work_session_decision(decision, None)
+        }
+        AssistantToolRouterRuntimeResult::NormalChat { .. } => {
+            Some(WorkSessionRoutingDecision::NormalChat)
+        }
+        AssistantToolRouterRuntimeResult::Clarify { message, .. } => {
+            Some(WorkSessionRoutingDecision::Clarify {
+                message,
+                confidence: 0.0,
+            })
+        }
+        AssistantToolRouterRuntimeResult::Refuse { message, .. } => {
+            Some(WorkSessionRoutingDecision::Clarify {
+                message,
+                confidence: 1.0,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn assistant_tool_decision_to_work_session_decision(
+    decision: AssistantRouteDecision,
+    model_label: Option<String>,
+) -> Option<WorkSessionRoutingDecision> {
+    match decision {
+        AssistantRouteDecision::NormalChat => Some(WorkSessionRoutingDecision::NormalChat),
+        AssistantRouteDecision::Clarify(clarify) => Some(WorkSessionRoutingDecision::Clarify {
+            message: clarify.message,
+            confidence: clarify.confidence,
+        }),
+        AssistantRouteDecision::Refuse(refusal) => Some(WorkSessionRoutingDecision::Clarify {
+            message: refusal.message,
+            confidence: 1.0,
+        }),
+        AssistantRouteDecision::ToolCall(intent) => {
+            let work_session_intent = assistant_tool_intent_to_work_session_intent(&intent)?;
+            let target = assistant_tool_target_to_work_session_target(&intent.target);
+            Some(WorkSessionRoutingDecision::Tool {
+                route: WorkSessionChatRoute {
+                    intent: work_session_intent,
+                    confidence: intent.confidence,
+                    target: Some(target),
+                    query: intent.query.clone(),
+                    reason_code: Some(intent.reason_code.clone()),
+                },
+                classifier_source: "assistant_tool_router_active_model",
+                model_label,
+            })
+        }
+    }
+}
+
+fn assistant_tool_target_to_work_session_target(target: &ToolTarget) -> WorkSessionExecutionTarget {
+    WorkSessionExecutionTarget {
+        kind: parse_work_session_target_kind(&target.kind),
+        session_id: target.session_id.clone(),
+        object_type: target.object_type.clone(),
+        object_ids: target.object_ids.clone(),
+    }
+}
+
+fn assistant_tool_intent_to_work_session_intent(
+    intent: &AssistantToolIntent,
+) -> Option<WorkSessionChatIntent> {
+    match intent.tool_name.as_str() {
+        "work_session.start" => Some(WorkSessionChatIntent::StartSession),
+        "work_session.stop" => Some(WorkSessionChatIntent::StopSession),
+        "work_session.stop_and_recap" => Some(WorkSessionChatIntent::StopAndGenerateRecap),
+        "work_session.recap" | "work_session.generate_intelligence" => {
+            Some(WorkSessionChatIntent::GenerateIntelligence)
+        }
+        "work_session.transcript_summary" => Some(WorkSessionChatIntent::GenerateTranscriptSummary),
+        "work_session.details" => Some(WorkSessionChatIntent::GenerateDetails),
+        "work_session.technical_recap" => Some(WorkSessionChatIntent::GenerateTechnicalRecap),
+        "work_session.followup_draft" => Some(WorkSessionChatIntent::GenerateFollowUpDraft),
+        "work_session.recall" => Some(WorkSessionChatIntent::RecallSessionMemory),
+        "work_session.search" => Some(WorkSessionChatIntent::SearchSessionMemory),
+        "work_session.attach_screen" => Some(WorkSessionChatIntent::AttachScreenContext),
+        "work_session.show_evidence" => Some(WorkSessionChatIntent::ShowEvidence),
+        "work_session.status" => Some(WorkSessionChatIntent::ShowSessionStatus),
+        "work_session.open_details" => Some(WorkSessionChatIntent::OpenMeetingPanel),
+        _ => None,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_assistant_tool_router_messages(
+    message: &str,
+    history: &[ConversationMessage],
+    memory: Option<&WorkSessionChatMemory>,
+    work_session_context: Option<&serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    build_assistant_tool_router_messages_with_manifest(
+        message,
+        history,
+        memory,
+        work_session_context,
+        compact_tool_manifest_json(),
+        4,
+        220,
+        420,
+        true,
+    )
+}
+
+fn build_assistant_tool_router_messages_budgeted(
+    message: &str,
+    history: &[ConversationMessage],
+    memory: Option<&WorkSessionChatMemory>,
+    work_session_context: Option<&serde_json::Value>,
+    working_context: Option<&WorkingContextFrame>,
+) -> Vec<serde_json::Value> {
+    let manifest = context_broker::filtered_tool_manifest_json(working_context, true);
+    let mut messages = build_assistant_tool_router_messages_with_manifest(
+        message,
+        history,
+        memory,
+        work_session_context,
+        manifest,
+        4,
+        220,
+        420,
+        true,
+    );
+    let mut prompt_chars = context_broker::prompt_char_count(&messages);
+    if prompt_chars <= context_broker::FULL_ROUTER_TARGET_CHARS {
+        return messages;
+    }
+
+    let compact_manifest = context_broker::filtered_tool_manifest_json(working_context, false);
+    messages = build_assistant_tool_router_messages_with_manifest(
+        message,
+        history,
+        memory,
+        work_session_context,
+        compact_manifest,
+        2,
+        140,
+        320,
+        true,
+    );
+    prompt_chars = context_broker::prompt_char_count(&messages);
+    if prompt_chars <= context_broker::FULL_ROUTER_HARD_CAP_CHARS {
+        return messages;
+    }
+
+    build_assistant_tool_router_messages_with_manifest(
+        message,
+        history,
+        memory,
+        None,
+        context_broker::filtered_tool_manifest_json(working_context, false),
+        1,
+        90,
+        240,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_assistant_tool_router_messages_with_manifest(
+    message: &str,
+    history: &[ConversationMessage],
+    memory: Option<&WorkSessionChatMemory>,
+    work_session_context: Option<&serde_json::Value>,
+    available_tools: serde_json::Value,
+    recent_turn_limit: usize,
+    recent_turn_char_limit: usize,
+    user_message_limit: usize,
+    include_runtime_context: bool,
+) -> Vec<serde_json::Value> {
+    let router_input = build_work_session_classifier_input_value_with_limits(
+        message,
+        history,
+        memory,
+        work_session_context,
+        available_tools,
+        recent_turn_limit,
+        recent_turn_char_limit,
+        user_message_limit,
+        include_runtime_context,
+    );
+    let schema = serde_json::json!({
+        "route": "normal_chat|tool_call|clarify|refuse",
+        "tool": "work_session.transcript_summary|null",
+        "target": "latest_archived_session|last_referenced_session|last_completed_session|active_session|current_screen|archived_sessions|none",
+        "object": "transcript|recap|screen_context|evidence|intelligence|null",
+        "confidence": 0.0,
+        "query": "short normalized query or null",
+        "reason_code": "short_machine_readable_reason"
+    });
+    vec![
+        serde_json::json!({
+            "role": "system",
+            "content": concat!(
+                "You are Astra's tool router. Return one valid JSON object only. ",
+                "Do not answer the user. Do not use markdown. Do not explain. ",
+                "Choose normal_chat, tool_call, clarify, or refuse. ",
+                "The user-facing assistant will answer later. ",
+                "The model only proposes; Rust validates and executes governed tools. ",
+                "Never propose browser automation, DesktopControl, clicking, terminal, filesystem, email, cloud, or autonomous actions."
+            )
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": serde_json::json!({
+                "task": "route_user_message",
+                "output_schema": schema,
+                "router_input": router_input,
+                "instructions": [
+                    "Use tool_call only when a governed Astra tool is needed.",
+                    "Use work_session.transcript_summary when the user asks what a recording, transcript, saved session, or last Work Session content was about.",
+                    "Use target active_session when runtime_context says a Work Session is active and the user asks about the current/ongoing session.",
+                    "Use work_session.attach_screen with target active_session when the user asks to attach the current screen to the active Work Session.",
+                    "Use last_referenced_session when discourse_state contains a clear previous Work Session reference.",
+                    "Use normal_chat for ordinary assistant questions.",
+                    "Return compact JSON. Preferred target shape: string plus optional object."
+                ]
+            }).to_string()
+        }),
+    ]
+}
+
+#[allow(dead_code)]
+fn build_work_session_classifier_input_value(
+    message: &str,
+    history: &[ConversationMessage],
+    memory: Option<&WorkSessionChatMemory>,
+    work_session_context: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    build_work_session_classifier_input_value_with_limits(
+        message,
+        history,
+        memory,
+        work_session_context,
+        compact_tool_manifest_json(),
+        4,
+        220,
+        420,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_work_session_classifier_input_value_with_limits(
+    message: &str,
+    history: &[ConversationMessage],
+    memory: Option<&WorkSessionChatMemory>,
+    work_session_context: Option<&serde_json::Value>,
+    available_tools: serde_json::Value,
+    recent_turn_limit: usize,
+    recent_turn_char_limit: usize,
+    user_message_limit: usize,
+    include_runtime_context: bool,
+) -> serde_json::Value {
+    let recent_turns = history
+        .iter()
+        .rev()
+        .take(recent_turn_limit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|turn| {
+            serde_json::json!({
+                "role": turn.role,
+                "text": bounded_text(&turn.content, recent_turn_char_limit),
+            })
+        })
+        .collect::<Vec<_>>();
+    let memory_value = memory
+        .map(|value| {
+            serde_json::json!({
+                "last_user_message": value.last_user_message.as_deref(),
+                "last_assistant_summary": value.last_assistant_summary.as_deref(),
+                "last_route": "work_session_tool",
+                "last_work_session_action": value.last_intent.as_str(),
+                "last_work_session_target": value.last_target.as_str(),
+                "last_referenced_session_id": value.last_referenced_session_id.as_deref(),
+                "last_referenced_session_title": value.last_referenced_session_title.as_deref(),
+                "last_referenced_object_type": value.last_referenced_object_type.as_deref(),
+                "last_referenced_object_ids": value.last_referenced_object_ids.iter().take(12).collect::<Vec<_>>(),
+                "last_answer_kind": value.last_answer_kind.as_str(),
+                "last_evidence_count": value.evidence.len(),
+                "last_evidence_refs": value.evidence.iter().take(5).map(|item| serde_json::json!({
+                    "session_id": item.session_id.as_str(),
+                    "matched_kind": item.matched_kind.as_str(),
+                    "segment_count": item.evidence_segment_ids.len(),
+                    "screen_context_count": item.screen_context_ids.len(),
+                })).collect::<Vec<_>>(),
+                "last_screen_context_ids": value.last_screen_context_ids.iter().take(8).collect::<Vec<_>>(),
+                "last_query_present": value.last_query.as_ref().is_some_and(|query| !query.trim().is_empty()),
+                "last_query_hash": value.last_query_hash.as_deref(),
+                "last_recall_evidence_count": value.evidence.len(),
+                "last_response_had_details": value.last_response_had_details,
+                "updated_at": value.updated_at.to_rfc3339(),
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!(null));
+    serde_json::json!({
+        "user_message": bounded_text(message, user_message_limit),
+        "recent_turns": recent_turns,
+        "discourse_state": memory_value,
+        "runtime_context": if include_runtime_context {
+            work_session_context.cloned().unwrap_or(serde_json::Value::Null)
+        } else {
+            serde_json::json!({"omitted_for_prompt_budget": true, "metadata_only": true})
+        },
+        "capability_manifest": {
+            "metadata_only": true,
+            "llm_proposes_only": true,
+            "rust_validates_and_executes": true,
+            "no_desktop_control": true,
+            "no_browser_automation": true,
+        },
+        "available_tools": available_tools,
+    })
+}
+
 async fn execute_work_session_chat_intent(
     window: &WebviewWindow,
     runtime: &AssistantRuntime,
-    intent: WorkSessionChatIntent,
+    route: &WorkSessionChatRoute,
     message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    request_id: &str,
 ) -> Result<String, String> {
+    let intent = route.intent;
     match intent {
         WorkSessionChatIntent::StartSession => start_work_session_from_chat(window, runtime),
         WorkSessionChatIntent::StopSession => stop_work_session_from_chat(window, runtime)
@@ -613,15 +1851,34 @@ async fn execute_work_session_chat_intent(
             ))
         }
         WorkSessionChatIntent::AttachScreenContext => {
-            attach_screen_context_from_chat(window, runtime).await
+            attach_screen_context_from_chat(window, runtime, route).await
         }
         WorkSessionChatIntent::GenerateIntelligence => {
-            let intelligence = generate_intelligence_from_chat(window, runtime).await?;
-            Ok(render_intelligence_response(&intelligence))
+            recap_work_session_from_chat(
+                window, runtime, route, message, source, history, request_id,
+            )
+            .await
+        }
+        WorkSessionChatIntent::GenerateTranscriptSummary => {
+            transcript_summary_work_session_from_chat(
+                Some(window),
+                runtime,
+                route,
+                message,
+                source,
+                history,
+                request_id,
+            )
+            .await
+        }
+        WorkSessionChatIntent::GenerateDetails => {
+            details_work_session_from_chat(
+                window, runtime, route, message, source, history, request_id,
+            )
+            .await
         }
         WorkSessionChatIntent::GenerateTechnicalRecap => {
-            let intelligence = generate_intelligence_from_chat(window, runtime).await?;
-            Ok(render_technical_recap_response(&intelligence))
+            technical_recap_from_chat(window, runtime).await
         }
         WorkSessionChatIntent::GenerateFollowUpDraft => {
             generate_followup_from_chat(window, runtime).await
@@ -632,6 +1889,7 @@ async fn execute_work_session_chat_intent(
         WorkSessionChatIntent::SearchSessionMemory => {
             search_session_memory_from_chat(runtime, message)
         }
+        WorkSessionChatIntent::ShowEvidence => show_work_session_evidence_from_chat(runtime),
         WorkSessionChatIntent::ShowSessionStatus => render_work_session_status(runtime),
         WorkSessionChatIntent::OpenMeetingPanel => {
             let _ = window.emit("work-session-open-details-requested", serde_json::json!({}));
@@ -643,23 +1901,35 @@ async fn execute_work_session_chat_intent(
 
 fn work_session_chat_route_diagnostic(
     message: &str,
-    intent: WorkSessionChatIntent,
-    confidence: f32,
+    route: &WorkSessionChatRoute,
+    classifier_source: &str,
 ) -> ConversationRouteDiagnostic {
+    let intent = route.intent;
+    let target_kind = route
+        .target
+        .as_ref()
+        .map(|target| target.kind.as_str())
+        .unwrap_or("none");
     ConversationRouteDiagnostic {
         message_excerpt: message.chars().take(160).collect(),
-        classifier_source: "work_session_chat_heuristic".to_string(),
+        classifier_source: classifier_source.to_string(),
         intent: intent.as_str().to_string(),
-        target: Some("meeting_work_session".to_string()),
+        target: Some(target_kind.to_string()),
         action: Some(intent.as_str().to_string()),
         tool_name: intent.primary_tool_name().map(str::to_string),
         extracted_params: Some(serde_json::json!({
             "intent": intent.as_str(),
+            "target_kind": target_kind,
+            "target_object_type": route
+                .target
+                .as_ref()
+                .and_then(|target| target.object_type.as_deref()),
+            "reason_code": route.reason_code.as_deref(),
             "metadata_only": true,
             "transcript_text_included": false,
             "screen_pixels_included": false,
         })),
-        confidence: Some(confidence),
+        confidence: Some(route.confidence),
         routed_to: "work_session_chat".to_string(),
         grounded: true,
         fallback_used: false,
@@ -669,11 +1939,120 @@ fn work_session_chat_route_diagnostic(
         approval_created: false,
         audit_expected: intent.primary_tool_name().is_some(),
         rationale: Some(
-            "common Meeting / Work Session chat command routed to governed meeting tools"
-                .to_string(),
+            "active-model tool router proposed a governed Work Session tool route".to_string(),
         ),
         error: None,
     }
+}
+
+fn build_assistant_context_with_work_session(
+    manifest: &CapabilityManifest,
+    runtime: &AssistantRuntime,
+) -> String {
+    let mut context = build_capability_context(manifest);
+    if let Some(work_session) = work_session_context_for_assistant(runtime) {
+        context.push_str("\n\nWork Session context (metadata only):\n");
+        if let Ok(rendered) = serde_json::to_string_pretty(&work_session) {
+            context.push_str(&rendered);
+        }
+    }
+    context
+}
+
+fn work_session_context_for_assistant(runtime: &AssistantRuntime) -> Option<serde_json::Value> {
+    let active_session = read_active_work_session_governed(runtime).ok().flatten();
+    let last_completed_state = read_last_completed_work_session_governed(runtime)
+        .ok()
+        .flatten();
+    let archived_sessions = list_archived_work_sessions_governed(runtime, 50).ok();
+    let latest_archived = archived_sessions
+        .as_ref()
+        .and_then(|response| response.sessions.first());
+    let state = if active_session.is_some() {
+        read_work_session_state_governed(runtime).ok()
+    } else {
+        last_completed_state.clone()
+    };
+    let capabilities = read_live_capabilities_governed(runtime).ok();
+    let stt_completeness = capabilities.as_ref().map(|capabilities| {
+        meeting::types::derive_meeting_stt_completeness(
+            &capabilities.system_capture_health,
+            &capabilities.microphone_capture_health,
+        )
+        .overall
+        .as_str()
+        .to_string()
+    });
+    Some(serde_json::json!({
+        "work_session_status": if active_session.is_some() {
+            "active"
+        } else if state.is_some() {
+            "last_completed_available"
+        } else if latest_archived.is_some() {
+            "latest_archived_available"
+        } else {
+            "none"
+        },
+        "work_session_available": true,
+        "active_session_present": active_session.is_some(),
+        "active_session_id": active_session.as_ref().map(|session| session.session_id.clone()),
+        "last_completed_present": last_completed_state.is_some(),
+        "last_completed_session_id": last_completed_state.as_ref().map(|state| state.session.session_id.clone()),
+        "latest_archived_present": latest_archived.is_some(),
+        "latest_archived_session_present": latest_archived.is_some(),
+        "latest_archived_session_id": latest_archived.map(|session| session.session_id.clone()),
+        "latest_archived_title": latest_archived.map(|session| session.title.clone()),
+        "latest_archived_started_at": latest_archived.map(|session| session.started_at),
+        "latest_archived_transcript_count": latest_archived.map(|session| session.transcript_count).unwrap_or(0),
+        "latest_archived_intelligence_present": latest_archived.is_some_and(|session| session.intelligence_present),
+        "latest_archived_screen_context_count": latest_archived.map(|session| session.screen_context_count).unwrap_or(0),
+        "latest_archived_stt_status": latest_archived.map(|session| session.stt_completeness_status.clone()).unwrap_or_else(|| "unknown".to_string()),
+        "last_work_session_reference": runtime.work_session_chat_memory().map(|memory| serde_json::json!({
+            "last_user_message_present": memory.last_user_message.is_some(),
+            "last_assistant_summary": memory.last_assistant_summary,
+            "last_route": "work_session_tool",
+            "last_intent": memory.last_intent.as_str(),
+            "last_target": memory.last_target,
+            "last_referenced_session_id": memory.last_referenced_session_id,
+            "last_referenced_session_title": memory.last_referenced_session_title,
+            "last_referenced_object_type": memory.last_referenced_object_type,
+            "last_referenced_object_ids": memory.last_referenced_object_ids.iter().take(12).collect::<Vec<_>>(),
+            "last_answer_kind": memory.last_answer_kind,
+            "last_evidence_count": memory.evidence.len(),
+            "last_screen_context_count": memory.last_screen_context_ids.len(),
+            "last_query_hash": memory.last_query_hash,
+            "last_response_had_details": memory.last_response_had_details,
+            "updated_at": memory.updated_at,
+        })),
+        "archived_session_count": archived_sessions.as_ref().map(|response| response.sessions.len()).unwrap_or(0),
+        "transcript_count": state.as_ref().map(|state| state.transcript.len()).unwrap_or_else(|| latest_archived.map(|session| session.transcript_count).unwrap_or(0)),
+        "transcript_count_current_or_latest": state.as_ref().map(|state| state.transcript.len()).unwrap_or_else(|| latest_archived.map(|session| session.transcript_count).unwrap_or(0)),
+        "stt_completeness": stt_completeness.unwrap_or_else(|| "unknown".to_string()),
+        "stt_completeness_status": latest_archived.map(|session| session.stt_completeness_status.clone()).unwrap_or_else(|| "unknown".to_string()),
+        "screen_context_count": state.as_ref().map(|state| state.screen_contexts.len()).unwrap_or_else(|| latest_archived.map(|session| session.screen_context_count).unwrap_or(0)),
+        "intelligence_present": state.as_ref().is_some_and(|state| state.intelligence.is_some()) || latest_archived.is_some_and(|session| session.intelligence_present),
+        "session_memory_available": true,
+        "recall_available": true,
+        "available_work_session_actions": [
+            "start_session",
+            "stop_session",
+            "generate_recap",
+            "generate_details",
+            "generate_technical_recap",
+            "generate_follow_up_draft",
+            "attach_current_screen",
+            "ask_session_memory",
+            "search_session_memory",
+            "show_evidence",
+            "show_session_status"
+        ],
+        "privacy": {
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "screen_pixels_included": false,
+            "generated_text_included": false
+        }
+    }))
 }
 
 fn default_chat_work_session_config() -> MeetingConfig {
@@ -801,6 +2180,16 @@ async fn generate_intelligence_from_chat(
     window: &WebviewWindow,
     runtime: &AssistantRuntime,
 ) -> Result<MeetingIntelligenceResult, String> {
+    if let Some(existing) = read_intelligence_governed(runtime)? {
+        return Ok(existing);
+    }
+
+    let state = read_current_or_last_work_session_state_governed(runtime)?
+        .ok_or_else(|| "no current or completed Work Session available".to_string())?;
+    if state.transcript.is_empty() {
+        return Err("meeting intelligence requires transcript evidence".to_string());
+    }
+
     let meeting = runtime.meeting_runtime.clone();
     let desktop_agent = runtime.desktop_agent.clone();
     let options = MeetingIntelligenceGenerationOptions::default();
@@ -834,6 +2223,607 @@ async fn generate_intelligence_from_chat(
     Ok(intelligence)
 }
 
+async fn recap_work_session_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+    route: &WorkSessionChatRoute,
+    message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    request_id: &str,
+) -> Result<String, String> {
+    match route_target_kind(route) {
+        WorkSessionTargetKind::ActiveSession => {
+            return summarize_active_transcript_from_chat(
+                Some(window),
+                runtime,
+                message,
+                source,
+                history,
+                route,
+                "recap_active_session",
+                true,
+                request_id,
+            )
+            .await;
+        }
+        WorkSessionTargetKind::LatestArchivedSession => {
+            return summarize_latest_archive_transcript_or_recap(
+                Some(window),
+                runtime,
+                message,
+                source,
+                history,
+                "recap_latest_archived_session",
+                request_id,
+            )
+            .await;
+        }
+        WorkSessionTargetKind::LastReferencedSession => {
+            return summarize_last_referenced_transcript_or_recap(
+                Some(window),
+                runtime,
+                message,
+                source,
+                history,
+                "recap_last_referenced_session",
+                request_id,
+            )
+            .await;
+        }
+        WorkSessionTargetKind::LastCompletedSession => {
+            if let Some(state) = read_last_completed_work_session_governed(runtime)? {
+                if runtime_state_has_transcript(&state) {
+                    return summarize_runtime_transcript_from_chat(
+                        Some(window),
+                        runtime,
+                        message,
+                        source,
+                        history,
+                        route,
+                        &state,
+                        None,
+                        "recap_last_completed_session",
+                        request_id,
+                    )
+                    .await;
+                }
+            }
+            return Ok("Non trovo transcript nella sessione completata piu recente.".to_string());
+        }
+        _ => {}
+    }
+
+    if let Some(state) = read_active_work_session_state_governed(runtime)? {
+        if runtime_state_has_transcript(&state) {
+            return summarize_runtime_transcript_from_chat(
+                Some(window),
+                runtime,
+                message,
+                source,
+                history,
+                route,
+                &state,
+                read_live_capabilities_governed(runtime).ok(),
+                "recap_active_session_default",
+                request_id,
+            )
+            .await;
+        }
+    }
+
+    if let Some(existing) = read_intelligence_governed(runtime)? {
+        runtime.remember_work_session_chat_memory(work_session_memory_from_intelligence(
+            WorkSessionChatIntent::GenerateIntelligence,
+            "recap_runtime_session",
+            &existing,
+            None,
+        ));
+        return Ok(render_intelligence_response(&existing));
+    }
+
+    if let Some(state) = read_current_or_last_work_session_state_governed(runtime)? {
+        if runtime_state_has_transcript(&state) {
+            let intelligence = generate_intelligence_from_chat(window, runtime).await?;
+            runtime.remember_work_session_chat_memory(work_session_memory_from_intelligence(
+                WorkSessionChatIntent::GenerateIntelligence,
+                "recap_runtime_session",
+                &intelligence,
+                None,
+            ));
+            return Ok(render_intelligence_response(&intelligence));
+        }
+    }
+
+    if let Ok(answer) = summarize_last_referenced_transcript_or_recap(
+        Some(window),
+        runtime,
+        message,
+        source,
+        history,
+        "recap_last_referenced_session_default",
+        request_id,
+    )
+    .await
+    {
+        return Ok(answer);
+    }
+    if let Ok(answer) = summarize_latest_archive_transcript_or_recap(
+        Some(window),
+        runtime,
+        message,
+        source,
+        history,
+        "recap_latest_archived_session_default",
+        request_id,
+    )
+    .await
+    {
+        return Ok(answer);
+    }
+    Ok("Non trovo transcript nella sessione corrente, ne sessioni archiviate con contenuti utilizzabili per un recap.".to_string())
+}
+
+async fn technical_recap_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+) -> Result<String, String> {
+    if let Some(existing) = read_intelligence_governed(runtime)? {
+        if existing.technical_recap.is_some() {
+            return Ok(render_technical_recap_response(&existing));
+        }
+    }
+
+    if let Some(state) = read_current_or_last_work_session_state_governed(runtime)? {
+        if !state.transcript.is_empty() {
+            let intelligence = generate_intelligence_from_chat(window, runtime).await?;
+            return Ok(render_technical_recap_response(&intelligence));
+        }
+    }
+
+    if let Some((item, archive)) = read_latest_archived_work_session_governed(runtime)? {
+        if let Some(intelligence) = archive_intelligence(&archive) {
+            if intelligence.technical_recap.is_some() {
+                return Ok(format!(
+                    "Recap tecnico dall'ultima Work Session archiviata: {}\n{}",
+                    item.title,
+                    render_technical_recap_response(intelligence)
+                ));
+            }
+        }
+    }
+
+    Ok("Non trovo un recap tecnico nella sessione corrente o nelle sessioni archiviate piu recenti.".to_string())
+}
+
+async fn details_work_session_from_chat(
+    window: &WebviewWindow,
+    runtime: &AssistantRuntime,
+    route: &WorkSessionChatRoute,
+    message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    request_id: &str,
+) -> Result<String, String> {
+    if matches!(
+        route_target_kind(route),
+        WorkSessionTargetKind::ActiveSession
+    ) {
+        return render_work_session_status(runtime);
+    }
+    if let Some((item, archive)) = read_last_referenced_archived_work_session_governed(runtime)? {
+        runtime.remember_work_session_chat_memory(work_session_memory_from_archive(
+            WorkSessionChatIntent::GenerateDetails,
+            "details_last_referenced_session",
+            &item,
+            &archive,
+            None,
+        ));
+        if archive_intelligence(&archive).is_none() && archive_has_transcript(&archive) {
+            return summarize_archive_transcript_from_chat(
+                Some(window),
+                runtime,
+                message,
+                source,
+                history,
+                &item,
+                &archive,
+                "details_last_referenced_session",
+                request_id,
+            )
+            .await;
+        }
+        return Ok(render_archive_details_response(&item, &archive));
+    }
+
+    render_work_session_status(runtime)
+}
+
+async fn transcript_summary_work_session_from_chat(
+    window: Option<&WebviewWindow>,
+    runtime: &AssistantRuntime,
+    route: &WorkSessionChatRoute,
+    message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    request_id: &str,
+) -> Result<String, String> {
+    match route_target_kind(route) {
+        WorkSessionTargetKind::ActiveSession => {
+            return summarize_active_transcript_from_chat(
+                window,
+                runtime,
+                message,
+                source,
+                history,
+                route,
+                "transcript_summary_active_session",
+                false,
+                request_id,
+            )
+            .await;
+        }
+        WorkSessionTargetKind::LatestArchivedSession => {
+            return match summarize_latest_archive_transcript_or_recap(
+                window,
+                runtime,
+                message,
+                source,
+                history,
+                "transcript_summary_latest_archived_session",
+                request_id,
+            )
+            .await
+            {
+                Ok(answer) => Ok(answer),
+                Err(_) => Ok("Non trovo una Work Session archiviata con transcript da analizzare. Se hai appena fermato una sessione, aspetta il completamento del drain STT e riprova.".to_string()),
+            };
+        }
+        WorkSessionTargetKind::LastReferencedSession => {
+            return match summarize_last_referenced_transcript_or_recap(
+                window,
+                runtime,
+                message,
+                source,
+                history,
+                "transcript_summary_last_referenced_session",
+                request_id,
+            )
+            .await
+            {
+                Ok(answer) => Ok(answer),
+                Err(_) => Ok("Non trovo il transcript della Work Session a cui ti riferivi. Dimmi se vuoi usare la sessione attiva o l'ultima archiviata.".to_string()),
+            };
+        }
+        WorkSessionTargetKind::LastCompletedSession => {
+            if let Some(state) = read_last_completed_work_session_governed(runtime)? {
+                if runtime_state_has_transcript(&state) {
+                    return summarize_runtime_transcript_from_chat(
+                        window,
+                        runtime,
+                        message,
+                        source,
+                        history,
+                        route,
+                        &state,
+                        None,
+                        "transcript_summary_last_completed_session",
+                        request_id,
+                    )
+                    .await;
+                }
+            }
+            return Ok("Non trovo transcript nella sessione completata piu recente.".to_string());
+        }
+        _ => {}
+    }
+
+    if let Some(session_id) = route_target_session_id(route) {
+        if let Some(active_state) = read_active_work_session_state_governed(runtime)? {
+            if active_state.session.session_id == session_id {
+                return summarize_runtime_transcript_from_chat(
+                    window,
+                    runtime,
+                    message,
+                    source,
+                    history,
+                    route,
+                    &active_state,
+                    read_live_capabilities_governed(runtime).ok(),
+                    "transcript_summary_target_session",
+                    request_id,
+                )
+                .await;
+            }
+        }
+        if let Some((item, archive)) =
+            read_archived_work_session_by_id_governed(runtime, session_id)?
+        {
+            return summarize_archive_transcript_from_chat(
+                window,
+                runtime,
+                message,
+                source,
+                history,
+                &item,
+                &archive,
+                "transcript_summary_target_archive",
+                request_id,
+            )
+            .await;
+        }
+    }
+
+    if let Some(state) = read_active_work_session_state_governed(runtime)? {
+        if runtime_state_has_transcript(&state) {
+            return summarize_runtime_transcript_from_chat(
+                window,
+                runtime,
+                message,
+                source,
+                history,
+                route,
+                &state,
+                read_live_capabilities_governed(runtime).ok(),
+                "transcript_summary_active_session_default",
+                request_id,
+            )
+            .await;
+        }
+    }
+
+    if let Ok(answer) = summarize_last_referenced_transcript_or_recap(
+        window,
+        runtime,
+        message,
+        source,
+        history,
+        "transcript_summary_last_referenced_session_default",
+        request_id,
+    )
+    .await
+    {
+        return Ok(answer);
+    }
+
+    if let Ok(answer) = summarize_latest_archive_transcript_or_recap(
+        window,
+        runtime,
+        message,
+        source,
+        history,
+        "transcript_summary_latest_archived_session_default",
+        request_id,
+    )
+    .await
+    {
+        return Ok(answer);
+    }
+
+    Ok(
+        "Non trovo transcript nella sessione attiva o in una Work Session archiviata da analizzare. Se la sessione e appena iniziata, attendi i primi segmenti STT e riprova."
+            .to_string(),
+    )
+}
+
+async fn summarize_active_transcript_from_chat(
+    window: Option<&WebviewWindow>,
+    runtime: &AssistantRuntime,
+    message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    route: &WorkSessionChatRoute,
+    answer_kind: &str,
+    allow_intelligence: bool,
+    request_id: &str,
+) -> Result<String, String> {
+    let Some(state) = read_active_work_session_state_governed(runtime)? else {
+        return Ok("Non c'e una Work Session attiva da riassumere.".to_string());
+    };
+    if !runtime_state_has_transcript(&state) {
+        return Ok(format!(
+            "Fonte: sessione attiva\nLa Work Session attiva ({}) non contiene ancora segmenti transcript utilizzabili. Se la cattura e appena partita, attendi il completamento dei primi segmenti STT.",
+            short_session_id(&state.session.session_id)
+        ));
+    }
+    if allow_intelligence {
+        if let Some(existing) = read_intelligence_governed(runtime)? {
+            if existing.session_id == state.session.session_id {
+                runtime.remember_work_session_chat_memory(work_session_memory_from_intelligence(
+                    WorkSessionChatIntent::GenerateIntelligence,
+                    answer_kind,
+                    &existing,
+                    Some(message.to_string()),
+                ));
+                return Ok(format!(
+                    "Fonte: sessione attiva\n{}",
+                    render_intelligence_response(&existing)
+                ));
+            }
+        }
+    }
+    summarize_runtime_transcript_from_chat(
+        window,
+        runtime,
+        message,
+        source,
+        history,
+        route,
+        &state,
+        read_live_capabilities_governed(runtime).ok(),
+        answer_kind,
+        request_id,
+    )
+    .await
+}
+
+async fn summarize_last_referenced_transcript_or_recap(
+    window: Option<&WebviewWindow>,
+    runtime: &AssistantRuntime,
+    message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    answer_kind: &str,
+    request_id: &str,
+) -> Result<String, String> {
+    if let Some(memory) = runtime.work_session_chat_memory() {
+        if let Some(session_id) = memory.last_referenced_session_id.as_deref() {
+            if let Some(active_state) = read_active_work_session_state_governed(runtime)? {
+                if active_state.session.session_id == session_id
+                    && runtime_state_has_transcript(&active_state)
+                {
+                    let route = WorkSessionChatRoute {
+                        intent: WorkSessionChatIntent::GenerateTranscriptSummary,
+                        confidence: 1.0,
+                        target: Some(WorkSessionExecutionTarget {
+                            kind: WorkSessionTargetKind::ActiveSession,
+                            session_id: Some(session_id.to_string()),
+                            object_type: Some("transcript".to_string()),
+                            object_ids: Vec::new(),
+                        }),
+                        query: Some(message.to_string()),
+                        reason_code: Some("last_referenced_active_session".to_string()),
+                    };
+                    return summarize_runtime_transcript_from_chat(
+                        window,
+                        runtime,
+                        message,
+                        source,
+                        history,
+                        &route,
+                        &active_state,
+                        read_live_capabilities_governed(runtime).ok(),
+                        answer_kind,
+                        request_id,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    let Some((item, archive)) = read_last_referenced_archived_work_session_governed(runtime)?
+    else {
+        return Err("no last referenced archived session".to_string());
+    };
+    if answer_kind.starts_with("recap")
+        && archived_session_has_recap_content(&archive)
+        && archive_intelligence(&archive).is_some()
+    {
+        runtime.remember_work_session_chat_memory(work_session_memory_from_archive(
+            WorkSessionChatIntent::GenerateIntelligence,
+            answer_kind,
+            &item,
+            &archive,
+            Some(message.to_string()),
+        ));
+        return Ok(render_archive_recap_response(&item, &archive));
+    }
+    summarize_archive_transcript_from_chat(
+        window,
+        runtime,
+        message,
+        source,
+        history,
+        &item,
+        &archive,
+        answer_kind,
+        request_id,
+    )
+    .await
+}
+
+async fn summarize_latest_archive_transcript_or_recap(
+    window: Option<&WebviewWindow>,
+    runtime: &AssistantRuntime,
+    message: &str,
+    source: &str,
+    history: &[ConversationMessage],
+    answer_kind: &str,
+    request_id: &str,
+) -> Result<String, String> {
+    let Some((item, archive)) = read_latest_archived_work_session_governed(runtime)? else {
+        return Err("no latest archived session".to_string());
+    };
+    if answer_kind.starts_with("recap")
+        && archived_session_has_recap_content(&archive)
+        && archive_intelligence(&archive).is_some()
+    {
+        runtime.remember_work_session_chat_memory(work_session_memory_from_archive(
+            WorkSessionChatIntent::GenerateIntelligence,
+            answer_kind,
+            &item,
+            &archive,
+            Some(message.to_string()),
+        ));
+        return Ok(render_archive_recap_response(&item, &archive));
+    }
+    summarize_archive_transcript_from_chat(
+        window,
+        runtime,
+        message,
+        source,
+        history,
+        &item,
+        &archive,
+        answer_kind,
+        request_id,
+    )
+    .await
+}
+
+async fn summarize_runtime_transcript_from_chat(
+    window: Option<&WebviewWindow>,
+    runtime: &AssistantRuntime,
+    message: &str,
+    source: &str,
+    _history: &[ConversationMessage],
+    route: &WorkSessionChatRoute,
+    state: &MeetingSessionState,
+    capabilities: Option<MeetingLiveCapabilitySnapshot>,
+    answer_kind: &str,
+    request_id: &str,
+) -> Result<String, String> {
+    let packet = build_runtime_transcript_evidence_packet(
+        route.intent,
+        route_target_kind(route),
+        state,
+        capabilities.as_ref(),
+    );
+    runtime.remember_work_session_chat_memory(work_session_memory_from_runtime_transcript_packet(
+        route.intent,
+        answer_kind,
+        state,
+        &packet,
+        Some(message.to_string()),
+    ));
+    if packet.evidence_items.is_empty() {
+        return Ok(format!(
+            "Fonte: {}\nLa Work Session {} non contiene segmenti transcript utilizzabili per un riassunto.",
+            evidence_source_label(&packet),
+            short_session_id(&state.session.session_id)
+        )
+        );
+    }
+    let synthesis =
+        synthesize_tool_answer_from_evidence(window, source, message, &packet, Some(request_id))
+            .await;
+    if let Some(answer) = synthesis.answer {
+        if let Some(output) = synthesis.output.as_ref() {
+            runtime.remember_tool_result_frame(tool_result_frame_from_evidence_packet(
+                &packet,
+                answer_kind,
+                &answer,
+                output,
+            ));
+        }
+        return Ok(answer);
+    }
+    Ok(render_extractive_transcript_summary_with_reason(
+        &packet,
+        synthesis.failure_reason.as_deref(),
+    ))
+}
+
 fn meeting_intelligence_chat_params(
     use_local_llm: bool,
     max_transcript_segments: usize,
@@ -863,6 +2853,29 @@ async fn generate_followup_from_chat(
     window: &WebviewWindow,
     runtime: &AssistantRuntime,
 ) -> Result<String, String> {
+    if let Some(existing) = read_intelligence_governed(runtime)? {
+        if let Some(draft) = existing.follow_up_draft.as_ref() {
+            return Ok(render_followup_draft_response(draft));
+        }
+    }
+
+    let has_runtime_transcript = read_current_or_last_work_session_state_governed(runtime)?
+        .is_some_and(|state| !state.transcript.is_empty());
+    if !has_runtime_transcript {
+        if let Some((item, archive)) = read_latest_archived_work_session_governed(runtime)? {
+            if let Some(draft) =
+                archive_intelligence(&archive).and_then(|value| value.follow_up_draft.as_ref())
+            {
+                return Ok(format!(
+                    "Bozza di follow-up dall'ultima Work Session archiviata: {}\n{}",
+                    item.title,
+                    render_followup_draft_response(draft)
+                ));
+            }
+        }
+        return Ok("Non trovo una bozza di follow-up nella sessione corrente o nell'ultima sessione archiviata. Non invio email automaticamente.".to_string());
+    }
+
     let meeting = runtime.meeting_runtime.clone();
     let desktop_agent = runtime.desktop_agent.clone();
     let value = desktop_agent
@@ -902,10 +2915,7 @@ async fn generate_followup_from_chat(
         ],
     );
     Ok(match draft {
-        Some(draft) => format!(
-            "Ho preparato una bozza di follow-up, solo da copiare: {}\n\n{}",
-            draft.subject, draft.body
-        ),
+        Some(draft) => render_followup_draft_response(&draft),
         None => "Non ho trovato evidenze sufficienti per una bozza di follow-up.".to_string(),
     })
 }
@@ -913,9 +2923,19 @@ async fn generate_followup_from_chat(
 async fn attach_screen_context_from_chat(
     window: &WebviewWindow,
     runtime: &AssistantRuntime,
+    route: &WorkSessionChatRoute,
 ) -> Result<String, String> {
+    let target_kind = route_target_kind(route);
+    if matches!(
+        target_kind,
+        WorkSessionTargetKind::ActiveSession | WorkSessionTargetKind::None
+    ) && read_active_work_session_governed(runtime)?.is_none()
+    {
+        return Ok("Non c'e una Work Session attiva a cui allegare lo schermo.".to_string());
+    }
+    let session_id = route_target_session_id(route).map(str::to_string);
     let request = MeetingScreenContextAttachRequest {
-        session_id: None,
+        session_id,
         store_screenshot: false,
         capture_fresh: true,
         attachment_mode: Default::default(),
@@ -958,7 +2978,7 @@ async fn attach_screen_context_from_chat(
         ],
     );
     Ok(format!(
-        "Ho allegato lo schermo corrente alla sessione.\nSummary: {}\nEvidenze collegate: {} segmenti transcript.",
+        "Ho allegato lo schermo corrente alla sessione attiva.\nSummary: {}\nEvidenze collegate: {} segmenti transcript.",
         response.context.summary,
         response.context.linked_transcript_segment_ids.len()
     ))
@@ -1014,7 +3034,181 @@ async fn answer_recall_from_chat(
         )
         .await?;
     let response: MeetingRecallResponse = meeting_from_value(value)?;
+    runtime.remember_work_session_chat_memory(work_session_memory_from_recall(message, &response));
     Ok(render_recall_response(&response))
+}
+
+fn work_session_memory_from_recall(
+    query: &str,
+    response: &MeetingRecallResponse,
+) -> WorkSessionChatMemory {
+    let first_session = response
+        .evidence
+        .first()
+        .map(|evidence| (evidence.session_id.clone(), evidence.session_title.clone()))
+        .or_else(|| {
+            response
+                .sessions
+                .first()
+                .map(|session| (session.session_id.clone(), session.title.clone()))
+        });
+    let evidence = response
+        .evidence
+        .iter()
+        .take(8)
+        .map(|item| WorkSessionChatEvidenceMemory {
+            session_id: item.session_id.clone(),
+            session_title: item.session_title.clone(),
+            matched_kind: item.matched_kind.clone(),
+            snippet: bounded_text(&item.snippet, 360),
+            evidence_segment_ids: item.evidence_segment_ids.clone(),
+            screen_context_ids: item.screen_context_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    let last_screen_context_ids = collect_work_session_memory_screen_context_ids(&evidence);
+    let last_referenced_object_ids = collect_work_session_memory_object_ids(&evidence);
+    let last_referenced_object_type = work_session_memory_object_type(
+        WorkSessionChatIntent::RecallSessionMemory,
+        "recall",
+        &evidence,
+    );
+    let referenced_title = first_session.as_ref().map(|(_, title)| title.as_str());
+    WorkSessionChatMemory {
+        last_user_message: Some(bounded_text(query, 240)),
+        last_assistant_summary: Some(work_session_memory_assistant_summary(
+            "recall",
+            referenced_title,
+        )),
+        last_intent: WorkSessionChatIntent::RecallSessionMemory,
+        last_target: "archived_sessions".to_string(),
+        last_referenced_session_id: first_session
+            .as_ref()
+            .map(|(session_id, _)| session_id.clone()),
+        last_referenced_session_title: first_session.map(|(_, title)| title),
+        last_referenced_object_type,
+        last_referenced_object_ids,
+        last_answer_kind: "recall".to_string(),
+        last_query: Some(query.to_string()),
+        last_query_hash: Some(sha256_hex(query)),
+        evidence,
+        last_screen_context_ids,
+        last_response_had_details: false,
+        updated_at: Utc::now(),
+    }
+}
+
+fn collect_work_session_memory_screen_context_ids(
+    evidence: &[WorkSessionChatEvidenceMemory],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in evidence
+        .iter()
+        .flat_map(|item| item.screen_context_ids.iter())
+    {
+        if ids.len() >= 12 {
+            break;
+        }
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
+fn collect_work_session_memory_object_ids(
+    evidence: &[WorkSessionChatEvidenceMemory],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in evidence.iter().flat_map(|item| {
+        item.evidence_segment_ids
+            .iter()
+            .chain(item.screen_context_ids.iter())
+    }) {
+        if ids.len() >= 12 {
+            break;
+        }
+        if !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
+fn work_session_memory_object_type(
+    intent: WorkSessionChatIntent,
+    answer_kind: &str,
+    evidence: &[WorkSessionChatEvidenceMemory],
+) -> Option<String> {
+    let object_type = match intent {
+        WorkSessionChatIntent::GenerateTranscriptSummary => "transcript",
+        WorkSessionChatIntent::GenerateIntelligence
+        | WorkSessionChatIntent::GenerateTechnicalRecap
+        | WorkSessionChatIntent::StopAndGenerateRecap => "recap",
+        WorkSessionChatIntent::GenerateDetails | WorkSessionChatIntent::ShowSessionStatus => {
+            "details"
+        }
+        WorkSessionChatIntent::ShowEvidence | WorkSessionChatIntent::RecallSessionMemory => {
+            "evidence"
+        }
+        WorkSessionChatIntent::AttachScreenContext => "screen_context",
+        _ if answer_kind.contains("transcript") => "transcript",
+        _ if evidence
+            .iter()
+            .any(|item| item.matched_kind == "transcript") =>
+        {
+            "transcript"
+        }
+        _ => return None,
+    };
+    Some(object_type.to_string())
+}
+
+fn work_session_memory_assistant_summary(answer_kind: &str, title: Option<&str>) -> String {
+    match title {
+        Some(title) if !title.trim().is_empty() => {
+            format!("Answered Work Session {answer_kind} for {title}")
+        }
+        _ => format!("Answered Work Session {answer_kind}"),
+    }
+}
+
+fn show_work_session_evidence_from_chat(runtime: &AssistantRuntime) -> Result<String, String> {
+    let Some(memory) = runtime.work_session_chat_memory() else {
+        return Ok("Vuoi vedere le evidenze di quale sessione o domanda? Puoi chiedere, per esempio: mostrami le evidenze dell'ultima Work Session.".to_string());
+    };
+    if memory.evidence.is_empty() {
+        return Ok("Non ho evidenze specifiche gia pronte per l'ultimo riferimento Work Session. Posso aprire i dettagli o cercare nella memoria se mi dai una parola chiave.".to_string());
+    }
+    let mut lines = vec![format!(
+        "Evidenze per {}:",
+        memory
+            .last_referenced_session_title
+            .as_deref()
+            .unwrap_or("l'ultimo riferimento Work Session")
+    )];
+    for item in memory.evidence.iter().take(6) {
+        let mut suffix = Vec::new();
+        if !item.evidence_segment_ids.is_empty() {
+            suffix.push(format!("segmenti: {}", item.evidence_segment_ids.len()));
+        }
+        if !item.screen_context_ids.is_empty() {
+            suffix.push(format!("screen context: {}", item.screen_context_ids.len()));
+        }
+        lines.push(format!(
+            "- {} ({}) / {}: {}{}",
+            item.session_title,
+            short_session_id(&item.session_id),
+            item.matched_kind,
+            item.snippet,
+            if suffix.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", suffix.join(", "))
+            }
+        ));
+    }
+    lines.push("[Apri dettagli]".to_string());
+    Ok(lines.join("\n"))
 }
 
 fn search_session_memory_from_chat(
@@ -1133,6 +3327,41 @@ fn read_last_completed_work_session_governed(
     meeting_from_value(value)
 }
 
+fn read_current_or_last_work_session_state_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<MeetingSessionState>, String> {
+    if read_active_work_session_governed(runtime)?.is_some() {
+        return read_work_session_state_governed(runtime).map(Some);
+    }
+    read_last_completed_work_session_governed(runtime)
+}
+
+fn read_intelligence_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<MeetingIntelligenceResult>, String> {
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.intelligence.read",
+        serde_json::json!({
+            "read": "meeting_intelligence",
+            "data_category": "meeting_intelligence",
+            "chat_initiated": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_intelligence()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
 fn read_live_capabilities_governed(
     runtime: &AssistantRuntime,
 ) -> Result<MeetingLiveCapabilitySnapshot, String> {
@@ -1157,6 +3386,161 @@ fn read_live_capabilities_governed(
     meeting_from_value(value)
 }
 
+fn list_archived_work_sessions_governed(
+    runtime: &AssistantRuntime,
+    limit: usize,
+) -> Result<MeetingSessionListResponse, String> {
+    let request = MeetingSessionListRequest {
+        limit,
+        cursor: None,
+        date_from: None,
+        date_to: None,
+        has_intelligence: None,
+        query: None,
+    };
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.sessions.list",
+        serde_json::json!({
+            "limit": request.limit,
+            "cursor_present": false,
+            "date_from_present": false,
+            "date_to_present": false,
+            "has_intelligence": request.has_intelligence,
+            "query_length": 0,
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+            "chat_initiated": true,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .list_archived_sessions(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+fn read_archived_work_session_governed(
+    runtime: &AssistantRuntime,
+    session_id: &str,
+) -> Result<MeetingSessionArchiveDocument, String> {
+    let request = MeetingSessionReadRequest {
+        session_id: session_id.to_string(),
+        include_transcript: true,
+        include_intelligence: true,
+        include_diagnostics: true,
+    };
+    let meeting = runtime.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        runtime,
+        "meeting.session.archive.read",
+        serde_json::json!({
+            "session_id": session_id,
+            "include_transcript": true,
+            "include_intelligence": true,
+            "include_diagnostics": true,
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "generated_text_included": false,
+            "chat_initiated": true,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_archived_session(request)
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    let response: MeetingSessionReadResponse = meeting_from_value(value)?;
+    Ok(response.archive)
+}
+
+fn read_latest_archived_work_session_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<(MeetingSessionListItem, MeetingSessionArchiveDocument)>, String> {
+    let mut response = list_archived_work_sessions_governed(runtime, 1)?;
+    let Some(item) = response.sessions.pop() else {
+        return Ok(None);
+    };
+    let archive = read_archived_work_session_governed(runtime, &item.session_id)?;
+    Ok(Some((item, archive)))
+}
+
+fn read_last_referenced_archived_work_session_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<(MeetingSessionListItem, MeetingSessionArchiveDocument)>, String> {
+    let Some(session_id) = runtime
+        .work_session_chat_memory()
+        .and_then(|memory| memory.last_referenced_session_id)
+    else {
+        return Ok(None);
+    };
+    let response = list_archived_work_sessions_governed(runtime, 100)?;
+    let Some(item) = response
+        .sessions
+        .into_iter()
+        .find(|item| item.session_id == session_id)
+    else {
+        return Ok(None);
+    };
+    let archive = read_archived_work_session_governed(runtime, &item.session_id)?;
+    Ok(Some((item, archive)))
+}
+
+fn read_archived_work_session_by_id_governed(
+    runtime: &AssistantRuntime,
+    session_id: &str,
+) -> Result<Option<(MeetingSessionListItem, MeetingSessionArchiveDocument)>, String> {
+    let response = list_archived_work_sessions_governed(runtime, 200)?;
+    let Some(item) = response
+        .sessions
+        .into_iter()
+        .find(|item| item.session_id == session_id)
+    else {
+        return Ok(None);
+    };
+    let archive = read_archived_work_session_governed(runtime, &item.session_id)?;
+    Ok(Some((item, archive)))
+}
+
+fn read_active_work_session_state_governed(
+    runtime: &AssistantRuntime,
+) -> Result<Option<MeetingSessionState>, String> {
+    if read_active_work_session_governed(runtime)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(read_work_session_state_governed(runtime)?))
+}
+
+fn route_target_kind(route: &WorkSessionChatRoute) -> WorkSessionTargetKind {
+    route
+        .target
+        .as_ref()
+        .map(|target| target.kind)
+        .unwrap_or(WorkSessionTargetKind::None)
+}
+
+fn route_target_session_id(route: &WorkSessionChatRoute) -> Option<&str> {
+    route
+        .target
+        .as_ref()
+        .and_then(|target| target.session_id.as_deref())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn runtime_state_has_transcript(state: &MeetingSessionState) -> bool {
+    state
+        .transcript
+        .iter()
+        .any(|entry| !entry.text.trim().is_empty())
+}
+
 fn render_work_session_status(runtime: &AssistantRuntime) -> Result<String, String> {
     let active_session = read_active_work_session_governed(runtime)?;
     let state = if active_session.is_some() {
@@ -1166,7 +3550,19 @@ fn render_work_session_status(runtime: &AssistantRuntime) -> Result<String, Stri
     };
     let capabilities = read_live_capabilities_governed(runtime)?;
     let Some(state) = state else {
-        return Ok("Nessuna Work Session attiva o archiviata in questa esecuzione.".to_string());
+        if let Some((item, archive)) = read_latest_archived_work_session_governed(runtime)? {
+            runtime.remember_work_session_chat_memory(work_session_memory_from_archive(
+                WorkSessionChatIntent::GenerateDetails,
+                "details_latest_archived_session",
+                &item,
+                &archive,
+                None,
+            ));
+            return Ok(render_archive_details_response(&item, &archive));
+        }
+        return Ok(
+            "Nessuna Work Session attiva o archiviata con contenuti utilizzabili.".to_string(),
+        );
     };
     let metrics = &capabilities.capture_health.metrics;
     let status = if active_session.is_some() {
@@ -1177,16 +3573,1482 @@ fn render_work_session_status(runtime: &AssistantRuntime) -> Result<String, Stri
             meeting_status_label(&state.status)
         )
     };
-    Ok(format!(
-        "Work Session: {status}\nTranscript: {} entrate\nSTT: {}/{} trascritti, queue {}, in-flight {}\nScreen contexts: {}\nIntelligence: {}",
-        state.transcript.len(),
-        metrics.segments_transcribed,
-        metrics.segments_written,
-        metrics.current_queue_depth,
-        metrics.segments_in_flight,
-        state.screen_contexts.len(),
-        if state.intelligence.is_some() { "generata" } else { "non generata" }
+    let mut lines = vec![
+        format!("Work Session: {status}"),
+        format!("Transcript: {} entrate", state.transcript.len()),
+        format!(
+            "STT: {}/{} trascritti, queue {}, in-flight {}",
+            metrics.segments_transcribed,
+            metrics.segments_written,
+            metrics.current_queue_depth,
+            metrics.segments_in_flight
+        ),
+        format!("Screen contexts: {}", state.screen_contexts.len()),
+        format!(
+            "Intelligence: {}",
+            if state.intelligence.is_some() {
+                "generata"
+            } else {
+                "non generata"
+            }
+        ),
+    ];
+    if let Some(intelligence) = state.intelligence.as_ref() {
+        if let Some(summary) = intelligence.summary.as_ref() {
+            lines.push(format!("Summary: {}", summary.text));
+        }
+        lines.push(format!(
+            "Decisioni: {}; action item: {}; domande aperte: {}; rischi: {}",
+            intelligence.decisions.len(),
+            intelligence.action_items.len(),
+            intelligence.open_questions.len(),
+            intelligence.risks.len()
+        ));
+    }
+    runtime.remember_work_session_chat_memory(work_session_memory_from_runtime_state(
+        WorkSessionChatIntent::ShowSessionStatus,
+        if active_session.is_some() {
+            "status_active_session"
+        } else {
+            "status_last_completed_session"
+        },
+        &state,
+    ));
+    lines.push("[Apri dettagli]".to_string());
+    Ok(lines.join("\n"))
+}
+
+fn archive_intelligence(
+    archive: &MeetingSessionArchiveDocument,
+) -> Option<&MeetingIntelligenceResult> {
+    archive
+        .state
+        .intelligence
+        .as_ref()
+        .or(archive.exported.intelligence.as_ref())
+}
+
+fn archived_session_has_recap_content(archive: &MeetingSessionArchiveDocument) -> bool {
+    archive_intelligence(archive).is_some()
+        || !archive.state.transcript.is_empty()
+        || !archive.exported.transcript.is_empty()
+}
+
+fn archive_has_transcript(archive: &MeetingSessionArchiveDocument) -> bool {
+    !archive.state.transcript.is_empty() || !archive.exported.transcript.is_empty()
+}
+
+fn archive_transcript_entries(archive: &MeetingSessionArchiveDocument) -> Vec<&TranscriptEntry> {
+    let transcript = if !archive.state.transcript.is_empty() {
+        &archive.state.transcript
+    } else {
+        &archive.exported.transcript
+    };
+    transcript.iter().collect()
+}
+
+async fn summarize_archive_transcript_from_chat(
+    window: Option<&WebviewWindow>,
+    runtime: &AssistantRuntime,
+    message: &str,
+    source: &str,
+    _history: &[ConversationMessage],
+    item: &MeetingSessionListItem,
+    archive: &MeetingSessionArchiveDocument,
+    answer_kind: &str,
+    request_id: &str,
+) -> Result<String, String> {
+    let packet = build_archive_transcript_evidence_packet(item, archive);
+    runtime.remember_work_session_chat_memory(work_session_memory_from_archive(
+        WorkSessionChatIntent::GenerateTranscriptSummary,
+        answer_kind,
+        item,
+        archive,
+        Some(message.to_string()),
+    ));
+    if packet.evidence_items.is_empty() {
+        return Ok(format!(
+            "Ho trovato la Work Session {}, ma non contiene segmenti transcript utilizzabili per un riassunto.",
+            item.title
+        ));
+    }
+    let synthesis =
+        synthesize_tool_answer_from_evidence(window, source, message, &packet, Some(request_id))
+            .await;
+    if let Some(answer) = synthesis.answer {
+        if let Some(output) = synthesis.output.as_ref() {
+            runtime.remember_tool_result_frame(tool_result_frame_from_evidence_packet(
+                &packet,
+                answer_kind,
+                &answer,
+                output,
+            ));
+        }
+        return Ok(answer);
+    }
+    Ok(render_extractive_transcript_summary_with_reason(
+        &packet,
+        synthesis.failure_reason.as_deref(),
     ))
+}
+
+fn build_archive_transcript_evidence_packet(
+    item: &MeetingSessionListItem,
+    archive: &MeetingSessionArchiveDocument,
+) -> AssistantToolEvidencePacket {
+    const MAX_TRANSCRIPT_SEGMENTS: usize = 12;
+    const MAX_CHARS_PER_SEGMENT: usize = 700;
+    const MAX_TOTAL_CHARS: usize = 6000;
+
+    let mut evidence_items = Vec::new();
+    let mut total_chars = 0usize;
+    for (index, entry) in archive_transcript_entries(archive)
+        .into_iter()
+        .filter(|entry| !entry.text.trim().is_empty())
+        .enumerate()
+    {
+        if evidence_items.len() >= MAX_TRANSCRIPT_SEGMENTS || total_chars >= MAX_TOTAL_CHARS {
+            break;
+        }
+        let remaining = MAX_TOTAL_CHARS.saturating_sub(total_chars);
+        if remaining == 0 {
+            break;
+        }
+        let max_chars = MAX_CHARS_PER_SEGMENT.min(remaining);
+        let text = bounded_text(&entry.text, max_chars);
+        total_chars += text.chars().count();
+        evidence_items.push(AssistantToolEvidenceItem {
+            evidence_id: if entry.segment_id.trim().is_empty() {
+                format!("transcript-{}", index + 1)
+            } else {
+                format!("segment:{}", entry.segment_id)
+            },
+            kind: "transcript".to_string(),
+            timestamp: Some(entry.timestamp.to_rfc3339()),
+            speaker: Some(entry.speaker_display_name().to_string()),
+            text,
+            relation: Some("bounded_transcript_segment".to_string()),
+        });
+    }
+
+    let transcript_count = archive
+        .state
+        .transcript
+        .len()
+        .max(archive.exported.transcript.len())
+        .max(item.transcript_count);
+    let screen_context_count = archive
+        .screen_contexts
+        .len()
+        .max(archive.state.screen_contexts.len())
+        .max(archive.exported.screen_contexts.len())
+        .max(item.screen_context_count);
+    let mut warnings = Vec::new();
+    if item.stt_completeness_status != "complete" {
+        warnings.push(format!(
+            "STT completeness: {}{}",
+            item.stt_completeness_status,
+            if item.stt_completeness_detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", item.stt_completeness_detail)
+            }
+        ));
+    }
+    if transcript_count > evidence_items.len() {
+        warnings.push(format!(
+            "Evidence packet bounded to {} of {} transcript entries.",
+            evidence_items.len(),
+            transcript_count
+        ));
+    }
+
+    AssistantToolEvidencePacket {
+        tool_name: "work_session.transcript_summary".to_string(),
+        target: ToolTarget {
+            kind: "latest_archived_session".to_string(),
+            session_id: Some(item.session_id.clone()),
+            object_type: Some("transcript".to_string()),
+            object_ids: evidence_items
+                .iter()
+                .map(|item| item.evidence_id.clone())
+                .collect(),
+        },
+        source_kind: "session_archive_transcript".to_string(),
+        session_id: Some(item.session_id.clone()),
+        title: Some(item.title.clone()),
+        metadata: serde_json::json!({
+            "session_id_short": short_session_id(&item.session_id),
+            "title": item.title,
+            "started_at": item.started_at,
+            "ended_at": item.ended_at,
+            "transcript_count": transcript_count,
+            "included_transcript_count": evidence_items.len(),
+            "screen_context_count": screen_context_count,
+            "stt_completeness_status": item.stt_completeness_status,
+            "stt_completeness_detail_present": !item.stt_completeness_detail.trim().is_empty(),
+            "metadata_only": true,
+        }),
+        evidence_items,
+        warnings,
+    }
+}
+
+fn build_runtime_transcript_evidence_packet(
+    intent: WorkSessionChatIntent,
+    target_kind: WorkSessionTargetKind,
+    state: &MeetingSessionState,
+    capabilities: Option<&MeetingLiveCapabilitySnapshot>,
+) -> AssistantToolEvidencePacket {
+    const MAX_TRANSCRIPT_SEGMENTS: usize = 12;
+    const MAX_CHARS_PER_SEGMENT: usize = 700;
+    const MAX_TOTAL_CHARS: usize = 6000;
+
+    let mut evidence_items = Vec::new();
+    let mut total_chars = 0usize;
+    for (index, entry) in state
+        .transcript
+        .iter()
+        .filter(|entry| !entry.text.trim().is_empty())
+        .enumerate()
+    {
+        if evidence_items.len() >= MAX_TRANSCRIPT_SEGMENTS || total_chars >= MAX_TOTAL_CHARS {
+            break;
+        }
+        let remaining = MAX_TOTAL_CHARS.saturating_sub(total_chars);
+        if remaining == 0 {
+            break;
+        }
+        let max_chars = MAX_CHARS_PER_SEGMENT.min(remaining);
+        let text = bounded_text(&entry.text, max_chars);
+        total_chars += text.chars().count();
+        evidence_items.push(AssistantToolEvidenceItem {
+            evidence_id: if entry.segment_id.trim().is_empty() {
+                format!("active-transcript-{}", index + 1)
+            } else {
+                format!("segment:{}", entry.segment_id)
+            },
+            kind: "transcript".to_string(),
+            timestamp: Some(entry.timestamp.to_rfc3339()),
+            speaker: Some(entry.speaker_display_name().to_string()),
+            text,
+            relation: Some("bounded_active_transcript_segment".to_string()),
+        });
+    }
+
+    let transcript_count = state.transcript.len();
+    let screen_context_count = state.screen_contexts.len();
+    let active = matches!(
+        state.session.status,
+        MeetingStatus::Capturing
+            | MeetingStatus::Transcribing
+            | MeetingStatus::Starting
+            | MeetingStatus::Ready
+            | MeetingStatus::Paused
+    ) || state.session.capture_active;
+    let mut warnings = Vec::new();
+    if active || matches!(target_kind, WorkSessionTargetKind::ActiveSession) {
+        warnings.push(
+            "La sessione e ancora attiva: il recap usa solo il transcript disponibile ora."
+                .to_string(),
+        );
+    }
+    if transcript_count > evidence_items.len() {
+        warnings.push(format!(
+            "Evidence packet bounded to {} of {} transcript entries.",
+            evidence_items.len(),
+            transcript_count
+        ));
+    }
+
+    let stt_report = capabilities.map(|capabilities| {
+        derive_meeting_stt_completeness(
+            &capabilities.system_capture_health,
+            &capabilities.microphone_capture_health,
+        )
+    });
+    if let Some(report) = stt_report.as_ref() {
+        if report.overall.is_incomplete() {
+            warnings.push(format!(
+                "STT completeness: {}; queue {}; in-flight {}; transcribed {}/{}.",
+                report.overall.as_str(),
+                report.current_queue_depth,
+                report.segments_in_flight,
+                report.segments_transcribed,
+                report.segments_written
+            ));
+        }
+    } else if matches!(target_kind, WorkSessionTargetKind::ActiveSession) {
+        warnings.push("Metriche STT live non disponibili per la sessione attiva.".to_string());
+    }
+
+    let source_kind = if matches!(target_kind, WorkSessionTargetKind::ActiveSession) || active {
+        "active_session_transcript"
+    } else {
+        "last_completed_session_transcript"
+    };
+    let tool_name = match intent {
+        WorkSessionChatIntent::GenerateIntelligence => "work_session.recap",
+        WorkSessionChatIntent::GenerateDetails => "work_session.details",
+        _ => "work_session.transcript_summary",
+    };
+    let title = format!(
+        "Work Session {}",
+        short_session_id(&state.session.session_id)
+    );
+    let stt_metadata = stt_report
+        .as_ref()
+        .map(|report| {
+            serde_json::json!({
+                "status": report.overall.as_str(),
+                "segments_written": report.segments_written,
+                "segments_transcribed": report.segments_transcribed,
+                "current_queue_depth": report.current_queue_depth,
+                "segments_in_flight": report.segments_in_flight,
+                "segments_failed": report.segments_failed,
+                "timeouts": report.timeouts,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!(null));
+
+    AssistantToolEvidencePacket {
+        tool_name: tool_name.to_string(),
+        target: ToolTarget {
+            kind: target_kind.as_str().to_string(),
+            session_id: Some(state.session.session_id.clone()),
+            object_type: Some("transcript".to_string()),
+            object_ids: evidence_items
+                .iter()
+                .map(|item| item.evidence_id.clone())
+                .collect(),
+        },
+        source_kind: source_kind.to_string(),
+        session_id: Some(state.session.session_id.clone()),
+        title: Some(title),
+        metadata: serde_json::json!({
+            "session_id_short": short_session_id(&state.session.session_id),
+            "status": meeting_status_label(&state.session.status),
+            "capture_active": state.session.capture_active,
+            "transcript_count": transcript_count,
+            "included_transcript_count": evidence_items.len(),
+            "screen_context_count": screen_context_count,
+            "intelligence_present": state.intelligence.is_some(),
+            "stt": stt_metadata,
+            "metadata_only": true,
+        }),
+        evidence_items,
+        warnings,
+    }
+}
+
+fn evidence_source_label(packet: &AssistantToolEvidencePacket) -> &'static str {
+    match packet.source_kind.as_str() {
+        "active_session_transcript" => "sessione attiva",
+        "last_completed_session_transcript" => "ultima sessione completata",
+        "session_archive_transcript" => "ultima sessione archiviata",
+        _ => "evidenze locali",
+    }
+}
+
+async fn synthesize_tool_answer_from_evidence(
+    window: Option<&WebviewWindow>,
+    source: &str,
+    message: &str,
+    packet: &AssistantToolEvidencePacket,
+    request_id: Option<&str>,
+) -> AssistantToolSynthesisAttempt {
+    let started = Instant::now();
+    let base_url = resolve_ollama_base_url();
+    let endpoint_label = sanitize_ollama_endpoint_label(&base_url);
+    let model = resolve_active_ollama_model(message, source).await;
+    let timeout_ms = tool_synthesis_timeout_ms_for_model(&model);
+    let num_predict = tool_synthesis_num_predict();
+    let mut diagnostics = AssistantToolSynthesisDiagnostics {
+        request_id: request_id.map(str::to_string),
+        model: Some(model.clone()),
+        endpoint_label: Some(endpoint_label),
+        source_kind: packet.source_kind.clone(),
+        evidence_count: packet.evidence_items.len(),
+        evidence_chars: evidence_packet_total_chars(packet),
+        used_json_mode: true,
+        duration_ms: None,
+        status: None,
+        failure_reason: None,
+        fallback_used: false,
+        repair_attempted: false,
+        repair_succeeded: false,
+        metadata_only: true,
+        raw_message_included: false,
+        raw_prompt_included: false,
+        raw_model_output_included: false,
+        transcript_text_included: false,
+        answer_text_included: false,
+        screen_summary_included: false,
+    };
+    let client = match Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            return finish_tool_synthesis_attempt(
+                window,
+                diagnostics,
+                started,
+                None,
+                Some("endpoint_config"),
+                true,
+            );
+        }
+    };
+    let response = match client
+        .post(ollama_endpoint("/api/chat"))
+        .json(&serde_json::json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "messages": build_tool_answer_synthesis_messages(message, packet),
+            "options": {
+                "temperature": 0.1,
+                "top_p": 0.8,
+                "repeat_penalty": 1.05,
+                "num_predict": num_predict
+            },
+            "keep_alive": "30m"
+        }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => {
+            return finish_tool_synthesis_attempt(
+                window,
+                diagnostics,
+                started,
+                None,
+                Some("timeout"),
+                true,
+            );
+        }
+        Err(_) => {
+            return finish_tool_synthesis_attempt(
+                window,
+                diagnostics,
+                started,
+                None,
+                Some("ollama_unavailable"),
+                true,
+            );
+        }
+    };
+    if !response.status().is_success() {
+        return finish_tool_synthesis_attempt(
+            window,
+            diagnostics,
+            started,
+            None,
+            Some("ollama_http_error"),
+            true,
+        );
+    }
+    let body: OllamaChatResponse = match response.json().await {
+        Ok(body) => body,
+        Err(_) => {
+            return finish_tool_synthesis_attempt(
+                window,
+                diagnostics,
+                started,
+                None,
+                Some("invalid_response_schema"),
+                true,
+            );
+        }
+    };
+    let content = body
+        .message
+        .map(|message| message.content)
+        .unwrap_or_default();
+    if content.trim().is_empty() {
+        return finish_tool_synthesis_attempt(
+            window,
+            diagnostics,
+            started,
+            None,
+            Some("empty_model_content"),
+            true,
+        );
+    }
+    let parse_outcome = parse_tool_answer_synthesis_output_with_repair(&content, packet);
+    diagnostics.repair_attempted = parse_outcome.repair_attempted;
+    diagnostics.repair_succeeded = parse_outcome.repair_succeeded;
+    let Some(output) = parse_outcome.output else {
+        return finish_tool_synthesis_attempt(
+            window,
+            diagnostics,
+            started,
+            None,
+            parse_outcome
+                .failure_reason
+                .as_deref()
+                .or(Some("invalid_json")),
+            true,
+        );
+    };
+    let _audit_payload = tool_answer_synthesis_audit_payload(packet, &model, &output.status);
+    let answer = render_tool_synthesis_answer(packet, &output);
+    let status = output.status.clone();
+    finish_tool_synthesis_attempt(
+        window,
+        diagnostics,
+        started,
+        Some((answer, status, output)),
+        None,
+        false,
+    )
+}
+
+fn finish_tool_synthesis_attempt(
+    window: Option<&WebviewWindow>,
+    mut diagnostics: AssistantToolSynthesisDiagnostics,
+    started: Instant,
+    answer: Option<(String, String, AssistantToolSynthesisOutput)>,
+    failure_reason: Option<&str>,
+    fallback_used: bool,
+) -> AssistantToolSynthesisAttempt {
+    diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
+    diagnostics.status = answer.as_ref().map(|(_, status, _)| status.clone());
+    diagnostics.failure_reason = failure_reason.map(str::to_string);
+    diagnostics.fallback_used = fallback_used;
+    emit_tool_synthesis_diagnostic(window, &diagnostics);
+    AssistantToolSynthesisAttempt {
+        answer: answer.as_ref().map(|(answer, _, _)| answer.clone()),
+        output: answer.map(|(_, _, output)| output),
+        failure_reason: failure_reason.map(str::to_string),
+    }
+}
+
+fn emit_tool_synthesis_diagnostic(
+    window: Option<&WebviewWindow>,
+    diagnostics: &AssistantToolSynthesisDiagnostics,
+) {
+    if let Some(window) = window {
+        let _ = window.emit("assistant-tool-synthesis-diagnostic", diagnostics.clone());
+    }
+}
+
+fn build_tool_answer_synthesis_messages(
+    user_question: &str,
+    packet: &AssistantToolEvidencePacket,
+) -> Vec<serde_json::Value> {
+    let system = "You are Astra's evidence-grounded answer synthesizer. Return strict JSON only. You do not answer from general knowledge. Use only the evidence packet. Do not include markdown. Use the user's language.";
+    let user_payload = serde_json::json!({
+        "user_question": bounded_text(user_question, 800),
+        "source": packet.source_kind.clone(),
+        "evidence_packet": packet,
+        "output_schema": {
+            "answer": "string",
+            "status": "answered|partial|insufficient_evidence",
+            "used_evidence_ids": ["evidence_id"],
+            "confidence": 0.0,
+            "warnings": ["string"]
+        },
+        "rules": [
+            "Answer only from evidence_packet.evidence_items.",
+            "Mention active-session or STT warnings when present.",
+            "Set status=partial when evidence is incomplete or session is still active.",
+            "Every used_evidence_ids item must exist in the packet."
+        ]
+    });
+    vec![
+        serde_json::json!({
+            "role": "system",
+            "content": system,
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": user_payload.to_string(),
+        }),
+    ]
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn build_tool_answer_synthesis_context(packet: &AssistantToolEvidencePacket) -> String {
+    build_tool_answer_synthesis_messages("", packet)
+        .into_iter()
+        .filter_map(|message| {
+            message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_synthesis_timeout_ms_for_model(model: &str) -> u64 {
+    tool_synthesis_timeout_ms_from_env(
+        model,
+        std::env::var("ASTRA_TOOL_SYNTHESIS_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn tool_synthesis_timeout_ms_from_env(model: &str, override_value: Option<&str>) -> u64 {
+    if let Some(value) = override_value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1_000..=120_000).contains(value))
+    {
+        return value;
+    }
+
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("70b")
+        || lower.contains("32b")
+        || lower.contains("30b")
+        || lower.contains("20b")
+        || lower.contains("gpt-oss")
+    {
+        30_000
+    } else {
+        15_000
+    }
+}
+
+fn tool_synthesis_num_predict() -> u64 {
+    tool_synthesis_num_predict_from_env(
+        std::env::var("ASTRA_TOOL_SYNTHESIS_NUM_PREDICT")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn tool_synthesis_num_predict_from_env(override_value: Option<&str>) -> u64 {
+    override_value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (128..=2_048).contains(value))
+        .unwrap_or(900)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_tool_answer_synthesis_output(
+    content: &str,
+    packet: &AssistantToolEvidencePacket,
+) -> Option<AssistantToolSynthesisOutput> {
+    parse_tool_answer_synthesis_output_with_repair(content, packet).output
+}
+
+fn parse_tool_answer_synthesis_output_with_repair(
+    content: &str,
+    packet: &AssistantToolEvidencePacket,
+) -> AssistantToolSynthesisParseOutcome {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return AssistantToolSynthesisParseOutcome {
+            output: None,
+            failure_reason: Some("empty_model_content".to_string()),
+            repair_attempted: false,
+            repair_succeeded: false,
+        };
+    }
+    if let Some(output) = parse_tool_answer_synthesis_json(trimmed, packet) {
+        return AssistantToolSynthesisParseOutcome {
+            output: Some(output),
+            failure_reason: None,
+            repair_attempted: false,
+            repair_succeeded: false,
+        };
+    }
+    let Some(candidate) = extract_json_object_for_tool_synthesis(trimmed) else {
+        return AssistantToolSynthesisParseOutcome {
+            output: None,
+            failure_reason: Some("invalid_json".to_string()),
+            repair_attempted: false,
+            repair_succeeded: false,
+        };
+    };
+    let extraction_repaired = candidate.trim() != trimmed;
+    if let Some(output) = parse_tool_answer_synthesis_json(candidate, packet) {
+        return AssistantToolSynthesisParseOutcome {
+            output: Some(output),
+            failure_reason: None,
+            repair_attempted: extraction_repaired,
+            repair_succeeded: extraction_repaired,
+        };
+    }
+    let repaired = repair_common_synthesis_json(candidate);
+    if repaired != candidate {
+        if let Some(output) = parse_tool_answer_synthesis_json(&repaired, packet) {
+            return AssistantToolSynthesisParseOutcome {
+                output: Some(output),
+                failure_reason: None,
+                repair_attempted: true,
+                repair_succeeded: true,
+            };
+        }
+    }
+    AssistantToolSynthesisParseOutcome {
+        output: None,
+        failure_reason: Some("invalid_json".to_string()),
+        repair_attempted: true,
+        repair_succeeded: false,
+    }
+}
+
+fn parse_tool_answer_synthesis_json(
+    json: &str,
+    packet: &AssistantToolEvidencePacket,
+) -> Option<AssistantToolSynthesisOutput> {
+    let mut output: AssistantToolSynthesisOutput = serde_json::from_str(json).ok()?;
+    output.status = output.status.trim().to_ascii_lowercase();
+    output.confidence = output.confidence.clamp(0.0, 1.0);
+    if !matches!(
+        output.status.as_str(),
+        "answered" | "partial" | "insufficient_evidence"
+    ) {
+        return None;
+    }
+    if matches!(output.status.as_str(), "answered" | "partial") && output.answer.trim().is_empty() {
+        return None;
+    }
+    let known_ids = packet
+        .evidence_items
+        .iter()
+        .map(|item| item.evidence_id.as_str())
+        .collect::<HashSet<_>>();
+    if output
+        .used_evidence_ids
+        .iter()
+        .any(|id| !known_ids.contains(id.as_str()))
+    {
+        return None;
+    }
+    if output.status == "insufficient_evidence" && output.answer.trim().is_empty() {
+        output.answer =
+            "Non trovo evidenze sufficienti nel pacchetto locale per rispondere.".to_string();
+    }
+    Some(output)
+}
+
+fn extract_json_object_for_tool_synthesis(content: &str) -> Option<&str> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    (end >= start).then_some(&content[start..=end])
+}
+
+fn repair_common_synthesis_json(content: &str) -> String {
+    let mut repaired = content.trim().to_string();
+    if repaired.starts_with("```") {
+        repaired = repaired
+            .trim_start_matches("```json")
+            .trim_start_matches("```JSON")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+            .to_string();
+    }
+    remove_trailing_synthesis_json_commas(&repaired)
+}
+
+fn remove_trailing_synthesis_json_commas(content: &str) -> String {
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut output = String::with_capacity(content.len());
+    for (index, ch) in chars.iter().enumerate() {
+        if *ch == ',' {
+            let next_non_ws = chars
+                .iter()
+                .skip(index + 1)
+                .find(|candidate| !candidate.is_whitespace());
+            if matches!(next_non_ws, Some('}' | ']')) {
+                continue;
+            }
+        }
+        output.push(*ch);
+    }
+    output
+}
+
+fn render_tool_synthesis_answer(
+    packet: &AssistantToolEvidencePacket,
+    output: &AssistantToolSynthesisOutput,
+) -> String {
+    let mut lines = vec![
+        format!("Fonte: {}", evidence_source_label(packet)),
+        output.answer.trim().to_string(),
+    ];
+    let mut warnings = packet.warnings.clone();
+    warnings.extend(output.warnings.iter().cloned());
+    warnings.sort();
+    warnings.dedup();
+    for warning in warnings.iter().take(3) {
+        lines.push(format!("Nota: {warning}"));
+    }
+    if !output.used_evidence_ids.is_empty() {
+        lines.push(format!(
+            "Evidenze usate: {}.",
+            output
+                .used_evidence_ids
+                .iter()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    } else if !packet.evidence_items.is_empty() {
+        lines.push(format!(
+            "Evidenze disponibili: {} segmenti transcript.",
+            packet.evidence_items.len()
+        ));
+    }
+    lines.join("\n")
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_extractive_transcript_summary(packet: &AssistantToolEvidencePacket) -> String {
+    render_extractive_transcript_summary_with_reason(packet, None)
+}
+
+fn render_extractive_transcript_summary_with_reason(
+    packet: &AssistantToolEvidencePacket,
+    failure_reason: Option<&str>,
+) -> String {
+    if packet.evidence_items.is_empty() {
+        return "Non trovo segmenti transcript utilizzabili per generare un riassunto.".to_string();
+    }
+    let detail = synthesis_failure_user_detail(failure_reason);
+    let mut lines = vec![format!(
+        "Fonte: {}\nSintesi provvisoria estrattiva: il modello locale non ha restituito una sintesi JSON valida in tempo. Dettaglio: {}. Riporto {} segmenti transcript della sessione {}:",
+        evidence_source_label(packet),
+        detail,
+        packet.evidence_items.len(),
+        packet.title.as_deref().unwrap_or("archiviata")
+    )];
+    for item in packet.evidence_items.iter().take(6) {
+        let speaker = item
+            .speaker
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("speaker");
+        lines.push(format!("- {}: {}", speaker, bounded_text(&item.text, 260)));
+    }
+    for warning in packet.warnings.iter().take(3) {
+        lines.push(format!("Nota: {warning}"));
+    }
+    lines.push(format!(
+        "Evidenze disponibili: {} segmenti transcript.",
+        packet.evidence_items.len()
+    ));
+    lines.join("\n")
+}
+
+fn synthesis_failure_user_detail(reason: Option<&str>) -> &'static str {
+    match reason.unwrap_or("invalid_json") {
+        "timeout" => "timeout",
+        "empty_model_content" => "contenuto testuale vuoto",
+        "ollama_unavailable" => "modello locale non raggiungibile",
+        "ollama_http_error" => "errore HTTP del modello locale",
+        "endpoint_config" => "configurazione endpoint non valida",
+        "invalid_response_schema" => "risposta modello non valida",
+        "invalid_evidence_ids" => "evidenze non valide",
+        _ => "output JSON non valido",
+    }
+}
+
+fn evidence_packet_total_chars(packet: &AssistantToolEvidencePacket) -> usize {
+    packet
+        .evidence_items
+        .iter()
+        .map(|item| item.text.chars().count())
+        .sum()
+}
+
+fn tool_answer_synthesis_audit_payload(
+    packet: &AssistantToolEvidencePacket,
+    model_name: &str,
+    status: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tool_name": packet.tool_name,
+        "session_id_hash": packet.session_id.as_ref().map(|id| sha256_hex(id)),
+        "evidence_count": packet.evidence_items.len(),
+        "evidence_total_chars": evidence_packet_total_chars(packet),
+        "model_name": model_name,
+        "status": status,
+        "metadata_only": true,
+        "transcript_text_included_in_audit": false,
+        "answer_text_included_in_audit": false,
+        "screen_pixels_included_in_audit": false,
+    })
+}
+
+fn tool_result_frame_from_evidence_packet(
+    packet: &AssistantToolEvidencePacket,
+    answer_kind: &str,
+    answer_text: &str,
+    output: &AssistantToolSynthesisOutput,
+) -> ToolResultFrame {
+    let used_evidence_ids = if output.used_evidence_ids.is_empty() {
+        packet
+            .evidence_items
+            .iter()
+            .map(|item| item.evidence_id.clone())
+            .collect()
+    } else {
+        output.used_evidence_ids.clone()
+    };
+    let mut warnings = packet.warnings.clone();
+    warnings.extend(output.warnings.clone());
+    ToolResultFrame::compact(
+        packet.tool_name.clone(),
+        answer_kind.to_string(),
+        packet.source_kind.clone(),
+        evidence_source_label(packet).to_string(),
+        packet.session_id.clone(),
+        used_evidence_ids,
+        packet.evidence_items.len(),
+        if output.answer.trim().is_empty() {
+            answer_text
+        } else {
+            output.answer.as_str()
+        },
+        warnings,
+        Some(output.confidence),
+    )
+}
+
+fn tool_result_frame_from_work_session_memory(
+    memory: &WorkSessionChatMemory,
+) -> Option<ToolResultFrame> {
+    if memory.evidence.is_empty() && memory.last_referenced_session_id.is_none() {
+        return None;
+    }
+    let used_evidence_ids = memory
+        .evidence
+        .iter()
+        .flat_map(|item| item.evidence_segment_ids.iter().cloned())
+        .collect::<Vec<_>>();
+    let source_kind = source_kind_from_work_session_memory(memory);
+    let source_label = source_label_from_source_kind(&source_kind).to_string();
+    let answer_summary = safe_work_session_answer_summary(memory);
+    let evidence_count = memory
+        .evidence
+        .iter()
+        .map(|item| {
+            item.evidence_segment_ids
+                .len()
+                .max(item.screen_context_ids.len())
+        })
+        .sum::<usize>()
+        .max(memory.evidence.len());
+
+    Some(ToolResultFrame::compact(
+        work_session_tool_name_for_memory(memory).to_string(),
+        memory.last_answer_kind.clone(),
+        source_kind,
+        source_label,
+        memory.last_referenced_session_id.clone(),
+        used_evidence_ids,
+        evidence_count,
+        answer_summary,
+        Vec::new(),
+        Some(0.72),
+    ))
+}
+
+fn work_session_tool_name_for_memory(memory: &WorkSessionChatMemory) -> &'static str {
+    match memory.last_intent {
+        WorkSessionChatIntent::GenerateIntelligence => "work_session.recap",
+        WorkSessionChatIntent::GenerateTranscriptSummary => "work_session.transcript_summary",
+        WorkSessionChatIntent::GenerateDetails => "work_session.details",
+        WorkSessionChatIntent::GenerateTechnicalRecap => "work_session.technical_recap",
+        WorkSessionChatIntent::GenerateFollowUpDraft => "work_session.followup_draft",
+        WorkSessionChatIntent::RecallSessionMemory => "work_session.recall",
+        WorkSessionChatIntent::SearchSessionMemory => "work_session.search",
+        WorkSessionChatIntent::ShowEvidence => "work_session.show_evidence",
+        WorkSessionChatIntent::ShowSessionStatus => "work_session.status",
+        WorkSessionChatIntent::AttachScreenContext => "work_session.attach_screen",
+        WorkSessionChatIntent::StartSession => "work_session.start",
+        WorkSessionChatIntent::StopSession => "work_session.stop",
+        WorkSessionChatIntent::StopAndGenerateRecap => "work_session.stop_and_recap",
+        WorkSessionChatIntent::OpenMeetingPanel => "work_session.open_details",
+        WorkSessionChatIntent::Unknown => "work_session.unknown",
+    }
+}
+
+fn source_kind_from_work_session_memory(memory: &WorkSessionChatMemory) -> String {
+    match memory.last_target.as_str() {
+        "active_session" | "runtime_session" => "active_session_transcript".to_string(),
+        "last_completed_session" => "last_completed_session_transcript".to_string(),
+        "latest_archived_session" | "last_referenced_session" | "archived_sessions" => {
+            "session_archive_transcript".to_string()
+        }
+        _ => "work_session_context".to_string(),
+    }
+}
+
+fn source_label_from_source_kind(source_kind: &str) -> &'static str {
+    match source_kind {
+        "active_session_transcript" => "sessione attiva",
+        "last_completed_session_transcript" => "ultima sessione completata",
+        "session_archive_transcript" => "ultima sessione archiviata",
+        _ => "contesto Work Session",
+    }
+}
+
+fn safe_work_session_answer_summary(memory: &WorkSessionChatMemory) -> String {
+    if let Some(summary) = memory
+        .evidence
+        .iter()
+        .find(|item| {
+            matches!(
+                item.matched_kind.as_str(),
+                "summary" | "session_summary" | "recap" | "intelligence"
+            ) && !item.snippet.trim().is_empty()
+        })
+        .map(|item| bounded_text(&item.snippet, 700))
+    {
+        return summary;
+    }
+    memory
+        .last_assistant_summary
+        .as_ref()
+        .map(|summary| bounded_text(summary, 360))
+        .unwrap_or_else(|| {
+            format!(
+                "Risposta Work Session evidence-grounded con {} riferimenti di evidenza.",
+                memory.evidence.len()
+            )
+        })
+}
+
+fn work_session_memory_from_archive(
+    intent: WorkSessionChatIntent,
+    answer_kind: &str,
+    item: &MeetingSessionListItem,
+    archive: &MeetingSessionArchiveDocument,
+    query: Option<String>,
+) -> WorkSessionChatMemory {
+    let intelligence = archive_intelligence(archive);
+    let summary_snippet = intelligence
+        .and_then(|value| value.summary.as_ref().map(|summary| summary.text.as_str()))
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (!item.summary_preview.trim().is_empty()).then_some(item.summary_preview.as_str())
+        })
+        .map(|value| bounded_text(value, 360))
+        .unwrap_or_else(|| {
+            format!(
+                "Transcript: {} entrate; screen contexts: {}; STT: {}",
+                item.transcript_count, item.screen_context_count, item.stt_completeness_status
+            )
+        });
+    let mut evidence = vec![WorkSessionChatEvidenceMemory {
+        session_id: item.session_id.clone(),
+        session_title: item.title.clone(),
+        matched_kind: "session_summary".to_string(),
+        snippet: summary_snippet,
+        evidence_segment_ids: intelligence
+            .and_then(|value| value.summary.as_ref())
+            .map(|summary| summary.evidence_segment_ids.clone())
+            .unwrap_or_default(),
+        screen_context_ids: archive
+            .screen_contexts
+            .iter()
+            .map(|context| context.context_id.clone())
+            .collect(),
+    }];
+    if let Some(intelligence) = intelligence {
+        for decision in intelligence.decisions.iter().take(3) {
+            evidence.push(WorkSessionChatEvidenceMemory {
+                session_id: item.session_id.clone(),
+                session_title: item.title.clone(),
+                matched_kind: "decision".to_string(),
+                snippet: bounded_text(&decision.decision, 280),
+                evidence_segment_ids: decision.evidence_segment_ids.clone(),
+                screen_context_ids: Vec::new(),
+            });
+        }
+        for action in intelligence.action_items.iter().take(3) {
+            evidence.push(WorkSessionChatEvidenceMemory {
+                session_id: item.session_id.clone(),
+                session_title: item.title.clone(),
+                matched_kind: "action_item".to_string(),
+                snippet: bounded_text(&action.task, 280),
+                evidence_segment_ids: action.evidence_segment_ids.clone(),
+                screen_context_ids: Vec::new(),
+            });
+        }
+    } else {
+        for entry in archive_transcript_entries(archive)
+            .into_iter()
+            .filter(|entry| !entry.text.trim().is_empty())
+            .take(6)
+        {
+            evidence.push(WorkSessionChatEvidenceMemory {
+                session_id: item.session_id.clone(),
+                session_title: item.title.clone(),
+                matched_kind: "transcript".to_string(),
+                snippet: bounded_text(&entry.text, 300),
+                evidence_segment_ids: vec![entry.segment_id.clone()],
+                screen_context_ids: Vec::new(),
+            });
+        }
+    }
+    let last_query_hash = query.as_deref().map(sha256_hex);
+    let last_user_message = query.as_deref().map(|value| bounded_text(value, 240));
+    let last_screen_context_ids = collect_work_session_memory_screen_context_ids(&evidence);
+    let last_referenced_object_ids = collect_work_session_memory_object_ids(&evidence);
+    let last_referenced_object_type =
+        work_session_memory_object_type(intent, answer_kind, &evidence);
+    WorkSessionChatMemory {
+        last_user_message,
+        last_assistant_summary: Some(work_session_memory_assistant_summary(
+            answer_kind,
+            Some(&item.title),
+        )),
+        last_intent: intent,
+        last_target: "latest_archived_session".to_string(),
+        last_referenced_session_id: Some(item.session_id.clone()),
+        last_referenced_session_title: Some(item.title.clone()),
+        last_referenced_object_type,
+        last_referenced_object_ids,
+        last_answer_kind: answer_kind.to_string(),
+        last_query: query,
+        last_query_hash,
+        evidence,
+        last_screen_context_ids,
+        last_response_had_details: matches!(
+            intent,
+            WorkSessionChatIntent::GenerateDetails | WorkSessionChatIntent::ShowSessionStatus
+        ),
+        updated_at: Utc::now(),
+    }
+}
+
+fn work_session_memory_from_intelligence(
+    intent: WorkSessionChatIntent,
+    answer_kind: &str,
+    intelligence: &MeetingIntelligenceResult,
+    query: Option<String>,
+) -> WorkSessionChatMemory {
+    let title = format!("Work Session {}", intelligence.session_id);
+    let mut evidence = Vec::new();
+    if let Some(summary) = intelligence.summary.as_ref() {
+        evidence.push(WorkSessionChatEvidenceMemory {
+            session_id: intelligence.session_id.clone(),
+            session_title: title.clone(),
+            matched_kind: "summary".to_string(),
+            snippet: bounded_text(&summary.text, 360),
+            evidence_segment_ids: summary.evidence_segment_ids.clone(),
+            screen_context_ids: Vec::new(),
+        });
+    }
+    for decision in intelligence.decisions.iter().take(3) {
+        evidence.push(WorkSessionChatEvidenceMemory {
+            session_id: intelligence.session_id.clone(),
+            session_title: title.clone(),
+            matched_kind: "decision".to_string(),
+            snippet: bounded_text(&decision.decision, 280),
+            evidence_segment_ids: decision.evidence_segment_ids.clone(),
+            screen_context_ids: Vec::new(),
+        });
+    }
+    let last_query_hash = query.as_deref().map(sha256_hex);
+    let last_user_message = query.as_deref().map(|value| bounded_text(value, 240));
+    let last_screen_context_ids = collect_work_session_memory_screen_context_ids(&evidence);
+    let last_referenced_object_ids = collect_work_session_memory_object_ids(&evidence);
+    let last_referenced_object_type =
+        work_session_memory_object_type(intent, answer_kind, &evidence);
+    WorkSessionChatMemory {
+        last_user_message,
+        last_assistant_summary: Some(work_session_memory_assistant_summary(
+            answer_kind,
+            Some(&title),
+        )),
+        last_intent: intent,
+        last_target: "runtime_session".to_string(),
+        last_referenced_session_id: Some(intelligence.session_id.clone()),
+        last_referenced_session_title: Some(title),
+        last_referenced_object_type,
+        last_referenced_object_ids,
+        last_answer_kind: answer_kind.to_string(),
+        last_query: query,
+        last_query_hash,
+        evidence,
+        last_screen_context_ids,
+        last_response_had_details: false,
+        updated_at: Utc::now(),
+    }
+}
+
+fn work_session_memory_from_runtime_state(
+    intent: WorkSessionChatIntent,
+    answer_kind: &str,
+    state: &MeetingSessionState,
+) -> WorkSessionChatMemory {
+    let title = format!("Work Session {}", state.session.session_id);
+    let evidence = vec![WorkSessionChatEvidenceMemory {
+        session_id: state.session.session_id.clone(),
+        session_title: title.clone(),
+        matched_kind: "session_status".to_string(),
+        snippet: format!(
+            "Transcript: {} entrate; screen contexts: {}; intelligence: {}",
+            state.transcript.len(),
+            state.screen_contexts.len(),
+            state.intelligence.is_some()
+        ),
+        evidence_segment_ids: Vec::new(),
+        screen_context_ids: state
+            .screen_contexts
+            .iter()
+            .map(|context| context.context_id.clone())
+            .collect(),
+    }];
+    let last_screen_context_ids = collect_work_session_memory_screen_context_ids(&evidence);
+    let last_referenced_object_ids = collect_work_session_memory_object_ids(&evidence);
+    let last_referenced_object_type =
+        work_session_memory_object_type(intent, answer_kind, &evidence);
+    WorkSessionChatMemory {
+        last_user_message: None,
+        last_assistant_summary: Some(work_session_memory_assistant_summary(
+            answer_kind,
+            Some(&title),
+        )),
+        last_intent: intent,
+        last_target: "runtime_session".to_string(),
+        last_referenced_session_id: Some(state.session.session_id.clone()),
+        last_referenced_session_title: Some(title.clone()),
+        last_referenced_object_type,
+        last_referenced_object_ids,
+        last_answer_kind: answer_kind.to_string(),
+        last_query: None,
+        last_query_hash: None,
+        evidence,
+        last_screen_context_ids,
+        last_response_had_details: true,
+        updated_at: Utc::now(),
+    }
+}
+
+fn work_session_memory_from_runtime_transcript_packet(
+    intent: WorkSessionChatIntent,
+    answer_kind: &str,
+    state: &MeetingSessionState,
+    packet: &AssistantToolEvidencePacket,
+    query: Option<String>,
+) -> WorkSessionChatMemory {
+    let title = packet.title.clone().unwrap_or_else(|| {
+        format!(
+            "Work Session {}",
+            short_session_id(&state.session.session_id)
+        )
+    });
+    let evidence = packet
+        .evidence_items
+        .iter()
+        .take(8)
+        .map(|item| WorkSessionChatEvidenceMemory {
+            session_id: state.session.session_id.clone(),
+            session_title: title.clone(),
+            matched_kind: item.kind.clone(),
+            snippet: bounded_text(&item.text, 300),
+            evidence_segment_ids: vec![item.evidence_id.clone()],
+            screen_context_ids: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let last_query_hash = query.as_deref().map(sha256_hex);
+    let last_user_message = query.as_deref().map(|value| bounded_text(value, 240));
+    let last_screen_context_ids = state
+        .screen_contexts
+        .iter()
+        .map(|context| context.context_id.clone())
+        .collect::<Vec<_>>();
+    let last_referenced_object_ids = collect_work_session_memory_object_ids(&evidence);
+    WorkSessionChatMemory {
+        last_user_message,
+        last_assistant_summary: Some(work_session_memory_assistant_summary(
+            answer_kind,
+            Some(&title),
+        )),
+        last_intent: intent,
+        last_target: packet.target.kind.clone(),
+        last_referenced_session_id: Some(state.session.session_id.clone()),
+        last_referenced_session_title: Some(title),
+        last_referenced_object_type: Some("transcript".to_string()),
+        last_referenced_object_ids,
+        last_answer_kind: answer_kind.to_string(),
+        last_query: query,
+        last_query_hash,
+        evidence,
+        last_screen_context_ids,
+        last_response_had_details: matches!(
+            intent,
+            WorkSessionChatIntent::GenerateDetails | WorkSessionChatIntent::ShowSessionStatus
+        ),
+        updated_at: Utc::now(),
+    }
+}
+
+fn render_archive_recap_response(
+    item: &MeetingSessionListItem,
+    archive: &MeetingSessionArchiveDocument,
+) -> String {
+    let transcript_count = archive
+        .state
+        .transcript
+        .len()
+        .max(archive.exported.transcript.len())
+        .max(item.transcript_count);
+    let screen_context_count = archive
+        .screen_contexts
+        .len()
+        .max(archive.state.screen_contexts.len())
+        .max(archive.exported.screen_contexts.len())
+        .max(item.screen_context_count);
+    let Some(intelligence) = archive_intelligence(archive) else {
+        let snippet = archive
+            .state
+            .transcript
+            .first()
+            .or_else(|| archive.exported.transcript.first())
+            .map(|entry| bounded_text(&entry.text, 220))
+            .unwrap_or_else(|| "nessun estratto transcript disponibile".to_string());
+        return format!(
+            "Ho trovato l'ultima Work Session archiviata: {}.\nNon c'e Meeting Intelligence archiviata, ma ci sono {} entrate transcript.\nPrimo estratto: {}\n[Apri dettagli]",
+            item.title, transcript_count, snippet
+        );
+    };
+
+    let mut lines = vec![format!(
+        "Recap dall'ultima Work Session archiviata: {}.",
+        item.title
+    )];
+    if let Some(summary) = intelligence.summary.as_ref() {
+        lines.push(format!("Summary: {}", summary.text));
+        if !summary.bullets.is_empty() {
+            lines.push(format!(
+                "Punti principali: {}",
+                summary
+                    .bullets
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+    } else if !item.summary_preview.trim().is_empty() {
+        lines.push(format!("Summary: {}", item.summary_preview));
+    }
+    lines.push(format!(
+        "Transcript: {} entrate. Screen contexts: {}. Decisioni: {}. Action item: {}. Domande aperte: {}. Rischi: {}.",
+        transcript_count,
+        screen_context_count,
+        intelligence.decisions.len().max(item.decision_count),
+        intelligence.action_items.len().max(item.action_item_count),
+        intelligence.open_questions.len().max(item.open_question_count),
+        intelligence.risks.len().max(item.risk_count)
+    ));
+    if item.stt_completeness_status != "complete" {
+        lines.push(format!(
+            "STT: {}{}",
+            item.stt_completeness_status,
+            if item.stt_completeness_detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", item.stt_completeness_detail)
+            }
+        ));
+    }
+    lines.push("[Apri dettagli]".to_string());
+    lines.join("\n")
+}
+
+fn render_archive_details_response(
+    item: &MeetingSessionListItem,
+    archive: &MeetingSessionArchiveDocument,
+) -> String {
+    let transcript_count = archive
+        .state
+        .transcript
+        .len()
+        .max(archive.exported.transcript.len())
+        .max(item.transcript_count);
+    let screen_context_count = archive
+        .screen_contexts
+        .len()
+        .max(archive.state.screen_contexts.len())
+        .max(archive.exported.screen_contexts.len())
+        .max(item.screen_context_count);
+    let mut lines = vec![
+        format!("Ultima Work Session archiviata: {}", item.title),
+        format!("Periodo: {} - {}", item.started_at, item.ended_at),
+        format!("Transcript: {} entrate", transcript_count),
+        format!("Screen contexts: {}", screen_context_count),
+        format!(
+            "STT: {}{}",
+            item.stt_completeness_status,
+            if item.stt_completeness_detail.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", item.stt_completeness_detail)
+            }
+        ),
+    ];
+    if let Some(intelligence) = archive_intelligence(archive) {
+        if let Some(summary) = intelligence.summary.as_ref() {
+            lines.push(format!("Summary: {}", summary.text));
+        }
+        if !intelligence.decisions.is_empty() {
+            lines.push("Decisioni:".to_string());
+            for decision in intelligence.decisions.iter().take(3) {
+                lines.push(format!("- {}", decision.decision));
+            }
+        }
+        if !intelligence.action_items.is_empty() {
+            lines.push("Action item:".to_string());
+            for item in intelligence.action_items.iter().take(3) {
+                lines.push(format!("- {}", item.task));
+            }
+        }
+        if let Some(recap) = intelligence.technical_recap.as_ref() {
+            if !recap.bullets.is_empty() {
+                lines.push(format!(
+                    "Recap tecnico: {}",
+                    recap
+                        .bullets
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+        }
+    } else if !item.summary_preview.trim().is_empty() {
+        lines.push(format!("Summary preview: {}", item.summary_preview));
+    }
+    lines.push("[Apri dettagli]".to_string());
+    lines.join("\n")
+}
+
+fn render_followup_draft_response(draft: &MeetingFollowUpDraft) -> String {
+    format!(
+        "Ho preparato una bozza di follow-up, solo da copiare: {}\n\n{}",
+        draft.subject, draft.body
+    )
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    let mut text = value.trim().chars().take(max_chars).collect::<String>();
+    if value.trim().chars().count() > max_chars {
+        text.push_str("...");
+    }
+    text
+}
+
+fn short_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
 }
 
 fn render_intelligence_response(intelligence: &MeetingIntelligenceResult) -> String {
@@ -1278,9 +5140,51 @@ fn render_stop_and_recap_response(
     )
 }
 
+fn ensure_work_session_chat_response_text(intent: WorkSessionChatIntent, text: String) -> String {
+    if !text.trim().is_empty() {
+        return text;
+    }
+    match intent {
+        WorkSessionChatIntent::GenerateIntelligence
+        | WorkSessionChatIntent::GenerateTranscriptSummary
+        | WorkSessionChatIntent::GenerateDetails
+        | WorkSessionChatIntent::GenerateTechnicalRecap
+        | WorkSessionChatIntent::GenerateFollowUpDraft => {
+            "Ho gestito il comando Work Session, ma non ho trovato contenuti sufficienti per generare un recap testuale. Se la sessione contiene transcript, riprova dopo il completamento STT.".to_string()
+        }
+        WorkSessionChatIntent::RecallSessionMemory | WorkSessionChatIntent::SearchSessionMemory => {
+            "Ho interrogato la memoria locale delle sessioni, ma non ho trovato evidenze sufficienti per una risposta.".to_string()
+        }
+        WorkSessionChatIntent::ShowEvidence => {
+            "Ho gestito la richiesta di evidenze, ma non ho trovato prove gia collegate all'ultimo riferimento Work Session.".to_string()
+        }
+        WorkSessionChatIntent::AttachScreenContext => {
+            "Ho gestito il comando di allegato schermo, ma il runtime non ha restituito un riepilogo utilizzabile.".to_string()
+        }
+        _ => format!(
+            "Ho gestito il comando Work Session ({}) e ho aggiornato lo stato locale.",
+            intent.as_str()
+        ),
+    }
+}
+
 fn render_work_session_error(intent: WorkSessionChatIntent, error: &str) -> String {
     let sanitized = sanitize_chat_meeting_error(error);
+    let lower = sanitized.to_lowercase();
     match intent {
+        WorkSessionChatIntent::GenerateIntelligence
+        | WorkSessionChatIntent::GenerateTranscriptSummary
+        | WorkSessionChatIntent::GenerateDetails
+        | WorkSessionChatIntent::GenerateTechnicalRecap
+        | WorkSessionChatIntent::GenerateFollowUpDraft
+            if lower.contains("transcript")
+                || lower.contains("evidence")
+                || lower.contains("no current")
+                || lower.contains("no active")
+                || lower.contains("noactivesession") =>
+        {
+            "Non posso generare il recap perche non trovo transcript nella sessione corrente, nell'ultima completata o nelle sessioni archiviate.".to_string()
+        }
         WorkSessionChatIntent::StartSession if sanitized.contains("consent") => {
             "Per avviare una Work Session serve prima il consenso Meeting. Apri Dettagli > Meeting e concedi il consenso, poi puoi scrivere di nuovo: Avvia una sessione di lavoro.".to_string()
         }
@@ -1332,7 +5236,8 @@ fn meeting_status_label(status: &MeetingStatus) -> String {
     }
 }
 
-async fn start_grounded_response(
+async fn start_grounded_response_with_request_id(
+    request_id: String,
     window: WebviewWindow,
     runtime: AssistantRuntime,
     original_message: String,
@@ -1344,7 +5249,6 @@ async fn start_grounded_response(
 ) -> Result<StartChatResponse, String> {
     let display_text = rendered.display_text;
     let speech_text = rendered.speech_text;
-    let request_id = Uuid::new_v4().to_string();
     runtime.begin_request(request_id.clone());
     let history_user_message = display_user_message
         .clone()
@@ -1464,7 +5368,7 @@ async fn run_ollama_stream(
 ) -> Result<(), String> {
     let client = Client::new();
     let response = client
-        .post("http://127.0.0.1:11434/api/chat")
+        .post(ollama_endpoint("/api/chat"))
         .json(&serde_json::json!({
             "model": resolved.model,
             "stream": true,
@@ -1589,6 +5493,7 @@ async fn run_ollama_stream(
         runtime
             .conversation_history
             .commit_turn(&request_id, &final_text);
+        runtime.remember_normal_chat_turn(&original_message, &final_text);
 
         if let Some(snapshot) = runtime.metrics.mark_llm_completed(&request_id) {
             emit_metrics_update(&window, &snapshot);
@@ -3790,6 +7695,73 @@ fn stop_meeting_session(
 }
 
 #[tauri::command]
+fn recover_failed_meeting_capture(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingSessionState, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.recover_failed_capture",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "audio_paths_included": false,
+            "operation": "recover_failed_capture"
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .recover_failed_capture_session()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    let state_value = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &["meeting-session-updated", "meeting-diagnostics-updated"],
+    );
+    Ok(state_value)
+}
+
+#[tauri::command]
+fn force_finalize_failed_meeting_capture(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<ExportedMeeting, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.force_finalize_failed_capture",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "audio_paths_included": false,
+            "operation": "force_finalize_failed_capture"
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .force_finalize_failed_capture_session()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    let exported = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-session-updated",
+            "meeting-transcript-updated",
+            "meeting-artifacts-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(exported)
+}
+
+#[tauri::command]
 fn list_meeting_sessions(
     state: State<'_, AssistantRuntime>,
     request: MeetingSessionListRequest,
@@ -4296,6 +8268,104 @@ mod tests {
         (DesktopAgentRuntime::new(root.clone()), root)
     }
 
+    fn archived_transcript_fixture(
+        transcript_texts: &[&str],
+    ) -> (
+        MeetingSessionListItem,
+        MeetingSessionArchiveDocument,
+        PathBuf,
+    ) {
+        let root =
+            std::env::temp_dir().join(format!("astra_transcript_summary_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = MeetingRuntime::new(root.clone());
+        runtime.grant_consent("teams").expect("grant consent");
+        let mut config = test_real_capture_config();
+        config.session_mode = MeetingSessionMode::Manual;
+        config.live_transcription_enabled = false;
+        config.capture_options = MeetingCaptureOptions::default();
+        let session = runtime
+            .start_session("teams".to_string(), config)
+            .expect("start session");
+        for (index, text) in transcript_texts.iter().enumerate() {
+            let mut entry = TranscriptEntry::sourced(
+                &session.session_id,
+                meeting::types::TranscriptSource::Manual,
+                "Speaker 1",
+                (*text).to_string(),
+                0.95,
+            );
+            entry.segment_id = format!("segment-{}", index + 1);
+            runtime.add_transcript(entry).expect("add transcript");
+        }
+        runtime.stop_session().expect("stop session");
+        let list = runtime
+            .list_archived_sessions(MeetingSessionListRequest {
+                limit: 1,
+                cursor: None,
+                date_from: None,
+                date_to: None,
+                has_intelligence: None,
+                query: None,
+            })
+            .expect("list archive");
+        let item = list.sessions.first().expect("archive item").clone();
+        let archive = runtime
+            .read_archived_session(MeetingSessionReadRequest {
+                session_id: item.session_id.clone(),
+                include_transcript: true,
+                include_intelligence: true,
+                include_diagnostics: true,
+            })
+            .expect("read archive")
+            .archive;
+        (item, archive, root)
+    }
+
+    fn active_state_fixture(transcript_texts: &[&str]) -> (MeetingSessionState, PathBuf) {
+        let root = std::env::temp_dir().join(format!("astra_active_transcript_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = MeetingRuntime::new(root.clone());
+        runtime.grant_consent("teams").expect("grant consent");
+        let mut config = test_real_capture_config();
+        config.session_mode = MeetingSessionMode::Manual;
+        config.live_transcription_enabled = false;
+        config.capture_options = MeetingCaptureOptions::default();
+        let session = runtime
+            .start_session("teams".to_string(), config)
+            .expect("start session");
+        for (index, text) in transcript_texts.iter().enumerate() {
+            let mut entry = TranscriptEntry::sourced(
+                &session.session_id,
+                meeting::types::TranscriptSource::Manual,
+                "Speaker 1",
+                (*text).to_string(),
+                0.95,
+            );
+            entry.segment_id = format!("active-segment-{}", index + 1);
+            runtime.add_transcript(entry).expect("add transcript");
+        }
+        (runtime.get_active_state().expect("active state"), root)
+    }
+
+    fn test_work_session_route(
+        intent: WorkSessionChatIntent,
+        target_kind: WorkSessionTargetKind,
+    ) -> WorkSessionChatRoute {
+        WorkSessionChatRoute {
+            intent,
+            confidence: 0.9,
+            target: Some(WorkSessionExecutionTarget {
+                kind: target_kind,
+                session_id: None,
+                object_type: Some("transcript".to_string()),
+                object_ids: Vec::new(),
+            }),
+            query: None,
+            reason_code: Some("test".to_string()),
+        }
+    }
+
     #[test]
     fn file_transcription_preflight_does_not_touch_filesystem_before_governance() {
         let request = MeetingAudioFileTranscriptionRequest {
@@ -4434,10 +8504,22 @@ mod tests {
 
     #[test]
     fn work_session_chat_route_diagnostic_is_metadata_only() {
+        let route = WorkSessionChatRoute {
+            intent: WorkSessionChatIntent::RecallSessionMemory,
+            confidence: 0.86,
+            target: Some(WorkSessionExecutionTarget {
+                kind: WorkSessionTargetKind::LastReferencedSession,
+                session_id: None,
+                object_type: Some("transcript".to_string()),
+                object_ids: Vec::new(),
+            }),
+            query: None,
+            reason_code: Some("test_recall".to_string()),
+        };
         let diagnostic = work_session_chat_route_diagnostic(
             "Cosa avevamo deciso sullo STT drain?",
-            WorkSessionChatIntent::RecallSessionMemory,
-            0.86,
+            &route,
+            "work_session_chat_heuristic",
         );
 
         assert_eq!(
@@ -4447,8 +8529,895 @@ mod tests {
         assert!(diagnostic.audit_expected);
         let params = diagnostic.extracted_params.expect("route params");
         assert_eq!(params["metadata_only"], true);
+        assert_eq!(params["target_kind"], "last_referenced_session");
         assert_eq!(params["transcript_text_included"], false);
         assert_eq!(params["screen_pixels_included"], false);
+    }
+
+    #[test]
+    fn handled_work_session_response_is_never_empty() {
+        let display = ensure_work_session_chat_response_text(
+            WorkSessionChatIntent::GenerateIntelligence,
+            "   ".to_string(),
+        );
+
+        assert!(!display.trim().is_empty());
+        assert!(display.contains("Work Session"));
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_validates_recap() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.recap",
+                "intent": "generate_recap",
+                "target": {"kind": "latest_archived_session", "session_id": null},
+                "confidence": 0.86,
+                "query": "recap ultima sessione",
+                "language": "it",
+                "reason_code": "archive_recap_request"
+            }"#,
+        )
+        .expect("valid route");
+
+        assert_eq!(route.intent, WorkSessionChatIntent::GenerateIntelligence);
+        assert_eq!(
+            route.target.as_ref().map(|target| target.kind),
+            Some(WorkSessionTargetKind::LatestArchivedSession)
+        );
+        assert!(route.confidence >= 0.86);
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_maps_meeting_intelligence_tool() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.generate_intelligence",
+                "target": "active_session",
+                "object": "transcript",
+                "confidence": 0.9,
+                "query": "mi generi un meeting intelligence sul transcript della sessione attiva?",
+                "reason_code": "meeting_intelligence_request"
+            }"#,
+        )
+        .expect("valid meeting intelligence route");
+
+        assert_eq!(route.intent, WorkSessionChatIntent::GenerateIntelligence);
+        assert_eq!(
+            route.target.as_ref().map(|target| target.kind),
+            Some(WorkSessionTargetKind::ActiveSession)
+        );
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_validates_transcript_summary() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.transcript_summary",
+                "intent": "summarize_transcript",
+                "target": {"kind": "latest_archived_session", "session_id": null},
+                "confidence": 0.88,
+                "query": "di cosa abbiamo parlato nell'ultima registrazione?",
+                "language": "it",
+                "reason_code": "last_recording_content"
+            }"#,
+        )
+        .expect("valid transcript summary route");
+
+        assert_eq!(
+            route.intent,
+            WorkSessionChatIntent::GenerateTranscriptSummary
+        );
+        assert_eq!(
+            route.target.as_ref().map(|target| target.kind),
+            Some(WorkSessionTargetKind::LatestArchivedSession)
+        );
+        assert!(route.confidence >= 0.88);
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_validates_details_followup() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.details",
+                "intent": "generate_details",
+                "target": {"kind": "last_referenced_session", "session_id": "session-1234567890"},
+                "confidence": 0.84,
+                "query": "dettagli",
+                "language": "it",
+                "reason_code": "contextual_followup"
+            }"#,
+        )
+        .expect("valid details route");
+
+        assert_eq!(route.intent, WorkSessionChatIntent::GenerateDetails);
+        assert_eq!(
+            route.target.as_ref().map(|target| target.kind),
+            Some(WorkSessionTargetKind::LastReferencedSession)
+        );
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_preserves_active_target() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.transcript_summary",
+                "target": "active_session",
+                "object": "transcript",
+                "confidence": 0.9,
+                "query": "recap sessione attuale",
+                "reason_code": "active_session_recap"
+            }"#,
+        )
+        .expect("valid active route");
+
+        let target = route.target.expect("target");
+        assert_eq!(
+            route.intent,
+            WorkSessionChatIntent::GenerateTranscriptSummary
+        );
+        assert_eq!(target.kind, WorkSessionTargetKind::ActiveSession);
+        assert_eq!(target.object_type.as_deref(), Some("transcript"));
+        assert_eq!(route.query.as_deref(), Some("recap sessione attuale"));
+        assert_eq!(route.reason_code.as_deref(), Some("active_session_recap"));
+    }
+
+    #[test]
+    fn transcript_summary_evidence_packet_uses_bounded_transcript_segments() {
+        let (item, archive, _root) = archived_transcript_fixture(&[
+            "l'impatto di asteroidi con la Terra e' un rischio reale",
+            "la discussione parla anche della possibilita di vita sul pianeta",
+            "il gruppo valuta esempi di corpi celesti e conseguenze degli impatti",
+        ]);
+
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+
+        assert_eq!(packet.tool_name, "work_session.transcript_summary");
+        assert_eq!(packet.evidence_items.len(), 3);
+        let combined = packet
+            .evidence_items
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(combined.contains("asteroidi"));
+        assert!(combined.contains("vita sul pianeta"));
+        assert!(combined.contains("corpi celesti"));
+    }
+
+    #[test]
+    fn active_session_transcript_packet_marks_active_source() {
+        let (state, _root) = active_state_fixture(&[
+            "questa e una sessione attiva sullo stato del progetto",
+            "stiamo valutando il backlog STT e la GPU",
+        ]);
+        let packet = build_runtime_transcript_evidence_packet(
+            WorkSessionChatIntent::GenerateTranscriptSummary,
+            WorkSessionTargetKind::ActiveSession,
+            &state,
+            None,
+        );
+
+        assert_eq!(packet.source_kind, "active_session_transcript");
+        assert_eq!(packet.target.kind, "active_session");
+        assert_eq!(packet.evidence_items.len(), 2);
+        assert!(packet
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("sessione e ancora attiva")));
+        assert_eq!(evidence_source_label(&packet), "sessione attiva");
+    }
+
+    #[test]
+    fn active_session_extractive_fallback_names_active_source() {
+        let (state, _root) =
+            active_state_fixture(&["recap parziale dalla sessione attiva corrente"]);
+        let packet = build_runtime_transcript_evidence_packet(
+            WorkSessionChatIntent::GenerateTranscriptSummary,
+            WorkSessionTargetKind::ActiveSession,
+            &state,
+            None,
+        );
+        let fallback = render_extractive_transcript_summary(&packet);
+
+        assert!(fallback.contains("Fonte: sessione attiva"));
+        assert!(fallback.contains("recap parziale"));
+    }
+
+    #[test]
+    fn synthesis_prompt_includes_stt_incompleteness_warning() {
+        let (mut item, archive, _root) =
+            archived_transcript_fixture(&["segmento utile per controllare il warning STT"]);
+        item.stt_completeness_status = "incomplete_drain_timeout".to_string();
+        item.stt_completeness_detail = "1 segment pending".to_string();
+
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let prompt = build_tool_answer_synthesis_context(&packet);
+
+        assert!(prompt.contains("incomplete_drain_timeout"));
+        assert!(prompt.contains("STT completeness"));
+        assert!(prompt.contains("segmento utile"));
+    }
+
+    #[test]
+    fn dedicated_synthesis_messages_do_not_include_normal_assistant_persona() {
+        let (item, archive, _root) =
+            archived_transcript_fixture(&["contenuto transcript per sintesi dedicata"]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let messages = build_tool_answer_synthesis_messages("riassumi", &packet);
+        let serialized = serde_json::to_string(&messages).expect("messages json");
+
+        assert!(serialized.contains("evidence-grounded answer synthesizer"));
+        assert!(serialized.contains("output_schema"));
+        assert!(serialized.contains("session_archive_transcript"));
+        assert!(!serialized.contains("You are Astra, a local desktop AI assistant"));
+        assert!(!serialized.contains("AssistantResponseOptions"));
+    }
+
+    #[test]
+    fn valid_synthesis_json_returns_answer_with_existing_evidence_ids() {
+        let (item, archive, _root) = archived_transcript_fixture(&[
+            "La sessione parla di asteroidi e impatti con la Terra",
+            "Si cita il rischio e la possibilita di vita sul pianeta",
+        ]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let first_id = packet.evidence_items[0].evidence_id.clone();
+        let json = format!(
+            r#"{{
+                "answer": "La sessione parla di asteroidi, impatti con la Terra e rischio per la vita sul pianeta.",
+                "status": "answered",
+                "used_evidence_ids": ["{}"],
+                "confidence": 0.84,
+                "warnings": []
+            }}"#,
+            first_id
+        );
+
+        let output = parse_tool_answer_synthesis_output(&json, &packet).expect("valid synthesis");
+        let rendered = render_tool_synthesis_answer(&packet, &output);
+
+        assert!(rendered.contains("asteroidi"));
+        assert!(rendered.contains(&first_id));
+    }
+
+    #[test]
+    fn invalid_synthesis_json_falls_back_to_extractive_transcript_summary() {
+        let (item, archive, _root) = archived_transcript_fixture(&[
+            "primo segmento sugli asteroidi",
+            "secondo segmento sugli impatti",
+            "terzo segmento sulla Terra",
+        ]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+
+        assert!(parse_tool_answer_synthesis_output("not json", &packet).is_none());
+        let fallback = render_extractive_transcript_summary(&packet);
+
+        assert!(fallback.contains("primo segmento"));
+        assert!(fallback.contains("secondo segmento"));
+        assert!(fallback.contains("terzo segmento"));
+    }
+
+    #[test]
+    fn malformed_synthesis_json_with_trailing_comma_is_repaired() {
+        let (item, archive, _root) =
+            archived_transcript_fixture(&["segmento verificabile per repair JSON"]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let first_id = packet.evidence_items[0].evidence_id.clone();
+        let json = format!(
+            r#"{{
+                "answer": "Sintesi valida",
+                "status": "answered",
+                "used_evidence_ids": ["{}"],
+                "confidence": 0.8,
+                "warnings": [],
+            }}"#,
+            first_id
+        );
+
+        let outcome = parse_tool_answer_synthesis_output_with_repair(&json, &packet);
+
+        assert!(outcome.output.is_some());
+        assert!(outcome.repair_attempted);
+        assert!(outcome.repair_succeeded);
+    }
+
+    #[test]
+    fn synthesis_rejects_hallucinated_evidence_ids() {
+        let (item, archive, _root) =
+            archived_transcript_fixture(&["segmento verificabile per evidenze"]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let json = r#"{
+            "answer": "Sintesi con evidenza inventata",
+            "status": "answered",
+            "used_evidence_ids": ["missing-evidence"],
+            "confidence": 0.8,
+            "warnings": []
+        }"#;
+
+        assert!(parse_tool_answer_synthesis_output(json, &packet).is_none());
+    }
+
+    #[test]
+    fn extractive_fallback_includes_source_and_failure_reason() {
+        let (state, _root) =
+            active_state_fixture(&["contenuto utile per fallback dalla sessione attiva"]);
+        let packet = build_runtime_transcript_evidence_packet(
+            WorkSessionChatIntent::GenerateTranscriptSummary,
+            WorkSessionTargetKind::ActiveSession,
+            &state,
+            None,
+        );
+
+        let fallback =
+            render_extractive_transcript_summary_with_reason(&packet, Some("empty_model_content"));
+
+        assert!(fallback.contains("Fonte: sessione attiva"));
+        assert!(fallback.contains("Sintesi provvisoria estrattiva"));
+        assert!(fallback.contains("contenuto testuale vuoto"));
+        assert!(fallback.contains("contenuto utile"));
+    }
+
+    #[test]
+    fn tool_synthesis_timeout_and_num_predict_defaults_are_sla_safe() {
+        assert_eq!(
+            tool_synthesis_timeout_ms_from_env("gpt-oss:20b", None),
+            30_000
+        );
+        assert_eq!(tool_synthesis_timeout_ms_from_env("tiny", None), 15_000);
+        assert_eq!(
+            tool_synthesis_timeout_ms_from_env("gpt-oss:20b", Some("45000")),
+            45_000
+        );
+        assert_eq!(tool_synthesis_num_predict_from_env(None), 900);
+        assert_eq!(tool_synthesis_num_predict_from_env(Some("1200")), 1_200);
+    }
+
+    #[test]
+    fn tool_answer_synthesis_audit_payload_is_metadata_only() {
+        let (item, archive, _root) =
+            archived_transcript_fixture(&["testo transcript segreto sugli asteroidi"]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let payload = tool_answer_synthesis_audit_payload(&packet, "gpt-oss:20b", "answered");
+        let serialized = payload.to_string();
+
+        assert_eq!(payload["metadata_only"], true);
+        assert_eq!(payload["transcript_text_included_in_audit"], false);
+        assert_eq!(payload["answer_text_included_in_audit"], false);
+        assert!(!serialized.contains("testo transcript segreto"));
+        assert!(!serialized.contains("risposta sintetizzata"));
+    }
+
+    #[tokio::test]
+    async fn transcript_summary_no_archive_returns_useful_no_data_explanation() {
+        let root = std::env::temp_dir().join(format!("astra_no_archive_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let runtime = AssistantRuntime::new(root);
+        let history = Vec::new();
+        let route = test_work_session_route(
+            WorkSessionChatIntent::GenerateTranscriptSummary,
+            WorkSessionTargetKind::LatestArchivedSession,
+        );
+
+        let response = transcript_summary_work_session_from_chat(
+            None,
+            &runtime,
+            &route,
+            "di cosa abbiamo parlato nell'ultima registrazione?",
+            "typed",
+            &history,
+            "test-request",
+        )
+        .await
+        .expect("response");
+
+        assert!(response.contains("Non trovo"));
+        assert!(response.contains("transcript"));
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_rejects_normal_chat_route() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "normal_chat",
+                "tool": null,
+                "intent": null,
+                "target": {"kind": "none", "session_id": null},
+                "confidence": 0.91,
+                "language": "it",
+                "reason_code": "normal_chat"
+            }"#,
+        );
+
+        assert!(route.is_none());
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_rejects_malformed_json() {
+        assert!(parse_active_model_work_session_route("not json").is_none());
+    }
+
+    #[test]
+    fn router_default_timeout_is_sla_safe_for_gpt_oss_20b() {
+        assert!(router_timeout_ms_from_env("gpt-oss:20b", None) > 8_000);
+        assert_eq!(router_timeout_ms_from_env("gpt-oss:20b", None), 25_000);
+    }
+
+    #[test]
+    fn router_timeout_env_override_is_honored() {
+        assert_eq!(
+            router_timeout_ms_from_env("gpt-oss:20b", Some("45000")),
+            45_000
+        );
+        assert_eq!(
+            router_timeout_ms_from_env("gpt-oss:20b", Some("999")),
+            25_000
+        );
+    }
+
+    #[test]
+    fn minimal_router_messages_do_not_include_normal_assistant_persona() {
+        let messages = build_assistant_tool_router_messages(
+            "di cosa abbiamo parlato nell'ultima registrazione?",
+            &[],
+            None,
+            None,
+        );
+        let combined = messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(combined.contains("Astra's tool router"));
+        assert!(!combined.contains("Sei Astra, un'assistente AI locale"));
+        assert!(!combined.contains("Rispondi in italiano naturale"));
+        assert!(!combined.contains("Work Session context (metadata only)"));
+    }
+
+    #[test]
+    fn minimal_router_messages_include_manifest_and_discourse_metadata() {
+        let memory = sample_work_session_memory();
+        let runtime_context = serde_json::json!({
+            "latest_archived_session_present": true,
+            "latest_archived_transcript_count": 6,
+            "metadata_only": true,
+        });
+        let messages = build_assistant_tool_router_messages(
+            "analizza quei sei pezzi salvati",
+            &[],
+            Some(&memory),
+            Some(&runtime_context),
+        );
+        let user_content = messages[1]
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .expect("router user content");
+
+        assert!(user_content.contains("work_session.transcript_summary"));
+        assert!(user_content.contains("last_referenced_session_id"));
+        assert!(user_content.contains("latest_archived_transcript_count"));
+        assert!(!user_content.contains("Summary evidence"));
+    }
+
+    #[test]
+    fn router_empty_response_does_not_fall_through_to_generic_empty_model_text() {
+        let result = AssistantToolRouterRuntimeResult::EmptyModelContent {
+            model: "gpt-oss:20b".to_string(),
+        };
+        assert!(assistant_router_runtime_result_to_work_session_decision(result.clone()).is_none());
+
+        let response = render_router_runtime_failure_response(&result);
+        assert!(response.contains("routing tool-aware"));
+        assert!(!response.contains("Non ho ricevuto una risposta testuale"));
+        assert!(!response.contains("chat normale"));
+    }
+
+    #[test]
+    fn malformed_router_json_returns_safe_router_failure_text() {
+        let result = AssistantToolRouterRuntimeResult::Malformed {
+            reason: RouterFailureReason::MalformedJson,
+            raw_len: 16,
+        };
+        assert!(assistant_router_runtime_result_to_work_session_decision(result.clone()).is_none());
+
+        let response = render_router_runtime_failure_response(&result);
+        assert!(response.contains("JSON valido"));
+        assert!(!response.contains("Non ho ricevuto"));
+        assert!(!response.contains("Non ho ricevuto una risposta testuale"));
+    }
+
+    #[test]
+    fn router_timeout_returns_safe_diagnostic_text() {
+        let result = AssistantToolRouterRuntimeResult::Timeout { timeout_ms: 8_000 };
+        assert!(assistant_router_runtime_result_to_work_session_decision(result.clone()).is_none());
+
+        let response = render_router_runtime_failure_response(&result);
+        assert!(response.contains("8000 ms"));
+        assert!(response.contains("Nessuna azione Work Session"));
+        assert!(!response.contains("Non ho ricevuto"));
+    }
+
+    #[test]
+    fn router_unavailable_returns_safe_diagnostic_text() {
+        let result = AssistantToolRouterRuntimeResult::Unavailable {
+            reason: RouterFailureReason::OllamaUnavailable,
+        };
+        assert!(assistant_router_runtime_result_to_work_session_decision(result.clone()).is_none());
+
+        let response = render_router_runtime_failure_response(&result);
+        assert!(response.contains("modello locale"));
+        assert!(response.contains("Nessuna azione Work Session"));
+        assert!(!response.contains("Non ho ricevuto"));
+    }
+
+    #[test]
+    fn unknown_router_tool_never_executes_as_work_session_route() {
+        let result = parse_router_runtime_result(
+            r#"{
+                "route": "tool_call",
+                "tool": "desktop.control",
+                "intent": "click",
+                "target": {"kind": "current_screen", "session_id": null},
+                "confidence": 0.99,
+                "reason_code": "unsafe"
+            }"#,
+            "gpt-oss:20b",
+        );
+
+        assert!(matches!(
+            result,
+            AssistantToolRouterRuntimeResult::Malformed {
+                reason: RouterFailureReason::InvalidTool,
+                ..
+            }
+        ));
+        assert!(assistant_router_runtime_result_to_work_session_decision(result).is_none());
+    }
+
+    #[test]
+    fn router_diagnostics_are_metadata_only() {
+        let mut diagnostics = AssistantRouterDiagnostics {
+            request_id: None,
+            router_called: true,
+            model: Some("gpt-oss:20b".to_string()),
+            endpoint_label: Some("http://127.0.0.1:11434".to_string()),
+            route: None,
+            tool: None,
+            target_kind: None,
+            confidence: None,
+            reason_code: None,
+            failure_reason: None,
+            used_json_mode: true,
+            duration_ms: Some(12),
+            fallback_kind: None,
+            repair_attempted: false,
+            repair_succeeded: false,
+            prompt_char_count: Some(1200),
+            full_router_invoked_reason: None,
+            metadata_only: true,
+            raw_message_included: false,
+            raw_router_prompt_included: false,
+            raw_model_output_included: false,
+            transcript_text_included: false,
+            answer_text_included: false,
+            screen_summary_included: false,
+        };
+        let result = AssistantToolRouterRuntimeResult::Malformed {
+            reason: RouterFailureReason::MalformedJson,
+            raw_len: 42,
+        };
+        update_router_diagnostics_from_result(&mut diagnostics, &result);
+        let serialized = serde_json::to_string(&diagnostics).expect("diagnostics json");
+
+        assert!(diagnostics.metadata_only);
+        assert!(!diagnostics.raw_message_included);
+        assert!(!diagnostics.raw_router_prompt_included);
+        assert!(!diagnostics.raw_model_output_included);
+        assert!(!diagnostics.transcript_text_included);
+        assert!(!diagnostics.answer_text_included);
+        assert!(!serialized.contains("raw user message"));
+        assert_eq!(diagnostics.failure_reason.as_deref(), Some("MalformedJson"));
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_rejects_low_confidence() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.attach_screen",
+                "intent": "attach_screen_context",
+                "target": {"kind": "current_screen", "session_id": null},
+                "confidence": 0.41,
+                "language": "it",
+                "reason_code": "uncertain"
+            }"#,
+        );
+
+        assert!(route.is_none());
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_clarifies_medium_confidence_action() {
+        match parse_active_model_work_session_decision(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.details",
+                "intent": "generate_details",
+                "target": {"kind": "last_referenced_session", "session_id": "session-1234567890"},
+                "confidence": 0.71,
+                "language": "it",
+                "reason_code": "ambiguous_followup"
+            }"#,
+        ) {
+            Some(WorkSessionRoutingDecision::Clarify { message, .. }) => {
+                assert!(message.contains("Work Session"));
+            }
+            _ => panic!("expected clarification for medium-confidence action"),
+        }
+    }
+
+    #[test]
+    fn active_model_work_session_json_classifier_rejects_unsafe_target() {
+        let route = parse_active_model_work_session_route(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.attach_screen",
+                "intent": "attach_screen_context",
+                "target": {"kind": "desktop_control", "session_id": null},
+                "confidence": 0.91,
+                "language": "it",
+                "reason_code": "unsafe_target"
+            }"#,
+        );
+
+        assert!(route.is_none());
+    }
+
+    fn sample_work_session_memory() -> WorkSessionChatMemory {
+        WorkSessionChatMemory {
+            last_user_message: Some("mi fai un recap dell'ultima sessione".to_string()),
+            last_assistant_summary: Some(
+                "Answered Work Session recap for Latest archived session".to_string(),
+            ),
+            last_intent: WorkSessionChatIntent::GenerateIntelligence,
+            last_target: "latest_archived_session".to_string(),
+            last_referenced_session_id: Some("session-1234567890".to_string()),
+            last_referenced_session_title: Some("Latest archived session".to_string()),
+            last_referenced_object_type: Some("recap".to_string()),
+            last_referenced_object_ids: vec!["seg-1".to_string()],
+            last_answer_kind: "recap_latest_archived_session".to_string(),
+            last_query: Some("recap sessione".to_string()),
+            last_query_hash: Some(sha256_hex("recap sessione")),
+            evidence: vec![WorkSessionChatEvidenceMemory {
+                session_id: "session-1234567890".to_string(),
+                session_title: "Latest archived session".to_string(),
+                matched_kind: "summary".to_string(),
+                snippet: "Summary evidence".to_string(),
+                evidence_segment_ids: vec!["seg-1".to_string()],
+                screen_context_ids: vec!["ctx-1".to_string()],
+            }],
+            last_screen_context_ids: vec!["ctx-1".to_string()],
+            last_response_had_details: false,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn full_router_prompt_budget_is_hard_capped_for_short_followup() {
+        let memory = sample_work_session_memory();
+        let mut working_context = WorkingContextFrame::default();
+        working_context.update_from_tool_result(ToolResultFrame::compact(
+            "work_session.recap",
+            "work_session_recap",
+            "session_archive_transcript",
+            "ultima sessione archiviata",
+            Some("session-1234567890".to_string()),
+            vec!["seg-1".to_string()],
+            1,
+            "La sessione parlava della formazione della Terra primordiale, oceano di magma, atmosfera primitiva e primi mari.",
+            Vec::new(),
+            Some(0.9),
+        ));
+        let history = (0..12)
+            .flat_map(|index| {
+                [
+                    ConversationMessage {
+                        role: "user".to_string(),
+                        content: format!("domanda precedente {index} {}", "x".repeat(900)),
+                    },
+                    ConversationMessage {
+                        role: "assistant".to_string(),
+                        content: format!("risposta precedente {index} {}", "y".repeat(1400)),
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        let runtime_context = serde_json::json!({
+            "latest_archived_session_present": true,
+            "latest_archived_title": "Latest archived session",
+            "metadata_blob": "z".repeat(8_000),
+            "metadata_only": true,
+        });
+
+        let messages = build_assistant_tool_router_messages_budgeted(
+            "quindi si parlava di marte?",
+            &history,
+            Some(&memory),
+            Some(&runtime_context),
+            Some(&working_context),
+        );
+        let prompt_chars = context_broker::prompt_char_count(&messages);
+
+        assert!(prompt_chars <= context_broker::FULL_ROUTER_HARD_CAP_CHARS);
+    }
+
+    #[test]
+    fn ordinary_natural_language_uses_active_model_router_without_phrase_fallback() {
+        let memory = Some(sample_work_session_memory());
+        match decide_work_session_routing("mi dai piu dettagli al riguardo?", &memory) {
+            WorkSessionRoutingDecision::ActiveModel => {}
+            _ => panic!("expected active model router for natural-language message"),
+        }
+    }
+
+    #[test]
+    fn work_session_phrase_classifier_is_not_primary_path() {
+        let memory = Some(sample_work_session_memory());
+        assert!(matches!(
+            decide_work_session_routing("analizza quei 6 transcript e fammi un riassunto", &memory),
+            WorkSessionRoutingDecision::ActiveModel
+        ));
+        assert_eq!(
+            work_session_chat::parse_work_session_chat_intent(
+                "analizza quei 6 transcript e fammi un riassunto"
+            ),
+            WorkSessionChatIntent::Unknown
+        );
+    }
+
+    #[test]
+    fn mock_model_routes_contextual_transcript_followup_to_transcript_summary() {
+        match parse_active_model_work_session_decision(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.transcript_summary",
+                "intent": "summarize_transcript",
+                "target": {
+                    "kind": "last_referenced_session",
+                    "session_id": "session-1234567890",
+                    "object_type": "transcript",
+                    "object_ids": ["seg-1", "seg-2"]
+                },
+                "confidence": 0.89,
+                "language": "it",
+                "query": "analizza i transcript salvati",
+                "reason_code": "contextual_transcript_reference"
+            }"#,
+        ) {
+            Some(WorkSessionRoutingDecision::Tool { route, .. }) => {
+                assert_eq!(
+                    route.intent,
+                    WorkSessionChatIntent::GenerateTranscriptSummary
+                );
+            }
+            _ => panic!("expected transcript summary tool route"),
+        }
+    }
+
+    #[test]
+    fn mock_model_routes_contextual_details_followup_to_details() {
+        match parse_active_model_work_session_decision(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.details",
+                "intent": "generate_details",
+                "target": {
+                    "kind": "last_referenced_session",
+                    "session_id": "session-1234567890",
+                    "object_type": "recap",
+                    "object_ids": []
+                },
+                "confidence": 0.86,
+                "language": "it",
+                "query": "piu dettagli sul riferimento precedente",
+                "reason_code": "contextual_details_reference"
+            }"#,
+        ) {
+            Some(WorkSessionRoutingDecision::Tool { route, .. }) => {
+                assert_eq!(route.intent, WorkSessionChatIntent::GenerateDetails);
+            }
+            _ => panic!("expected details tool route"),
+        }
+    }
+
+    #[test]
+    fn contextual_followup_without_memory_clarifies() {
+        match parse_active_model_work_session_decision(
+            r#"{
+                "route": "clarify",
+                "tool": null,
+                "intent": null,
+                "target": {"kind": "none", "session_id": null},
+                "confidence": 0.77,
+                "language": "it",
+                "reason_code": "missing_discourse_reference"
+            }"#,
+        ) {
+            Some(WorkSessionRoutingDecision::Clarify { message, .. }) => {
+                assert!(message.contains("Work Session"))
+            }
+            _ => panic!("expected clarification"),
+        }
+    }
+
+    #[test]
+    fn mock_model_routes_evidence_followup_to_show_evidence() {
+        match parse_active_model_work_session_decision(
+            r#"{
+                "route": "tool_call",
+                "tool": "work_session.show_evidence",
+                "intent": "show_evidence",
+                "target": {
+                    "kind": "last_referenced_session",
+                    "session_id": "session-1234567890",
+                    "object_type": "evidence",
+                    "object_ids": ["seg-1"]
+                },
+                "confidence": 0.9,
+                "language": "it",
+                "query": null,
+                "reason_code": "evidence_followup"
+            }"#,
+        ) {
+            Some(WorkSessionRoutingDecision::Tool { route, .. }) => {
+                assert_eq!(route.intent, WorkSessionChatIntent::ShowEvidence);
+            }
+            _ => panic!("expected evidence tool route"),
+        }
+    }
+
+    #[test]
+    fn normal_chat_does_not_trigger_work_session_route() {
+        assert!(matches!(
+            parse_active_model_work_session_decision(
+                r#"{
+                    "route": "normal_chat",
+                    "tool": null,
+                    "intent": null,
+                    "target": {"kind": "none", "session_id": null},
+                    "confidence": 0.94,
+                    "language": "it",
+                    "reason_code": "ordinary_chat"
+                }"#
+            )
+            .expect("normal route"),
+            WorkSessionRoutingDecision::NormalChat
+        ));
+    }
+
+    #[test]
+    fn mock_model_returns_normal_chat_for_ordinary_question() {
+        assert!(matches!(
+            parse_active_model_work_session_decision(
+                r#"{
+                    "route": "normal_chat",
+                    "tool": null,
+                    "intent": null,
+                    "target": {"kind": "none", "session_id": null, "object_type": null, "object_ids": []},
+                    "confidence": 0.95,
+                    "language": "it",
+                    "query": "chi sei?",
+                    "reason_code": "ordinary_assistant_question"
+                }"#
+            )
+            .expect("normal route"),
+            WorkSessionRoutingDecision::NormalChat
+        ));
     }
 
     #[test]
@@ -4757,6 +9726,8 @@ pub fn run() {
             pause_meeting_session,
             resume_meeting_session,
             stop_meeting_session,
+            recover_failed_meeting_capture,
+            force_finalize_failed_meeting_capture,
             list_meeting_sessions,
             read_meeting_session_archive,
             search_meeting_sessions,

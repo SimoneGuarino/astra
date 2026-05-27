@@ -1007,18 +1007,11 @@ fn speaker_label_for_entry(
     entry: &TranscriptEntry,
 ) -> SpeakerLabel {
     let requested_name = entry.speaker.trim();
-    let requested_is_explicit = !requested_name.is_empty()
-        && !matches!(
-            requested_name.to_ascii_lowercase().as_str(),
-            "unknown" | "stt" | "manual" | "imported"
-        );
+    let requested_is_explicit =
+        !requested_name.is_empty() && !is_source_placeholder_speaker(entry.source, requested_name);
 
     let mut default_label = SpeakerLabel::source_default(entry.source);
-    if matches!(
-        entry.source,
-        TranscriptSource::Manual | TranscriptSource::ImportedFile
-    ) && requested_is_explicit
-    {
+    if requested_is_explicit {
         default_label.speaker_id = stable_user_assigned_speaker_id(entry.source, requested_name);
         default_label.display_name = requested_name.to_string();
         default_label.confidence = 1.0;
@@ -1035,6 +1028,29 @@ fn speaker_label_for_entry(
 
     speakers.push(default_label.clone());
     default_label
+}
+
+fn is_source_placeholder_speaker(source: TranscriptSource, speaker: &str) -> bool {
+    let normalized = speaker.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if matches!(
+        normalized.as_str(),
+        "unknown" | "stt" | "manual" | "imported"
+    ) {
+        return true;
+    }
+    match source {
+        TranscriptSource::Microphone => matches!(normalized.as_str(), "mic" | "microphone"),
+        TranscriptSource::SystemAudio => {
+            matches!(
+                normalized.as_str(),
+                "system" | "system audio" | "pc audio" | "desktop audio"
+            )
+        }
+        TranscriptSource::Manual | TranscriptSource::ImportedFile | TranscriptSource::Unknown => {
+            false
+        }
+    }
 }
 
 fn apply_source_default_speaker(speakers: &mut Vec<SpeakerLabel>, entry: &mut TranscriptEntry) {

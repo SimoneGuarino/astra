@@ -26,10 +26,24 @@ const meetingEvents = [
     "meeting-diagnostics-updated",
 ];
 
+function statusKind(status: MeetingSessionState["status"] | MeetingSession["status"] | null | undefined) {
+    if (!status) return "unknown";
+    if (typeof status === "string") return status;
+    if ("failed" in status) return "failed";
+    return "error";
+}
+
 function statusLabel(session: MeetingSession | null, state: MeetingSessionState | null) {
+    const kind = statusKind(state?.status ?? session?.status ?? null);
+    if (session && kind === "failed" && session.capture_active === false) return "failed/recoverable";
+    if (session && kind === "failed") return "failed";
     if (session) return "active";
     if (state) return "stopped";
     return "none";
+}
+
+function statusClassName(label: string) {
+    return label.replace("/", "_");
 }
 
 function sumWritten(capabilities: MeetingLiveCapabilitySnapshot | null) {
@@ -56,6 +70,14 @@ function sumInFlight(capabilities: MeetingLiveCapabilitySnapshot | null) {
     );
 }
 
+function sumQueueDepth(capabilities: MeetingLiveCapabilitySnapshot | null) {
+    if (!capabilities) return 0;
+    return (
+        (capabilities.system_capture_health.metrics.current_queue_depth ?? 0) +
+        (capabilities.microphone_capture_health.metrics.current_queue_depth ?? 0)
+    );
+}
+
 function compactError(error: unknown) {
     return error instanceof Error ? error.message : String(error);
 }
@@ -69,6 +91,8 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
     const [busyAction, setBusyAction] = useState<WorkSessionAction | null>(null);
     const [chatCommandStatus, setChatCommandStatus] = useState<string | null>(null);
     const [lastError, setLastError] = useState<string | null>(null);
+    const [isMinimized, setIsMinimized] = useState(false);
+    const [isDismissed, setIsDismissed] = useState(false);
 
     const refresh = useCallback(async () => {
         try {
@@ -122,21 +146,32 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
     useEffect(() => {
         let cancelled = false;
         const unlisteners: Array<() => void> = [];
+        let routeTimer: ReturnType<typeof setTimeout> | null = null;
 
         const describeIntent = (intent?: string) => {
             switch (intent) {
+                case "route_request":
+                    return "Routing request";
+                case "router_failed":
+                    return "Router failed";
                 case "stop_session":
                 case "stop_and_generate_recap":
                     return "Stopping / draining STT";
                 case "attach_screen_context":
                     return "Attaching screen context";
+                case "generate_transcript_summary":
+                    return "Analyzing transcript";
                 case "generate_intelligence":
                 case "generate_technical_recap":
                 case "generate_follow_up_draft":
                     return "Generating recap";
+                case "generate_details":
+                    return "Loading session details";
                 case "recall_session_memory":
                 case "search_session_memory":
                     return "Reading session memory";
+                case "show_evidence":
+                    return "Showing evidence";
                 case "start_session":
                     return "Starting session";
                 default:
@@ -148,7 +183,18 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
             const started = await listen<WorkSessionChatCommandEvent>(
                 "work-session-chat-command-started",
                 (event) => {
-                    if (!cancelled) setChatCommandStatus(describeIntent(event.payload.intent));
+                    if (routeTimer) {
+                        clearTimeout(routeTimer);
+                        routeTimer = null;
+                    }
+                    if (!cancelled) {
+                        setChatCommandStatus(describeIntent(event.payload.intent));
+                        if (event.payload.intent === "route_request") {
+                            routeTimer = setTimeout(() => {
+                                if (!cancelled) setChatCommandStatus("Routing with local model...");
+                            }, 2000);
+                        }
+                    }
                 }
             );
             unlisteners.push(started);
@@ -156,6 +202,10 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
                 "work-session-chat-command-finished",
                 () => {
                     if (!cancelled) {
+                        if (routeTimer) {
+                            clearTimeout(routeTimer);
+                            routeTimer = null;
+                        }
                         setChatCommandStatus(null);
                         void refresh();
                     }
@@ -170,17 +220,24 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
 
         return () => {
             cancelled = true;
+            if (routeTimer) clearTimeout(routeTimer);
             unlisteners.forEach((unlisten) => unlisten());
         };
     }, [refresh]);
 
     useEffect(() => {
-        const intervalMs = activeSession ? 2000 : 6000;
+        const intervalMs = activeSession || busyAction || chatCommandStatus ? 2000 : 6000;
         const timer = window.setInterval(() => {
             void refresh();
         }, intervalMs);
         return () => window.clearInterval(timer);
-    }, [activeSession, refresh]);
+    }, [activeSession, busyAction, chatCommandStatus, refresh]);
+
+    useEffect(() => {
+        if (activeSession || busyAction || chatCommandStatus) {
+            setIsDismissed(false);
+        }
+    }, [activeSession, busyAction, chatCommandStatus]);
 
     const displayState = activeSession ? activeState : lastCompletedState;
     const transcriptCount = displayState?.transcript.length ?? 0;
@@ -188,15 +245,48 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
     const written = sumWritten(capabilities);
     const transcribed = sumTranscribed(capabilities);
     const inFlight = sumInFlight(capabilities);
+    const queueDepth = sumQueueDepth(capabilities);
     const micActive = capabilities?.microphone_capture_health.active_handle_present ?? false;
     const systemActive = capabilities?.system_capture_health.active_handle_present ?? false;
     const controlsBusy = busyAction !== null || chatCommandStatus !== null;
+    const currentStatusLabel = statusLabel(activeSession, displayState);
+    const currentStatusClass = statusClassName(currentStatusLabel);
+    const captureSummaryStatus = capabilities?.capture_summary_status ?? null;
+    const captureFailed =
+        captureSummaryStatus === "failed" ||
+        (
+            captureSummaryStatus === null &&
+            (
+                Boolean(activeSession && statusKind(displayState?.status ?? activeSession.status) === "failed") ||
+                capabilities?.capture_health.state === "failed" ||
+                capabilities?.capture_health.status === "failed"
+            )
+        );
+    const captureDegraded = captureSummaryStatus === "degraded";
+    const captureStatusLabel = captureDegraded ? "degraded" : captureFailed ? "failed" : null;
+    const progressLabel =
+        chatCommandStatus ??
+        (busyAction === "stop"
+            ? "Stopping / draining STT"
+            : busyAction === "attach_screen"
+              ? "Attaching screen context"
+              : busyAction === "generate_recap"
+                ? "Generating recap"
+                : null);
+    const hasVisibleSession = Boolean(activeSession || displayState || controlsBusy || lastError);
+    const canDismiss = !activeSession && !controlsBusy && Boolean(displayState);
 
     const sttLabel = useMemo(() => {
-        if (written === 0 && inFlight === 0) return "idle";
-        if (inFlight > 0) return `${transcribed}/${written} transcribed, ${inFlight} in-flight`;
+        const pending = Math.max(0, written - transcribed);
+        if (written === 0 && inFlight === 0 && queueDepth === 0) return "idle";
+        if (queueDepth > 0 || inFlight > 0 || pending > 0) {
+            const details = [`${transcribed}/${written} transcribed`];
+            if (queueDepth > 0) details.push(`${queueDepth} queued`);
+            if (inFlight > 0) details.push(`${inFlight} in-flight`);
+            return `catching up: ${details.join(", ")}`;
+        }
         return `${transcribed}/${written} transcribed`;
-    }, [inFlight, transcribed, written]);
+    }, [inFlight, queueDepth, transcribed, written]);
 
     const runAction = useCallback(
         async (action: WorkSessionAction, operation: () => Promise<unknown>) => {
@@ -238,19 +328,54 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
         [meeting, runAction]
     );
 
+    if ((!hasVisibleSession || isDismissed) && !activeSession && !controlsBusy) {
+        return null;
+    }
+
+    if (isMinimized) {
+        return (
+            <section className="work-session-strip work-session-strip--minimized" aria-label="Work Session status">
+                <div className="work-session-strip__main">
+                    <span className={`work-session-strip__state work-session-strip__state--${currentStatusClass}`}>
+                        Work Session: {currentStatusLabel}
+                    </span>
+                    {captureStatusLabel ? <span>Capture: {captureStatusLabel}</span> : null}
+                    <span>Transcript: {transcriptCount}</span>
+                    <span>STT: {sttLabel}</span>
+                    {progressLabel ? <span>{progressLabel}</span> : null}
+                </div>
+                <div className="work-session-strip__actions">
+                    <Button variant="text" radius="full" size="xs" onClick={() => setIsMinimized(false)}>
+                        Expand
+                    </Button>
+                    <Button variant="text" radius="full" size="xs" onClick={onOpenDetails}>
+                        Details
+                    </Button>
+                    {canDismiss ? (
+                        <Button variant="text" radius="full" size="xs" onClick={() => setIsDismissed(true)}>
+                            Dismiss
+                        </Button>
+                    ) : null}
+                </div>
+                {lastError ? <div className="work-session-strip__error">{lastError}</div> : null}
+            </section>
+        );
+    }
+
     return (
         <section className="work-session-strip" aria-label="Work Session status">
             <div className="work-session-strip__main">
-                <span className={`work-session-strip__state work-session-strip__state--${statusLabel(activeSession, displayState)}`}>
-                    Work Session: {statusLabel(activeSession, displayState)}
+                <span className={`work-session-strip__state work-session-strip__state--${currentStatusClass}`}>
+                    Work Session: {currentStatusLabel}
                 </span>
+                {captureStatusLabel ? <span>Capture: {captureStatusLabel}</span> : null}
                 <span>Mic: {micActive ? "active" : "inactive"}</span>
                 <span>System: {systemActive ? "active" : "inactive"}</span>
                 <span>Transcript: {transcriptCount}</span>
                 <span>STT: {sttLabel}</span>
                 <span>Screen: {screenContextCount}</span>
                 <span>Intel: {displayState?.intelligence ? "generated" : "none"}</span>
-                {chatCommandStatus ? <span>{chatCommandStatus}</span> : null}
+                {progressLabel ? <span>{progressLabel}</span> : null}
             </div>
             <div className="work-session-strip__actions">
                 {activeSession ? (
@@ -285,6 +410,14 @@ export function WorkSessionStatusStrip({ onOpenDetails }: WorkSessionStatusStrip
                 <Button variant="text" radius="full" size="xs" onClick={onOpenDetails}>
                     Details
                 </Button>
+                <Button variant="text" radius="full" size="xs" onClick={() => setIsMinimized(true)}>
+                    Minimize
+                </Button>
+                {canDismiss ? (
+                    <Button variant="text" radius="full" size="xs" onClick={() => setIsDismissed(true)}>
+                        Dismiss
+                    </Button>
+                ) : null}
             </div>
             {lastError ? <div className="work-session-strip__error">{lastError}</div> : null}
         </section>

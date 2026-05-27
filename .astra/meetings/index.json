@@ -1,7 +1,71 @@
 {
   "schema_version": 2,
-  "updated_at": "2026-05-20T08:07:17.304387300Z",
+  "updated_at": "2026-05-25T19:10:53.787065700Z",
   "sessions": [
+    {
+      "session_id": "4eb42b1a-a3a1-4082-9e2e-c89a8581c2fc",
+      "title": "Speaking: Speaker 1",
+      "platform": "teams",
+      "session_mode": "real_capture",
+      "started_at": "2026-05-25T18:58:12.014602200Z",
+      "ended_at": "2026-05-25T19:10:53.767578800Z",
+      "duration_ms": 761752,
+      "transcript_count": 11,
+      "intelligence_present": false,
+      "summary_preview": "Speaking: Speaker 1",
+      "action_item_count": 0,
+      "decision_count": 0,
+      "open_question_count": 0,
+      "risk_count": 0,
+      "technical_recap_present": false,
+      "speakers_preview": [
+        "You",
+        "Speaker 1",
+        "Manual",
+        "Imported",
+        "Unknown"
+      ],
+      "capture_sources": [
+        "system_audio"
+      ],
+      "stt_completeness_status": "incomplete_drain_timeout",
+      "stt_completeness_detail": "incomplete_drain_timeout; system incomplete_drain_timeout (11/12 transcribed, 0 queued, 1 in-flight, 0 failed, 1 timeout); microphone complete_no_speech (0/0 transcribed, 0 queued, 0 in-flight, 0 failed, 0 timeout)",
+      "screen_context_count": 2,
+      "drain_status": "timed_out",
+      "last_updated_at": "2026-05-25T19:10:53.767158100Z"
+    },
+    {
+      "session_id": "124517a6-340d-42a1-be9d-e25e1d30d1a5",
+      "title": "Speaking: Speaker 1",
+      "platform": "teams",
+      "session_mode": "real_capture",
+      "started_at": "2026-05-24T18:52:16.133109300Z",
+      "ended_at": "2026-05-24T19:09:04.669593900Z",
+      "duration_ms": 1008536,
+      "transcript_count": 16,
+      "intelligence_present": false,
+      "summary_preview": "Speaking: Speaker 1",
+      "action_item_count": 0,
+      "decision_count": 0,
+      "open_question_count": 0,
+      "risk_count": 0,
+      "technical_recap_present": false,
+      "speakers_preview": [
+        "You",
+        "Speaker 1",
+        "Manual",
+        "Imported",
+        "Unknown"
+      ],
+      "capture_sources": [
+        "system_audio"
+      ],
+      "stt_completeness_status": "incomplete_failed_segments",
+      "stt_completeness_detail": "incomplete_failed_segments; system incomplete_failed_segments (16/18 transcribed, 0 queued, 0 in-flight, 2 failed, 1 timeout); microphone complete_no_speech (0/0 transcribed, 0 queued, 0 in-flight, 0 failed, 0 timeout)",
+      "screen_context_count": 1,
+      "drain_status": "completed",
+      "last_updated_at": "2026-05-24T19:09:04.669270300Z"
+    },
     {
       "session_id": "40e127cc-5822-4ec2-98ea-dbd5de4d7eac",
       "title": "Speaking: Speaker 1",

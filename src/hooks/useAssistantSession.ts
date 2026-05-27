@@ -11,10 +11,13 @@ import { useVoiceSession } from "./useVoiceSession";
 import type {
     AssistantErrorEvent,
     AssistantInterruptedEvent,
+    AssistantOrchestratorDiagnostic,
     AssistantRequestFinishedEvent,
     AssistantRequestSettledEvent,
     AssistantRequestStartedEvent,
+    AssistantRouterDiagnostic,
     AssistantStatus,
+    AssistantToolSynthesisDiagnostic,
     ChatMessage,
     RequestMetricsSnapshot,
     SpeechSegmentQueuedEvent,
@@ -560,6 +563,18 @@ export function useAssistantSession() {
         console.info("Astra route diagnostic:", event);
     }, []);
 
+    const handleRouterDiagnostic = useCallback((event: AssistantRouterDiagnostic) => {
+        console.debug("Astra router diagnostic:", event);
+    }, []);
+
+    const handleOrchestratorDiagnostic = useCallback((event: AssistantOrchestratorDiagnostic) => {
+        console.debug("Astra orchestrator diagnostic:", event);
+    }, []);
+
+    const handleToolSynthesisDiagnostic = useCallback((event: AssistantToolSynthesisDiagnostic) => {
+        console.debug("Astra tool synthesis diagnostic:", event);
+    }, []);
+
     const handleStatus = useCallback(
         (nextStatus: AssistantStatus) => {
             if (nextStatus === "idle") {
@@ -607,6 +622,9 @@ export function useAssistantSession() {
         onVoiceSessionTranscript: handleVoiceSessionTranscript,
         onVoiceTurnMetrics: setLastVoiceMetrics,
         onRouteDiagnostic: handleRouteDiagnostic,
+        onOrchestratorDiagnostic: handleOrchestratorDiagnostic,
+        onRouterDiagnostic: handleRouterDiagnostic,
+        onToolSynthesisDiagnostic: handleToolSynthesisDiagnostic,
     });
 
     return {

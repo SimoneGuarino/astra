@@ -703,6 +703,8 @@ export type CaptureHealthStatus =
     | "stop_timed_out"
     | "failed";
 
+export type CaptureSummaryStatus = "active" | "degraded" | "failed" | "inactive";
+
 export type CaptureOverflowPolicy =
     | "reject_newest"
     | "drop_oldest_and_report"
@@ -847,5 +849,9 @@ export type MeetingLiveCapabilitySnapshot = {
     live_summarization: MeetingCapabilityReadiness;
     follow_up: MeetingCapabilityReadiness;
     capture_health: CaptureHealth;
+    capture_summary_status: CaptureSummaryStatus;
+    capture_summary_reason?: string | null;
+    active_sources: string[];
+    failed_sources: string[];
     stt_adapter: MeetingSttAdapterStatus;
 };

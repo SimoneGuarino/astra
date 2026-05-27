@@ -12,8 +12,6 @@ use serde_json::{json, Value};
 use std::env;
 use uuid::Uuid;
 
-const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
-
 #[derive(Clone)]
 pub struct ModelAssistedPlanner {
     client: Client,
@@ -61,7 +59,7 @@ impl ModelAssistedPlanner {
     async fn fetch_installed_models(&self) -> Result<Vec<String>, String> {
         let response = self
             .client
-            .get(format!("{OLLAMA_BASE_URL}/api/tags"))
+            .get(crate::model_routing::ollama_endpoint("/api/tags"))
             .send()
             .await
             .map_err(|error| format!("Ollama planner tags request failed: {error}"))?;
@@ -106,7 +104,7 @@ impl ModelAssistedPlanner {
 
         let response = self
             .client
-            .post(format!("{OLLAMA_BASE_URL}/api/chat"))
+            .post(crate::model_routing::ollama_endpoint("/api/chat"))
             .json(&payload)
             .send()
             .await

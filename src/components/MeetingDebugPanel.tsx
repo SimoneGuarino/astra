@@ -37,9 +37,11 @@ type MeetingUiState =
     | "blocked_permissions"
     | "ready_to_record"
     | "recording"
+    | "degraded"
     | "transcribing"
     | "paused"
     | "failed"
+    | "failed_recoverable"
     | "completed";
 
 type MeetingUiSummary = {
@@ -821,6 +823,37 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             metrics?.last_backend_error_message ??
             metrics?.last_segment_transcription_error_kind ??
             null;
+        const poisonQuarantined = diagnostics.some((diagnostic) =>
+            diagnostic.code.includes("capture_controller_poisoned") ||
+            diagnostic.code.includes("capture_controller_recovered")
+        );
+        const recoverableCaptureFailure =
+            hasActiveSession &&
+            sessionMode === "real_capture" &&
+            activeSession?.capture_active !== true &&
+            (currentStatusKind === "failed" ||
+                liveCapabilities?.capture_health.state === "failed" ||
+                liveCapabilities?.capture_health.status === "failed") &&
+            (
+                failureReason?.includes("capture") ||
+                failureReason?.includes("poison") ||
+                poisonQuarantined ||
+                currentStatusKind === "failed"
+            );
+
+        if (liveCapabilities?.capture_summary_status === "degraded") {
+            return {
+                state: "degraded",
+                title: "Partial capture active",
+                description:
+                    liveCapabilities.capture_summary_reason ??
+                    `Active sources: ${liveCapabilities.active_sources.join(", ") || "unknown"}. Failed sources: ${liveCapabilities.failed_sources.join(", ") || "none"}.`,
+                nextAction: "You can continue with the available source or stop/finalize the session.",
+                blockingReasons: liveCapabilities.failed_sources,
+                isRecording: true,
+                isTranscribing,
+            };
+        }
 
         if (
             currentStatusKind === "failed" ||
@@ -828,6 +861,21 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
             liveCapabilities?.capture_health.state === "failed" ||
             liveCapabilities?.capture_health.status === "failed"
         ) {
+            if (recoverableCaptureFailure) {
+                return {
+                    state: "failed_recoverable",
+                    title: "Capture failed / recoverable",
+                    description: poisonQuarantined
+                        ? "Capture controller entered an inconsistent state and was quarantined. No audio data is being captured."
+                        : failureReason
+                          ? `Capture failed, but the session can be recovered. Reason: ${failureReason}`
+                          : "Capture failed, but the session can be recovered.",
+                    nextAction: "Force stop the session to archive what exists, or recover capture state before retrying.",
+                    blockingReasons: failureReason ? [failureReason] : [],
+                    isRecording: false,
+                    isTranscribing,
+                };
+            }
             return {
                 state: "failed",
                 title: "Capture failed",
@@ -965,6 +1013,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         currentStatus,
         currentStatusKind,
         currentQueueDepth,
+        diagnostics,
         googleMeetDetected,
         hasActiveSession,
         isStoppingSession,
@@ -1285,6 +1334,20 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         }
     }, [meeting, runOperation]);
 
+    const handleRecoverFailedCapture = useCallback(
+        () => runOperation("recover capture", meeting.recoverFailedCapture),
+        [meeting, runOperation]
+    );
+
+    const handleForceFinalizeFailedCapture = useCallback(async () => {
+        try {
+            setIsStoppingSession(true);
+            await runOperation("force stop session", meeting.forceFinalizeFailedCapture);
+        } finally {
+            setIsStoppingSession(false);
+        }
+    }, [meeting, runOperation]);
+
     const handleAttachCurrentScreen = useCallback(async () => {
         try {
             setIsAttachingScreenContext(true);
@@ -1478,7 +1541,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <div className="meeting-state-facts">
                         <span>Audio capture: <strong>{uiSummary.isRecording ? "active" : "inactive"}</strong></span>
                         <span>Transcription: <strong>{uiSummary.isTranscribing ? "active" : "inactive"}</strong></span>
-                        <span>Session: <strong>{hasActiveSession ? sessionMode ?? "active" : stateKind}</strong></span>
+                        <span>Session: <strong>{hasActiveSession ? uiSummary.title : stateKind}</strong></span>
                     </div>
                 </div>
 
@@ -1588,11 +1651,18 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <Button variant="text" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleStopSession()}>
                         {isStoppingSession ? "Finalizing..." : "Stop"}
                     </Button>
+                    {uiSummary.state === "failed_recoverable" ? (
+                        <>
+                            <Button variant="secondary" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleRecoverFailedCapture()}>
+                                Recover capture
+                            </Button>
+                            <Button variant="secondary" radius="full" size="xs" disabled={isBusy || !hasActiveSession} onClick={() => void handleForceFinalizeFailedCapture()}>
+                                Force stop session
+                            </Button>
+                        </>
+                    ) : null}
                     <Button variant="text" radius="full" size="xs" onClick={scrollToTranscript}>
                         Open transcript
-                    </Button>
-                    <Button variant="danger" radius="full" size="xs" disabled={isBusy} onClick={() => void handlePreviewClearData()}>
-                        Clear data
                     </Button>
                 </div>
 
@@ -1603,16 +1673,17 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 {lastResult ? <pre className="desktop-agent-json meeting-operation-result">{lastResult}</pre> : null}
             </section>
 
-            <section className="desktop-agent-card meeting-section-card">
-                <div className="meeting-section-heading">
+            <details className="desktop-agent-card meeting-section-card meeting-collapsible-section">
+                <summary className="meeting-collapsible-summary">
                     <div>
                         <p className="meeting-section-kicker">Live recording</p>
                         <h3>Recording readiness</h3>
+                        <p>Advanced start/capture readiness and STT drain details.</p>
                     </div>
                     <Button variant="text" radius="full" size="xs" disabled={isBusy} onClick={() => void refreshMeeting()}>
                         Refresh
                     </Button>
-                </div>
+                </summary>
                 <div className="meeting-readiness-grid">
                     <div>
                         <span>WASAPI backend</span>
@@ -1721,7 +1792,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         Streaming STT unsupported
                     </Button>
                 </div>
-            </section>
+            </details>
 
             <details className="desktop-agent-card meeting-section-card meeting-screen-context meeting-collapsible-section">
                 <summary className="meeting-collapsible-summary">
@@ -2573,14 +2644,15 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                 </div>
             </details>
 
-            <section className="desktop-agent-card meeting-section-card">
-                <div className="meeting-section-heading">
+            <details className="desktop-agent-card meeting-section-card meeting-collapsible-section">
+                <summary className="meeting-collapsible-summary">
                     <div>
                         <p className="meeting-section-kicker">Data & privacy</p>
                         <h3>Consent and clear data</h3>
+                        <p>Consent controls and destructive data tools.</p>
                     </div>
                     <span className="meeting-count-pill">{consentReady ? "consent ready" : "consent required"}</span>
-                </div>
+                </summary>
                 <div className="meeting-privacy-grid">
                     <div>
                         <span>Platform key</span>
@@ -2666,7 +2738,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                         </div>
                     </div>
                 ) : null}
-            </section>
+            </details>
 
             <details className="desktop-agent-card meeting-diagnostics">
                 <summary>Advanced diagnostics</summary>

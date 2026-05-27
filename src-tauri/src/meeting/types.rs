@@ -280,6 +280,16 @@ pub enum CaptureHealthStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSummaryStatus {
+    Active,
+    Degraded,
+    Failed,
+    #[default]
+    Inactive,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureOverflowPolicy {
@@ -815,6 +825,13 @@ pub struct MeetingLiveCapabilitySnapshot {
     pub live_summarization: MeetingCapabilityReadiness,
     pub follow_up: MeetingCapabilityReadiness,
     pub capture_health: CaptureHealth,
+    pub capture_summary_status: CaptureSummaryStatus,
+    #[serde(default)]
+    pub capture_summary_reason: Option<String>,
+    #[serde(default)]
+    pub active_sources: Vec<String>,
+    #[serde(default)]
+    pub failed_sources: Vec<String>,
     pub stt_adapter: MeetingSttAdapterStatus,
 }
 

@@ -283,9 +283,10 @@ function App() {
                 </div>
 
                 <div ref={chatWrapRef} className="h-full chat-area overflow-auto" style={{ flex: 1, minHeight: 0 }}>
-                    <WorkSessionStatusStrip onOpenDetails={() => openDesktopPanel("meeting")} />
                     <AssistantChat messages={session.messages} chatRef={chatWrapRef} />
                 </div>
+
+                <WorkSessionStatusStrip onOpenDetails={() => openDesktopPanel("meeting")} />
 
                 <div ref={inputWrapRef}>
                     <AssistantInputBar

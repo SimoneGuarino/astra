@@ -4,7 +4,7 @@ use std::env;
 
 use crate::conversation_history::ConversationMessage;
 
-const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 const DEFAULT_HISTORY_MESSAGES: usize = 10;
 
 #[derive(Debug, Clone)]
@@ -36,6 +36,12 @@ pub async fn resolve_ollama_request(
     })
 }
 
+pub async fn resolve_active_ollama_model(message: &str, source: &str) -> String {
+    let source_kind = RequestSource::from_source(source);
+    let installed_models = fetch_installed_models().await.unwrap_or_default();
+    select_model(message, source_kind, &installed_models)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestSource {
     Typed,
@@ -54,7 +60,7 @@ impl RequestSource {
 async fn fetch_installed_models() -> Result<Vec<String>, String> {
     let client = Client::new();
     let response = client
-        .get(format!("{OLLAMA_BASE_URL}/api/tags"))
+        .get(ollama_endpoint("/api/tags"))
         .send()
         .await
         .map_err(|error| format!("Ollama tags request failed: {error}"))?;
@@ -78,6 +84,71 @@ async fn fetch_installed_models() -> Result<Vec<String>, String> {
         .collect::<Vec<_>>();
 
     Ok(installed)
+}
+
+pub fn resolve_ollama_base_url() -> String {
+    let astra_url = env::var("ASTRA_OLLAMA_BASE_URL").ok();
+    let ollama_host = env::var("OLLAMA_HOST").ok();
+    resolve_ollama_base_url_from(astra_url.as_deref(), ollama_host.as_deref())
+}
+
+pub fn resolve_ollama_base_url_from(astra_url: Option<&str>, ollama_host: Option<&str>) -> String {
+    astra_url
+        .and_then(normalize_ollama_base_url)
+        .or_else(|| ollama_host.and_then(normalize_ollama_base_url))
+        .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string())
+}
+
+pub fn ollama_endpoint(path: &str) -> String {
+    format!(
+        "{}/{}",
+        resolve_ollama_base_url(),
+        path.trim_start_matches('/')
+    )
+}
+
+pub fn sanitize_ollama_endpoint_label(value: &str) -> String {
+    let Some(redacted) = strip_url_credentials(value) else {
+        return "configured endpoint".to_string();
+    };
+    if is_local_ollama_endpoint(&redacted) {
+        redacted
+    } else {
+        "configured endpoint".to_string()
+    }
+}
+
+fn normalize_ollama_base_url(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    Some(with_scheme.trim_end_matches('/').to_string())
+}
+
+fn strip_url_credentials(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let host_and_path = rest.rsplit_once('@').map(|(_, host)| host).unwrap_or(rest);
+    Some(format!("{scheme}://{host_and_path}"))
+}
+
+fn is_local_ollama_endpoint(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("https://[::1]")
 }
 
 fn select_model(message: &str, source: RequestSource, installed_models: &[String]) -> String {
@@ -265,5 +336,53 @@ fn build_options(source: RequestSource, message: &str) -> Value {
             "repeat_penalty": 1.07,
             "num_predict": if reasoning { 900 } else { 360 },
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_astra_ollama_base_url_first() {
+        assert_eq!(
+            resolve_ollama_base_url_from(
+                Some("http://localhost:11435/"),
+                Some("http://localhost:11436")
+            ),
+            "http://localhost:11435"
+        );
+    }
+
+    #[test]
+    fn resolves_ollama_host_second() {
+        assert_eq!(
+            resolve_ollama_base_url_from(None, Some("localhost:11436/")),
+            "http://localhost:11436"
+        );
+    }
+
+    #[test]
+    fn resolves_default_ollama_base_url() {
+        assert_eq!(
+            resolve_ollama_base_url_from(None, None),
+            DEFAULT_OLLAMA_BASE_URL
+        );
+    }
+
+    #[test]
+    fn sanitizes_local_endpoint_and_strips_credentials() {
+        assert_eq!(
+            sanitize_ollama_endpoint_label("http://user:secret@localhost:11434/"),
+            "http://localhost:11434"
+        );
+    }
+
+    #[test]
+    fn hides_non_local_endpoint_label() {
+        assert_eq!(
+            sanitize_ollama_endpoint_label("https://user:secret@example.com/ollama"),
+            "configured endpoint"
+        );
     }
 }

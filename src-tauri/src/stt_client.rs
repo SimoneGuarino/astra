@@ -68,6 +68,17 @@ pub struct SttClient {
 
 impl SttClient {
     pub fn new(project_root: PathBuf) -> Self {
+        Self::with_worker_environment(project_root, SttWorkerEnvironment::default())
+    }
+
+    pub fn new_for_meeting(project_root: PathBuf) -> Self {
+        Self::with_worker_environment(project_root, SttWorkerEnvironment::meeting_default())
+    }
+
+    fn with_worker_environment(
+        project_root: PathBuf,
+        worker_environment: SttWorkerEnvironment,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = watch::channel(0);
         let generation = Arc::new(AtomicU64::new(0));
@@ -75,6 +86,7 @@ impl SttClient {
         tauri::async_runtime::spawn(async move {
             SttActor {
                 project_root,
+                worker_environment,
                 rx,
                 cancel_rx,
                 worker: None,
@@ -114,6 +126,55 @@ impl SttClient {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SttWorkerEnvironment {
+    values: Vec<(String, String)>,
+}
+
+impl SttWorkerEnvironment {
+    fn meeting_default() -> Self {
+        Self::meeting_from_lookup(|key| std::env::var(key).ok())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn meeting_from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        let gpu_policy = lookup("ASTRA_MEETING_STT_GPU_POLICY")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "prefer_cpu_when_llm_gpu".to_string());
+        let default_device = match gpu_policy.as_str() {
+            "force_cuda" => "cuda",
+            "auto" => "auto",
+            _ => "cpu",
+        };
+        let device = lookup("ASTRA_MEETING_STT_DEVICE")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| default_device.to_string());
+        let compute_type = lookup("ASTRA_MEETING_STT_COMPUTE_TYPE")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| if device == "cpu" { "int8" } else { "auto" }.to_string());
+        let mut values = vec![
+            ("ASTRA_STT_DEVICE".to_string(), device),
+            ("ASTRA_STT_COMPUTE_TYPE".to_string(), compute_type),
+        ];
+        if let Some(model) = lookup("ASTRA_MEETING_STT_MODEL")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            values.push(("ASTRA_STT_MODEL".to_string(), model));
+        }
+        if let Some(language) = lookup("ASTRA_MEETING_STT_LANGUAGE")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            values.push(("ASTRA_STT_LANGUAGE".to_string(), language));
+        }
+        Self { values }
+    }
+}
+
 enum SttCommand {
     Transcribe(SttJob),
 }
@@ -126,6 +187,7 @@ struct SttJob {
 
 struct SttActor {
     project_root: PathBuf,
+    worker_environment: SttWorkerEnvironment,
     rx: mpsc::Receiver<SttCommand>,
     cancel_rx: watch::Receiver<u64>,
     worker: Option<WorkerProcess>,
@@ -161,7 +223,7 @@ impl SttActor {
         }
 
         if self.worker.is_none() {
-            self.worker = Some(start_worker(&self.project_root).await?);
+            self.worker = Some(start_worker(&self.project_root, &self.worker_environment).await?);
         }
 
         let worker = self
@@ -257,7 +319,10 @@ impl SttActor {
     }
 }
 
-async fn start_worker(project_root: &PathBuf) -> Result<WorkerProcess, SttClientError> {
+async fn start_worker(
+    project_root: &PathBuf,
+    worker_environment: &SttWorkerEnvironment,
+) -> Result<WorkerProcess, SttClientError> {
     let python = project_root
         .join(".venv")
         .join("Scripts")
@@ -281,13 +346,18 @@ async fn start_worker(project_root: &PathBuf) -> Result<WorkerProcess, SttClient
         )));
     }
 
-    let mut child = Command::new(&python)
+    let mut command = Command::new(&python);
+    command
         .current_dir(project_root)
         .arg("-m")
         .arg("python_services.stt.stt_worker")
         .arg("--server")
         .env("PYTHONUTF8", "1")
-        .env("PYTHONIOENCODING", "utf-8:replace")
+        .env("PYTHONIOENCODING", "utf-8:replace");
+    for (key, value) in &worker_environment.values {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -352,9 +422,52 @@ fn decode_worker_stdout_line(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::SttWorkerEnvironment;
+    use std::collections::HashMap;
+
     #[test]
     fn invalid_utf8_worker_stdout_is_lossy_decoded() {
         let decoded = super::decode_worker_stdout_line(b"{\"ok\":false}\xff\n");
         assert!(decoded.starts_with("{\"ok\":false}"));
+    }
+
+    #[test]
+    fn meeting_stt_environment_defaults_to_cpu_int8() {
+        let environment = SttWorkerEnvironment::meeting_from_lookup(|_| None);
+        let values = environment.values.into_iter().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            values.get("ASTRA_STT_DEVICE").map(String::as_str),
+            Some("cpu")
+        );
+        assert_eq!(
+            values.get("ASTRA_STT_COMPUTE_TYPE").map(String::as_str),
+            Some("int8")
+        );
+        assert!(!values.contains_key("ASTRA_STT_MODEL"));
+    }
+
+    #[test]
+    fn meeting_stt_environment_honors_overrides() {
+        let environment = SttWorkerEnvironment::meeting_from_lookup(|key| match key {
+            "ASTRA_MEETING_STT_DEVICE" => Some("cuda".to_string()),
+            "ASTRA_MEETING_STT_COMPUTE_TYPE" => Some("float16".to_string()),
+            "ASTRA_MEETING_STT_MODEL" => Some("base".to_string()),
+            _ => None,
+        });
+        let values = environment.values.into_iter().collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            values.get("ASTRA_STT_DEVICE").map(String::as_str),
+            Some("cuda")
+        );
+        assert_eq!(
+            values.get("ASTRA_STT_COMPUTE_TYPE").map(String::as_str),
+            Some("float16")
+        );
+        assert_eq!(
+            values.get("ASTRA_STT_MODEL").map(String::as_str),
+            Some("base")
+        );
     }
 }
