@@ -41,6 +41,7 @@ python_services/stt/recordings/
 .DS_Store
 Thumbs.db
 
+.astra
 .astra/audit/*
 .astra/screen/*
 .astra/state/*
