@@ -6,11 +6,11 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const CLEAR_MEETING_DATA_CONFIRMATION_PHRASE: &str = "DELETE_MEETING_DATA";
-pub const DEFAULT_CAPTURE_SEGMENT_DURATION_MS: u64 = 15_000;
-pub const MIN_CAPTURE_SEGMENT_DURATION_MS: u64 = 10_000;
+pub const DEFAULT_CAPTURE_SEGMENT_DURATION_MS: u64 = 8_000;
+pub const MIN_CAPTURE_SEGMENT_DURATION_MS: u64 = 5_000;
 pub const MAX_CAPTURE_SEGMENT_DURATION_MS: u64 = 30_000;
-pub const DEFAULT_CAPTURE_MAX_QUEUE_DEPTH: usize = 64;
-pub const DEFAULT_CAPTURE_MAX_SEGMENTS_PER_SESSION: u64 = 720;
+pub const DEFAULT_CAPTURE_MAX_QUEUE_DEPTH: usize = 16;
+pub const DEFAULT_CAPTURE_MAX_SEGMENTS_PER_SESSION: u64 = 900;
 pub const DEFAULT_CAPTURE_MAX_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_CAPTURE_MAX_CONSECUTIVE_TRANSCRIPTION_FAILURES: usize = 3;
 pub const DEFAULT_CAPTURE_VAD_ENABLED: bool = true;
@@ -80,6 +80,91 @@ pub enum MeetingStatus {
     Completed,
     Failed(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingFinalizationStage {
+    Idle,
+    StopRequested,
+    StoppingCapture,
+    ClosingSegmentQueues,
+    DrainingStt,
+    StoppingRegistry,
+    Exporting,
+    Archiving,
+    Completed,
+    CompletedPartial,
+    FailedRecoverable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeetingFinalizationStatus {
+    pub session_id: Option<String>,
+    pub stage: MeetingFinalizationStage,
+    pub started_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub foreground_returned_at: Option<DateTime<Utc>>,
+    pub progress_label: String,
+    pub pending_segments: u64,
+    pub queue_depth: usize,
+    pub in_flight_segments: u64,
+    pub transcribed_segments: u64,
+    pub written_segments: u64,
+    pub failed_segments: u64,
+    pub drain_timeout: bool,
+    pub archive_written: bool,
+    pub export_written: bool,
+    pub recoverable: bool,
+    pub error_code: Option<String>,
+    pub error_message_redacted: Option<String>,
+    pub metadata_only: bool,
+}
+
+impl MeetingFinalizationStatus {
+    pub fn idle() -> Self {
+        Self {
+            session_id: None,
+            stage: MeetingFinalizationStage::Idle,
+            started_at: None,
+            updated_at: Some(Utc::now()),
+            completed_at: None,
+            foreground_returned_at: None,
+            progress_label: "idle".to_string(),
+            pending_segments: 0,
+            queue_depth: 0,
+            in_flight_segments: 0,
+            transcribed_segments: 0,
+            written_segments: 0,
+            failed_segments: 0,
+            drain_timeout: false,
+            archive_written: false,
+            export_written: false,
+            recoverable: false,
+            error_code: None,
+            error_message_redacted: None,
+            metadata_only: true,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.stage,
+            MeetingFinalizationStage::Idle
+                | MeetingFinalizationStage::Completed
+                | MeetingFinalizationStage::CompletedPartial
+                | MeetingFinalizationStage::FailedRecoverable
+                | MeetingFinalizationStage::Failed
+        )
+    }
+}
+
+impl Default for MeetingFinalizationStatus {
+    fn default() -> Self {
+        Self::idle()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -832,6 +917,7 @@ pub struct MeetingLiveCapabilitySnapshot {
     pub active_sources: Vec<String>,
     #[serde(default)]
     pub failed_sources: Vec<String>,
+    pub finalization_status: MeetingFinalizationStatus,
     pub stt_adapter: MeetingSttAdapterStatus,
 }
 

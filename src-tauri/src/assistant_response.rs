@@ -166,6 +166,46 @@ pub fn present_display_text(text: &str) -> String {
     )))
 }
 
+pub fn append_incomplete_response_notice_if_needed(text: &str) -> String {
+    let display = present_display_text(text);
+    if !looks_suspiciously_truncated_response(&display) {
+        return display;
+    }
+    format!(
+        "{}\n\nRisposta probabilmente incompleta: chiedimi 'continua' e proseguo dal punto interrotto.",
+        display.trim_end()
+    )
+}
+
+pub fn looks_suspiciously_truncated_response(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let last_line = trimmed
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(trimmed);
+
+    if looks_like_bare_ordered_list_marker(last_line) {
+        return true;
+    }
+    if trimmed.ends_with(':') {
+        return true;
+    }
+    if has_unclosed_markdown_token(trimmed) {
+        return true;
+    }
+    if ends_with_unfinished_list_sentence(last_line, trimmed) {
+        return true;
+    }
+
+    false
+}
+
 pub fn speech_safe_text(text: &str) -> String {
     let display = present_display_text(text);
     if let Some(summary) = structured_speech_summary(&display) {
@@ -247,6 +287,71 @@ pub fn fallback_display_for_empty_response(original_message: &str) -> String {
 
     "Il modello non ha prodotto una risposta testuale per la chat normale. Riprova o cambia modello."
         .into()
+}
+
+fn looks_like_bare_ordered_list_marker(line: &str) -> bool {
+    let value = line.trim();
+    if value.is_empty() || value.len() > 4 {
+        return false;
+    }
+    let digits = value.trim_end_matches('.');
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn has_unclosed_markdown_token(text: &str) -> bool {
+    let fence_count = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count();
+    if fence_count % 2 == 1 {
+        return true;
+    }
+
+    let without_fences = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bold_count = without_fences.matches("**").count();
+    if bold_count % 2 == 1 {
+        return true;
+    }
+
+    without_fences.matches('`').count() % 2 == 1
+}
+
+fn ends_with_unfinished_list_sentence(last_line: &str, full_text: &str) -> bool {
+    let has_list = full_text
+        .lines()
+        .any(|line| is_ordered_list_line(line) || is_unordered_list_line(line));
+    if !has_list {
+        return false;
+    }
+    let Some(last_char) = last_line.chars().rev().find(|ch| !ch.is_whitespace()) else {
+        return false;
+    };
+    if matches!(
+        last_char,
+        '.' | '!' | '?' | ')' | ']' | '"' | '\'' | ':' | ';'
+    ) {
+        return false;
+    }
+    last_line.split_whitespace().count() >= 6
+}
+
+fn is_ordered_list_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some((number, rest)) = trimmed.split_once('.') else {
+        return false;
+    };
+    !number.is_empty()
+        && number.chars().all(|ch| ch.is_ascii_digit())
+        && rest.chars().next().is_some_and(|ch| ch.is_whitespace())
+}
+
+fn is_unordered_list_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    matches!(trimmed.as_bytes(), [b'-' | b'*' | b'+', b' ' | b'\t', ..])
 }
 
 fn render_executed_action(response: &DesktopActionResponse, italian: bool) -> String {
@@ -1029,7 +1134,8 @@ fn collapse_whitespace(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_display_for_empty_response, present_display_text, sanitize_display_text,
+        append_incomplete_response_notice_if_needed, fallback_display_for_empty_response,
+        looks_suspiciously_truncated_response, present_display_text, sanitize_display_text,
         speech_safe_text,
     };
 
@@ -1104,5 +1210,34 @@ Ho letto il file."#;
         assert!(fallback.contains("chat normale"));
         assert!(!fallback.contains("routing tool-aware"));
         assert!(!fallback.starts_with("Non ho ricevuto"));
+    }
+
+    #[test]
+    fn detects_suspicious_bare_list_ending() {
+        assert!(looks_suspiciously_truncated_response(
+            "1. Primo punto\n2. Secondo punto\n5"
+        ));
+        let display =
+            append_incomplete_response_notice_if_needed("1. Primo punto\n2. Secondo punto\n5");
+        assert!(display.contains("Risposta probabilmente incompleta"));
+    }
+
+    #[test]
+    fn detects_unclosed_markdown_as_suspicious() {
+        assert!(looks_suspiciously_truncated_response(
+            "Ecco il blocco:\n```rust\nfn main() {}"
+        ));
+        assert!(looks_suspiciously_truncated_response(
+            "Questo è **incompleto"
+        ));
+    }
+
+    #[test]
+    fn complete_answer_does_not_get_incomplete_notice() {
+        let display = append_incomplete_response_notice_if_needed(
+            "1. Primo punto completo.\n2. Secondo punto completo.",
+        );
+
+        assert!(!display.contains("Risposta probabilmente incompleta"));
     }
 }

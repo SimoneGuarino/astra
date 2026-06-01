@@ -25,9 +25,9 @@ use personal_ai_lib::meeting::{
         CaptureBackend, CaptureControllerState, CaptureHealthStatus, CaptureOverflowPolicy,
         CapturePipelineConfig, ClearMeetingDataRequest, ExportedMeeting, MeetingAudioChunk,
         MeetingAudioFileTranscriptionRequest, MeetingAudioSegment, MeetingCapabilityReadiness,
-        MeetingCapabilityState, MeetingClearScope, MeetingConfig, MeetingSessionMode,
-        MeetingStatus, MeetingSttAdapterStatus, SpeakerAttributionMethod, TranscriptEntry,
-        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingCapabilityState, MeetingClearScope, MeetingConfig, MeetingFinalizationStage,
+        MeetingSessionMode, MeetingStatus, MeetingSttAdapterStatus, SpeakerAttributionMethod,
+        TranscriptEntry, TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
         DEFAULT_CAPTURE_MAX_CONSECUTIVE_TRANSCRIPTION_FAILURES,
         DEFAULT_CAPTURE_MAX_SEGMENTS_PER_SESSION, DEFAULT_CAPTURE_SEGMENT_DURATION_MS,
         REMOTE_SPEAKER_1_ID,
@@ -253,6 +253,22 @@ fn start_manual_session(runtime: &MeetingRuntime) -> String {
         .start_session("teams".to_string(), manual_config())
         .expect("manual session start")
         .session_id
+}
+
+async fn wait_for_finalization_terminal(runtime: &MeetingRuntime) -> MeetingFinalizationStage {
+    for _ in 0..100 {
+        let status = runtime
+            .read_finalization_status()
+            .expect("read finalization status");
+        if status.is_terminal() && status.stage != MeetingFinalizationStage::Idle {
+            return status.stage;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    runtime
+        .read_finalization_status()
+        .expect("read finalization status")
+        .stage
 }
 
 fn file_request(path: &Path) -> MeetingAudioFileTranscriptionRequest {
@@ -919,6 +935,77 @@ fn completed_state_is_not_confused_with_active_session() {
         .expect("completed state");
     assert_eq!(completed_state.status, MeetingStatus::Stopped);
     assert_eq!(completed_state.transcript.len(), 1);
+}
+
+#[tokio::test]
+async fn async_stop_returns_quickly_and_archives_in_background() {
+    let runtime = MeetingRuntime::new(temp_root("meeting_async_stop"));
+    start_manual_session(&runtime);
+    runtime
+        .add_transcript(transcript())
+        .expect("manual transcript");
+
+    let started = Instant::now();
+    let status = runtime
+        .request_stop_session_async()
+        .expect("request async stop");
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(status.stage, MeetingFinalizationStage::StopRequested);
+    assert_eq!(status.metadata_only, true);
+
+    let terminal_stage = wait_for_finalization_terminal(&runtime).await;
+    assert!(matches!(
+        terminal_stage,
+        MeetingFinalizationStage::Completed | MeetingFinalizationStage::CompletedPartial
+    ));
+    let completed = runtime
+        .get_last_completed_state()
+        .expect("last completed read")
+        .expect("completed state");
+    assert_eq!(completed.transcript.len(), 1);
+    let final_status = runtime
+        .read_finalization_status()
+        .expect("finalization status");
+    assert!(final_status.export_written);
+    assert!(final_status.archive_written);
+    assert!(final_status.metadata_only);
+}
+
+#[tokio::test]
+async fn async_stop_is_idempotent_for_repeated_requests() {
+    let runtime = MeetingRuntime::new(temp_root("meeting_async_stop_idempotent"));
+    let session_id = start_manual_session(&runtime);
+
+    let first = runtime
+        .request_stop_session_async()
+        .expect("first stop request");
+    let second = runtime
+        .request_stop_session_async()
+        .expect("second stop request");
+
+    assert_eq!(first.session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(second.session_id.as_deref(), Some(session_id.as_str()));
+
+    let _ = wait_for_finalization_terminal(&runtime).await;
+    let third = runtime
+        .request_stop_session_async()
+        .expect("third stop request");
+    assert_eq!(third.session_id.as_deref(), Some(session_id.as_str()));
+    assert!(third.is_terminal());
+}
+
+#[test]
+fn live_capabilities_exposes_idle_finalization_status() {
+    let runtime = MeetingRuntime::new(temp_root("meeting_live_finalization_status"));
+
+    let capabilities = runtime.live_capabilities().expect("live capabilities");
+
+    assert_eq!(
+        capabilities.finalization_status.stage,
+        MeetingFinalizationStage::Idle
+    );
+    assert!(capabilities.finalization_status.metadata_only);
 }
 
 #[tokio::test]
@@ -1805,7 +1892,7 @@ fn segment_defaults_are_coherent_and_report_effective_config() {
         ..CapturePipelineConfig::default()
     }
     .effective();
-    assert_eq!(too_low.effective_segment_duration_ms, 10_000);
+    assert_eq!(too_low.effective_segment_duration_ms, 5_000);
     assert!(too_low.duration_clamped);
 
     let too_high = CapturePipelineConfig {

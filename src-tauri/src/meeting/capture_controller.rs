@@ -6,7 +6,8 @@
 
 use super::{
     audio_capture::{
-        AudioCapture, AudioCaptureStartRequest, CaptureMetricsReporter, CapturedSegmentSender,
+        AudioCapture, AudioCaptureStartRequest, CaptureMetricsReporter,
+        CapturedSegmentDrainOutcome, CapturedSegmentSender,
     },
     types::{
         CaptureBackend, CaptureControllerState, CaptureHealth, CaptureHealthStatus,
@@ -62,6 +63,38 @@ pub struct CaptureControllerStartRequest {
     pub segment_task: Option<tauri::async_runtime::JoinHandle<()>>,
     pub emit_segments: bool,
     pub metrics: CaptureMetricsReporter,
+}
+
+pub struct CaptureSegmentDrainWaiter {
+    sender: Option<CapturedSegmentSender>,
+    task: Option<tauri::async_runtime::JoinHandle<()>>,
+    timeout: Duration,
+    metrics: CaptureMetricsReporter,
+}
+
+impl CaptureSegmentDrainWaiter {
+    pub async fn wait(mut self) -> Option<CapturedSegmentDrainOutcome> {
+        let mut drained = true;
+        let mut outcome = None;
+        if let Some(sender) = self.sender.take() {
+            sender.close();
+            let drain_outcome = sender.wait_drained(self.timeout).await;
+            drained = drain_outcome.drained;
+            outcome = Some(drain_outcome);
+        }
+
+        if let Some(task) = self.task.take() {
+            if drained {
+                if task.await.is_err() {
+                    self.metrics.record_drain_timed_out(0, 0);
+                }
+            } else {
+                task.abort();
+            }
+        }
+
+        outcome
+    }
 }
 
 impl CaptureController {
@@ -247,6 +280,52 @@ impl CaptureController {
         Ok(self.refresh_health(CaptureHealthStatus::Idle, None))
     }
 
+    pub fn stop_for_background_finalization(
+        &mut self,
+        drain_timeout: Duration,
+    ) -> (
+        CaptureHealth,
+        Option<CaptureSegmentDrainWaiter>,
+        Option<MeetingRuntimeError>,
+    ) {
+        let Some(mut handle) = self.active_handle.take() else {
+            if matches!(
+                self.state,
+                CaptureControllerState::Failed | CaptureControllerState::Unsupported
+            ) {
+                return (self.health_snapshot(), None, None);
+            }
+            self.state = CaptureControllerState::Idle;
+            return (
+                self.refresh_health(CaptureHealthStatus::Idle, None),
+                None,
+                None,
+            );
+        };
+
+        self.state = CaptureControllerState::Stopping;
+        self.refresh_health(CaptureHealthStatus::Idle, None);
+        let (stop_result, drain_waiter) = handle.stop_for_background_finalization(drain_timeout);
+        if let Err(error) = stop_result {
+            let message = error.to_string();
+            self.state = CaptureControllerState::Failed;
+            let status = if matches!(error, MeetingRuntimeError::CaptureStopTimedOut { .. }) {
+                self.metrics.record_stop_timed_out();
+                CaptureHealthStatus::StopTimedOut
+            } else {
+                CaptureHealthStatus::Failed
+            };
+            let health = self.refresh_health(status, Some(message));
+            return (health, drain_waiter, Some(error));
+        }
+        self.state = CaptureControllerState::Idle;
+        (
+            self.refresh_health(CaptureHealthStatus::Idle, None),
+            drain_waiter,
+            None,
+        )
+    }
+
     pub fn stop_capture(&mut self) -> Result<CaptureHealth, MeetingRuntimeError> {
         self.stop()
     }
@@ -260,6 +339,26 @@ impl CaptureController {
         }
         self.state = CaptureControllerState::Failed;
         Ok(self.refresh_health(CaptureHealthStatus::Failed, Some(final_reason)))
+    }
+
+    /// Mark capture as failed and request the backend/segment pipeline to stop
+    /// without draining or joining the managed STT task.
+    ///
+    /// This is intentionally separate from `abort()`: segment transcription
+    /// failure handling may run inside the segment STT task itself. Calling the
+    /// blocking abort path from that context can wait on the same task that is
+    /// currently executing and can poison the capture-controller mutex if the
+    /// runtime panics while the lock is held. The finalization path remains
+    /// responsible for joining and archiving through the governed lifecycle.
+    pub fn request_stop_after_segment_transcription_failure(
+        &mut self,
+        reason: String,
+    ) -> CaptureHealth {
+        if let Some(handle) = self.active_handle.as_mut() {
+            handle.request_stop_nonblocking();
+        }
+        self.state = CaptureControllerState::Failed;
+        self.refresh_health(CaptureHealthStatus::Failed, Some(reason))
     }
 
     pub fn abort_capture(&mut self, reason: String) -> Result<CaptureHealth, MeetingRuntimeError> {
@@ -346,6 +445,18 @@ impl CaptureController {
         self.refresh_health(
             CaptureHealthStatus::ConsentRevoked,
             Some(stop_message.unwrap_or_else(|| format!("consent_revoked:{platform}"))),
+        )
+    }
+
+    pub fn record_consent_revoked_from_segment_worker(&mut self, platform: &str) -> CaptureHealth {
+        if let Some(handle) = self.active_handle.as_mut() {
+            handle.request_stop_nonblocking();
+        }
+        self.metrics.record_consent_revoked();
+        self.state = CaptureControllerState::Failed;
+        self.refresh_health(
+            CaptureHealthStatus::ConsentRevoked,
+            Some(format!("consent_revoked:{platform}")),
         )
     }
 
@@ -614,6 +725,37 @@ impl AudioCaptureHandle {
         result
     }
 
+    fn stop_for_background_finalization(
+        &mut self,
+        drain_timeout: Duration,
+    ) -> (
+        Result<(), MeetingRuntimeError>,
+        Option<CaptureSegmentDrainWaiter>,
+    ) {
+        #[cfg(test)]
+        if let Some(error) = self.stop_error.take() {
+            return (Err(error), None);
+        }
+
+        let result = match &mut self.inner {
+            AudioCaptureHandleInner::Real(capture) => capture.stop(),
+            AudioCaptureHandleInner::Fake(fake) => {
+                if fake.stop_acknowledges {
+                    fake.running = false;
+                    Ok(())
+                } else {
+                    std::thread::sleep(fake.stop_timeout);
+                    fake.running = false;
+                    Err(MeetingRuntimeError::CaptureStopTimedOut {
+                        backend: fake.backend,
+                        timeout_ms: fake.stop_timeout.as_millis() as u64,
+                    })
+                }
+            }
+        };
+        (result, self.take_segment_drain_waiter(drain_timeout))
+    }
+
     fn is_running(&self) -> bool {
         match &self.inner {
             AudioCaptureHandleInner::Real(capture) => capture.is_running(),
@@ -627,6 +769,18 @@ impl AudioCaptureHandle {
         }
         if let Some(task) = self.segment_task.take() {
             task.abort();
+        }
+    }
+
+    fn request_stop_nonblocking(&mut self) {
+        match &mut self.inner {
+            AudioCaptureHandleInner::Real(capture) => capture.request_stop_nonblocking(),
+            AudioCaptureHandleInner::Fake(fake) => {
+                fake.running = false;
+            }
+        }
+        if let Some(sender) = self.segment_sender.as_ref() {
+            sender.close();
         }
     }
 
@@ -651,12 +805,39 @@ impl AudioCaptureHandle {
             }
         }
     }
+
+    fn take_segment_drain_waiter(
+        &mut self,
+        timeout: Duration,
+    ) -> Option<CaptureSegmentDrainWaiter> {
+        let sender = self.segment_sender.take();
+        let task = self.segment_task.take();
+        if sender.is_none() && task.is_none() {
+            return None;
+        }
+        Some(CaptureSegmentDrainWaiter {
+            sender,
+            task,
+            timeout,
+            metrics: self.metrics.clone(),
+        })
+    }
 }
 
 fn meeting_stt_drain_timeout() -> Duration {
     let foreground = std::env::var("ASTRA_MEETING_STT_FOREGROUND_DRAIN_TIMEOUT_SECS").ok();
     let legacy = std::env::var("ASTRA_MEETING_STT_DRAIN_TIMEOUT_SECS").ok();
     let seconds = meeting_stt_drain_timeout_secs_from_env(foreground.as_deref(), legacy.as_deref());
+    Duration::from_secs(seconds)
+}
+
+pub fn meeting_stt_background_drain_timeout() -> Duration {
+    let background = std::env::var("ASTRA_MEETING_STT_BACKGROUND_DRAIN_TIMEOUT_SECS").ok();
+    let seconds = background
+        .as_deref()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60)
+        .clamp(1, 600);
     Duration::from_secs(seconds)
 }
 
@@ -796,6 +977,48 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|value| value.contains("abort stop failed")));
+    }
+
+
+    #[test]
+    fn segment_transcription_threshold_stop_is_nonblocking_and_preserves_handle_for_finalization() {
+        let mut controller = CaptureController::new();
+        let controller_config = CaptureControllerConfig::from_meeting_config(&config());
+        controller.install_fake_active_capture_for_test(
+            controller_config,
+            false,
+            Duration::from_millis(1_000),
+        );
+
+        let health = controller.request_stop_after_segment_transcription_failure(
+            "system_segment_transcription_failure_threshold".to_string(),
+        );
+
+        assert_eq!(health.state, CaptureControllerState::Failed);
+        assert_eq!(health.status, CaptureHealthStatus::Failed);
+        assert!(health.active_handle_present);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("system_segment_transcription_failure_threshold")
+        );
+    }
+
+    #[test]
+    fn segment_worker_consent_revoked_stop_is_nonblocking_and_preserves_handle_for_finalization() {
+        let mut controller = CaptureController::new();
+        let controller_config = CaptureControllerConfig::from_meeting_config(&config());
+        controller.install_fake_active_capture_for_test(
+            controller_config,
+            false,
+            Duration::from_millis(1_000),
+        );
+
+        let health = controller.record_consent_revoked_from_segment_worker("teams");
+
+        assert_eq!(health.state, CaptureControllerState::Failed);
+        assert_eq!(health.status, CaptureHealthStatus::ConsentRevoked);
+        assert!(health.active_handle_present);
+        assert_eq!(health.last_error.as_deref(), Some("consent_revoked:teams"));
     }
 
     #[test]

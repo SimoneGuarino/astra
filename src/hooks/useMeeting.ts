@@ -14,6 +14,7 @@ import type {
     MeetingDataClearPreview,
     MeetingDataClearResult,
     MeetingDiagnostic,
+    MeetingFinalizationStatus,
     MeetingIntelligenceGenerationOptions,
     MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
@@ -146,6 +147,21 @@ export function useMeeting() {
 
     const stopSession = useCallback(
         () => invoke<ExportedMeeting>("stop_meeting_session"),
+        []
+    );
+
+    const requestStopSession = useCallback(
+        () => invoke<MeetingFinalizationStatus>("request_stop_meeting_session"),
+        []
+    );
+
+    const readFinalizationStatus = useCallback(
+        () => invoke<MeetingFinalizationStatus>("read_meeting_finalization_status"),
+        []
+    );
+
+    const retryFinalization = useCallback(
+        () => invoke<MeetingFinalizationStatus>("retry_meeting_finalization"),
         []
     );
 
@@ -284,7 +300,10 @@ export function useMeeting() {
             readDiagnostics,
             readIntelligence,
             readNotes,
+            readFinalizationStatus,
             recoverFailedCapture,
+            requestStopSession,
+            retryFinalization,
             readSummary,
             readSessionArchive,
             reindexSessions,
@@ -326,7 +345,10 @@ export function useMeeting() {
             readDiagnostics,
             readIntelligence,
             readNotes,
+            readFinalizationStatus,
             recoverFailedCapture,
+            requestStopSession,
+            retryFinalization,
             readSummary,
             readSessionArchive,
             reindexSessions,

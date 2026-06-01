@@ -24,6 +24,10 @@ pub type MeetingFileTranscriptionFuture<'a> =
 pub trait MeetingFileTranscriber: Send + Sync {
     fn status(&self) -> MeetingSttAdapterStatus;
 
+    fn request_warm_up(&self) -> Result<(), MeetingRuntimeError> {
+        Ok(())
+    }
+
     fn transcribe_file<'a>(&'a self, audio_path: &'a Path) -> MeetingFileTranscriptionFuture<'a>;
 
     fn boundary(&self) -> &'static str {
@@ -105,6 +109,20 @@ impl MeetingFileTranscriber for ExistingSttClientMeetingAdapter {
                 Some(MISSING_STT_CLIENT_REASON.to_string())
             },
         }
+    }
+
+    fn request_warm_up(&self) -> Result<(), MeetingRuntimeError> {
+        let client = self
+            .stt_client
+            .as_ref()
+            .ok_or_else(|| MeetingRuntimeError::SttUnavailable {
+                reason: MISSING_STT_CLIENT_REASON.to_string(),
+            })?;
+        client.request_warm_up().map_err(|error| {
+            MeetingRuntimeError::TranscriptionUnavailable {
+                reason: sanitize_stt_error(&error),
+            }
+        })
     }
 
     fn transcribe_file<'a>(&'a self, audio_path: &'a Path) -> MeetingFileTranscriptionFuture<'a> {

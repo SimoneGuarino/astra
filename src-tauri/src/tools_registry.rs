@@ -205,6 +205,30 @@ impl ToolsRegistry {
                     false,
                 ),
                 tool(
+                    "meeting.session.stop.request",
+                    "meeting",
+                    "Request asynchronous governed meeting stop and background finalization",
+                    vec![Permission::MeetingSessionManage, Permission::MeetingExport],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
+                    "meeting.session.finalization.read",
+                    "meeting",
+                    "Read metadata-only meeting finalization progress",
+                    vec![Permission::MeetingSessionRead],
+                    RiskLevel::Low,
+                    false,
+                ),
+                tool(
+                    "meeting.session.finalization.retry",
+                    "meeting",
+                    "Retry recoverable governed meeting finalization",
+                    vec![Permission::MeetingSessionManage, Permission::MeetingExport],
+                    RiskLevel::Medium,
+                    false,
+                ),
+                tool(
                     "meeting.session.recover_failed_capture",
                     "meeting",
                     "Recover a failed capture controller state without deleting meeting data",
@@ -594,6 +618,15 @@ mod tests {
         let force_finalize_failed_capture = registry
             .get("meeting.session.force_finalize_failed_capture")
             .expect("force finalize failed capture");
+        let async_stop = registry
+            .get("meeting.session.stop.request")
+            .expect("async stop request");
+        let finalization_read = registry
+            .get("meeting.session.finalization.read")
+            .expect("finalization read");
+        let finalization_retry = registry
+            .get("meeting.session.finalization.retry")
+            .expect("finalization retry");
 
         assert!(consent_read.available);
         assert!(session_start.available);
@@ -619,6 +652,12 @@ mod tests {
         assert_eq!(recover_failed_capture.default_risk, RiskLevel::Medium);
         assert!(force_finalize_failed_capture.available);
         assert!(!force_finalize_failed_capture.requires_confirmation);
+        assert!(async_stop.available);
+        assert_eq!(async_stop.default_risk, RiskLevel::Medium);
+        assert!(finalization_read.available);
+        assert_eq!(finalization_read.default_risk, RiskLevel::Low);
+        assert!(finalization_retry.available);
+        assert_eq!(finalization_retry.default_risk, RiskLevel::Medium);
         assert!(segment_transcription.available);
         assert!(!live_transcription.available);
         assert_eq!(file_transcription.default_risk, RiskLevel::High);

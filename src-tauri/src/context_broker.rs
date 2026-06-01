@@ -217,6 +217,17 @@ pub fn compact_working_context_value(
         "last_tool_result": working_context.last_tool_result.as_ref().map(|tool| compact_tool_result_value(tool, answer_summary_limit)),
         "available_evidence_refs": working_context.available_evidence_refs.iter().take(12).collect::<Vec<_>>(),
         "unresolved_followups": working_context.unresolved_followups.iter().take(4).collect::<Vec<_>>(),
+        "pending_governed_action": working_context.pending_governed_action.as_ref().map(|action| json!({
+            "present": action.present,
+            "tool_name": action.tool_name,
+            "intent": action.intent,
+            "prerequisite": action.prerequisite,
+            "status": action.status,
+            "expires_at_present": action.expires_at_present,
+            "expired": action.expired,
+            "attempt_count": action.attempt_count,
+            "metadata_only": true,
+        })),
         "confidence": working_context.confidence,
         "updated_at_ms": working_context.updated_at_ms,
     })
@@ -257,6 +268,16 @@ pub fn compact_discourse_context_value(
             "normal_chat_turns_since_update": working_context.salience.normal_chat_turns_since_update,
             "salience_score": working_context.salience.salience_score,
             "stale": working_context.salience.stale,
+        })),
+        "pending_governed_action": working_context.pending_governed_action.as_ref().map(|action| json!({
+            "present": action.present,
+            "tool_name": action.tool_name,
+            "intent": action.intent,
+            "prerequisite": action.prerequisite,
+            "status": action.status,
+            "expires_at_present": action.expires_at_present,
+            "expired": action.expired,
+            "metadata_only": true,
         })),
         "confidence": working_context.confidence,
     })
@@ -305,9 +326,13 @@ fn context_planner_messages_with_limits(
     let system = concat!(
         "You are Astra's discourse planner, not user-facing. ",
         "Return JSON only; do not answer or call tools. ",
-        "Classify the next assistant action from compact conversation context. ",
-        "needs_tool only when a new governed retrieval or action is required. ",
-        "Contextual general questions can use answer_from_context_boundary or normal_chat_with_context."
+        "Classify the next assistant action from compact conversation context; Rust validates the final route. ",
+        "Set safe_to_bypass_tools=true only for ordinary chat that needs no tools, session memory, transcript evidence, screen context, or governed action. ",
+        "If unsure, or if the user asks to start/stop recording, recap/search/read a session, generate transcript summaries/intelligence, recall meeting memory, attach screen context, or perform any governed action, set safe_to_bypass_tools=false. ",
+        "Requests like intelligent transcript recap, complete recap, meeting intelligence, attach screenshot/screen, or current/active/latest session analysis are needs_tool; do not answer them from last_tool_result. ",
+        "If pending_governed_action is present and the user is ready to continue it, use needs_tool and keep safe_to_bypass_tools=false. ",
+        "Use answer_from_context only for topic-presence checks and direct evidence follow-ups such as whether a specific topic was mentioned. ",
+        "Use normal_chat_with_context when the user asks a general or boundary knowledge question inspired by prior context; the prior result is context, not the source of the full answer."
     );
     let payload = json!({
         "task": "plan_next_assistant_action",
@@ -325,6 +350,13 @@ fn context_planner_messages_with_limits(
         ],
         "output_schema": {
             "route": "answer_from_context|answer_from_context_boundary|normal_chat_with_context|needs_tool|normal_chat|clarify|refuse",
+            "intent_kind": "ordinary_question|casual_chat|general_knowledge|session_memory_query|governed_action|context_followup|context_boundary|unknown",
+            "capability_family": "none|work_session|meeting|screen_context|session_memory|unknown",
+            "requires_tool_arbitration": false,
+            "requires_memory_lookup": false,
+            "requires_governed_action": false,
+            "requires_context_boundary": false,
+            "safe_to_bypass_tools": false,
             "context_ref": "last_tool_result|working_topic|none",
             "confidence": 0.0,
             "tool_affinity_risk": false,
@@ -337,8 +369,12 @@ fn context_planner_messages_with_limits(
         "rules": [
             "No chain-of-thought.",
             "No answer_from_context without supporting context_ref.",
-            "Use answer_from_context_boundary when the user references previous context but evidence is insufficient.",
-            "Use normal_chat_with_context when general knowledge can answer while clearly separating it from transcript evidence.",
+            "Use answer_from_context for questions that ask whether something was present, mentioned, discussed, or supported by the previous transcript/session evidence.",
+            "Use answer_from_context_boundary when the user explicitly asks for transcript-grounded evidence but the evidence is insufficient.",
+            "Use normal_chat_with_context when the user asks a general explanation, causal/how/why/origin question, or boundary question inspired by the transcript. In that case, answer with general knowledge and separate it from transcript evidence.",
+            "For ordinary questions unrelated to tools/context, use normal_chat with capability_family=none and safe_to_bypass_tools=true.",
+            "For a pending governed action continuation, use needs_tool with capability_family=work_session or meeting.",
+            "Never mark safe_to_bypass_tools=true for session memory, transcript, meeting/work-session state, screen context, or governed actions.",
             "No browser, terminal, filesystem, email, cloud, or autonomous actions."
         ]
     });
@@ -354,7 +390,9 @@ fn context_planner_messages_minimal(
 ) -> Vec<Value> {
     let system = concat!(
         "You are Astra's discourse planner, not user-facing. JSON only. ",
-        "needs_tool only for new governed retrieval/action. ",
+        "Rust arbitrates final execution. ",
+        "safe_to_bypass_tools=true only for ordinary chat needing no tools, session memory, transcript evidence, screen context, or governed action. ",
+        "If pending_governed_action exists or unsure, safe_to_bypass_tools=false. ",
         "Use context boundary routes for contextual questions beyond supplied evidence."
     );
     let payload = json!({
@@ -364,6 +402,13 @@ fn context_planner_messages_minimal(
         "allowed_routes": ["answer_from_context", "answer_from_context_boundary", "normal_chat_with_context", "needs_tool", "normal_chat", "clarify", "refuse"],
         "output_schema": {
             "route": "answer_from_context|answer_from_context_boundary|normal_chat_with_context|needs_tool|normal_chat|clarify|refuse",
+            "intent_kind": "ordinary_question|casual_chat|general_knowledge|session_memory_query|governed_action|context_followup|context_boundary|unknown",
+            "capability_family": "none|work_session|meeting|screen_context|session_memory|unknown",
+            "requires_tool_arbitration": false,
+            "requires_memory_lookup": false,
+            "requires_governed_action": false,
+            "requires_context_boundary": false,
+            "safe_to_bypass_tools": false,
             "context_ref": "last_tool_result|working_topic|none",
             "confidence": 0.0,
             "tool_affinity_risk": false,
@@ -387,7 +432,10 @@ fn context_answer_messages_with_summary_limit(
         "You are Astra's context-grounded answer synthesizer. ",
         "Use the compact tool result frame as the evidence boundary. ",
         "If the user's claim is not supported, say so. ",
+        "If the user asks whether the previous session was about a topic or entity, answer Yes or No first. ",
+        "If supported, briefly explain from the provided context; if not supported, say no and summarize what the session was actually about. ",
         "If general knowledge is useful, clearly mark it as separate from transcript evidence. ",
+        "Do not put STT completeness, source labels, evidence IDs, or operational diagnostics in answer; put needed warnings only in warnings. ",
         "Do not call tools. Return strict JSON only. Keep JSON keys in English."
     );
     let payload = json!({
@@ -406,8 +454,11 @@ fn context_answer_messages_with_summary_limit(
         },
         "rules": [
             "Use only the tool_result answer_summary, topics, entities, source label, warnings, and evidence count.",
+            "For topic-presence checks, answer yes/no directly when the compact context is sufficient.",
             "If a claim or entity is not supported by the tool_result, state that limitation.",
             "For boundary questions, clearly distinguish transcript evidence from general knowledge.",
+            "Do not include STT completeness, source labels, evidence IDs, or operational diagnostics inside answer.",
+            "If warnings are needed, put them only in warnings.",
             "Do not present external facts as transcript evidence."
         ]
     });
@@ -426,6 +477,8 @@ fn context_answer_messages_minimal(
     let system = concat!(
         "Context-grounded answer. JSON only. No tools. ",
         "Use compact_context as evidence boundary. If unsupported, say so. ",
+        "For topic-presence checks, answer Yes or No first. ",
+        "Keep operational diagnostics out of answer; warnings only in warnings. ",
         "Separate any general knowledge from transcript evidence. Keep JSON keys in English."
     );
     let payload = json!({
@@ -651,6 +704,38 @@ mod tests {
         assert_eq!(value["source_label"], "ultima sessione archiviata");
         assert!(value.get("used_evidence_ids").is_none());
         assert_eq!(value["evidence_count"], 1);
+    }
+
+    #[test]
+    fn context_answer_prompt_instructs_yes_no_topic_checks() {
+        let frame = frame_with_tool_summary("La sessione parlava della Terra primordiale.");
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let prompt = build_context_answer_messages(
+            "quindi si parlava di questo tema?",
+            &frame,
+            tool,
+            AstraUserLanguage::Italian,
+        );
+        let serialized = serde_json::to_string(&prompt.messages).expect("prompt json");
+
+        assert!(serialized.contains("answer Yes or No first"));
+        assert!(serialized.contains("topic-presence checks"));
+    }
+
+    #[test]
+    fn context_answer_prompt_keeps_warnings_out_of_answer() {
+        let frame = frame_with_tool_summary("La sessione parlava della Terra primordiale.");
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let prompt = build_context_answer_messages(
+            "puoi verificare questa affermazione?",
+            &frame,
+            tool,
+            AstraUserLanguage::Italian,
+        );
+        let serialized = serde_json::to_string(&prompt.messages).expect("prompt json");
+
+        assert!(serialized.contains("put needed warnings only in warnings"));
+        assert!(serialized.contains("Do not include STT completeness"));
     }
 
     fn frame_with_tool_summary(summary: &str) -> WorkingContextFrame {

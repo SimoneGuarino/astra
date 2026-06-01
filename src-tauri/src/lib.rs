@@ -17,6 +17,7 @@ mod conversation_router;
 mod desktop_agent;
 mod desktop_agent_types;
 mod filesystem_service;
+mod llm_trace_store;
 pub mod meeting;
 mod metrics;
 mod model_assisted_planner;
@@ -47,8 +48,9 @@ mod workflow_continuation;
 use assistant_context::build_capability_context;
 use assistant_memory::RecentArtifactMemory;
 use assistant_response::{
-    fallback_display_for_empty_response, present_display_text, render_action_response,
-    speech_safe_text, RenderedAssistantResponse, StreamPresentationState,
+    append_incomplete_response_notice_if_needed, fallback_display_for_empty_response,
+    present_display_text, render_action_response, speech_safe_text, RenderedAssistantResponse,
+    StreamPresentationState,
 };
 use assistant_tool_router::{
     compact_tool_manifest_json, parse_router_runtime_result,
@@ -60,8 +62,9 @@ use chrono::{DateTime, Utc};
 use conversation_history::{ConversationHistoryManager, ConversationMessage};
 use conversation_orchestrator::{
     apply_orchestrator_policy, apply_policy_to_diagnostic, build_normal_chat_with_context_preamble,
-    plan_with_active_model, render_context_answer, synthesize_context_answer_with_active_model,
-    AssistantOrchestratorDiagnostic, ConversationOrchestratorDecision, OrchestratorPolicyAction,
+    plan_with_active_model, render_context_answer, sanitize_tool_result_answer_summary,
+    synthesize_context_answer_with_active_model, AssistantOrchestratorDiagnostic,
+    ConversationOrchestratorDecision, OrchestratorPolicyAction, PendingGovernedActionFrame,
     ToolResultFrame, WorkingContextFrame,
 };
 use conversation_router::{route_message, ConversationRoute};
@@ -80,9 +83,10 @@ use meeting::{
         ClearMeetingDataRequest, ConsentState, DecisionLogEntry, ExportedMeeting,
         MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
         MeetingCaptureOptions, MeetingConfig, MeetingDataClearPreview, MeetingDataClearResult,
-        MeetingDiagnostic, MeetingFollowUpDraft, MeetingIntelligenceGenerationOptions,
-        MeetingIntelligenceResult, MeetingLiveCapabilitySnapshot, MeetingRecallRequest,
-        MeetingRecallResponse, MeetingScreenContext, MeetingScreenContextAttachRequest,
+        MeetingDiagnostic, MeetingFinalizationStatus, MeetingFollowUpDraft,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
+        MeetingLiveCapabilitySnapshot, MeetingRecallRequest, MeetingRecallResponse,
+        MeetingScreenContext, MeetingScreenContextAttachRequest,
         MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionArchiveDocument,
         MeetingSessionExportRequest, MeetingSessionExportResponse, MeetingSessionListItem,
         MeetingSessionListRequest, MeetingSessionListResponse, MeetingSessionMode,
@@ -93,6 +97,10 @@ use meeting::{
     },
 };
 use metrics::{MetricsTracker, RequestMetricsSnapshot};
+use llm_trace_store::{
+    build_trace_prompt_payload, build_trace_response_payload, sha256_hex as trace_sha256_hex,
+    LlmTraceLevel, LlmTraceRecord, LlmTraceStore,
+};
 use model_routing::{
     ollama_endpoint, resolve_active_ollama_model, resolve_ollama_base_url, resolve_ollama_request,
     sanitize_ollama_endpoint_label,
@@ -146,6 +154,16 @@ struct OllamaStreamChunk {
 #[derive(Debug, Deserialize)]
 struct OllamaChatResponse {
     message: Option<OllamaMessage>,
+    done: Option<bool>,
+    done_reason: Option<String>,
+    model: Option<String>,
+    created_at: Option<String>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -189,6 +207,86 @@ struct WorkSessionChatMemory {
     last_screen_context_ids: Vec<String>,
     last_response_had_details: bool,
     updated_at: DateTime<Utc>,
+}
+
+const PENDING_GOVERNED_ACTION_TTL_SECS: i64 = 600;
+
+#[derive(Debug, Clone)]
+struct PendingGovernedAction {
+    action_id: String,
+    tool_name: String,
+    intent: String,
+    prerequisite: Option<String>,
+    status: PendingGovernedActionStatus,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    attempt_count: u8,
+    metadata_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PendingGovernedActionStatus {
+    AwaitingConsent,
+    AwaitingUserConfirmation,
+    ReadyToRetry,
+    Consumed,
+    Expired,
+}
+
+impl PendingGovernedActionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingConsent => "awaiting_consent",
+            Self::AwaitingUserConfirmation => "awaiting_user_confirmation",
+            Self::ReadyToRetry => "ready_to_retry",
+            Self::Consumed => "consumed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+impl PendingGovernedAction {
+    fn is_expired(&self) -> bool {
+        Utc::now() >= self.expires_at
+    }
+
+    fn to_frame(&self, expired: bool) -> PendingGovernedActionFrame {
+        PendingGovernedActionFrame {
+            present: !expired,
+            tool_name: self.tool_name.clone(),
+            intent: self.intent.clone(),
+            prerequisite: self.prerequisite.clone(),
+            status: if expired {
+                PendingGovernedActionStatus::Expired.as_str()
+            } else {
+                self.status.as_str()
+            }
+            .to_string(),
+            expires_at_present: true,
+            expired,
+            attempt_count: self.attempt_count,
+            metadata_only: self.metadata_only,
+        }
+    }
+
+    fn to_prompt_value(&self, expired: bool) -> serde_json::Value {
+        serde_json::json!({
+            "present": !expired,
+            "tool_name": self.tool_name.clone(),
+            "intent": self.intent.clone(),
+            "prerequisite": self.prerequisite.clone(),
+            "status": if expired {
+                PendingGovernedActionStatus::Expired.as_str()
+            } else {
+                self.status.as_str()
+            },
+            "expires_at_present": true,
+            "expired": expired,
+            "attempt_count": self.attempt_count,
+            "metadata_only": self.metadata_only,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +401,17 @@ struct AssistantRouterDiagnostics {
     repair_succeeded: bool,
     prompt_char_count: Option<usize>,
     full_router_invoked_reason: Option<String>,
+    pending_governed_action_present: bool,
+    pending_governed_action_tool: Option<String>,
+    pending_governed_action_status: Option<String>,
+    pending_governed_action_expired: Option<bool>,
+    pending_governed_action_policy_action: Option<String>,
+    pending_governed_action_retry_attempted: Option<bool>,
+    pending_continuation_decision: Option<String>,
+    pending_continuation_reason: Option<String>,
+    pending_continuation_model_called: Option<bool>,
+    pending_continuation_model_failure: Option<String>,
+    pending_continuation_safe_to_ignore: Option<bool>,
     metadata_only: bool,
     raw_message_included: bool,
     raw_router_prompt_included: bool,
@@ -366,8 +475,10 @@ struct AssistantRuntime {
     recent_artifacts: RecentArtifactMemory,
     work_session_chat_memory: Arc<Mutex<Option<WorkSessionChatMemory>>>,
     working_context: Arc<Mutex<WorkingContextFrame>>,
+    pending_governed_action: Arc<Mutex<Option<PendingGovernedAction>>>,
     tts_segment_fingerprints: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     meeting_runtime: MeetingRuntime,
+    llm_trace_store: LlmTraceStore,
 }
 
 impl AssistantRuntime {
@@ -401,7 +512,9 @@ impl AssistantRuntime {
             recent_artifacts: RecentArtifactMemory::default(),
             work_session_chat_memory: Arc::new(Mutex::new(None)),
             working_context: Arc::new(Mutex::new(WorkingContextFrame::default())),
+            pending_governed_action: Arc::new(Mutex::new(None)),
             tts_segment_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            llm_trace_store: LlmTraceStore::new(project_root.clone()),
             meeting_runtime: MeetingRuntime::with_stt_client(project_root, meeting_stt_client),
         }
     }
@@ -431,6 +544,138 @@ impl AssistantRuntime {
             .lock()
             .expect("working_context mutex poisoned")
             .clone()
+    }
+
+    fn working_context_with_pending_action(&self) -> WorkingContextFrame {
+        let mut context = self.working_context();
+        context.pending_governed_action = self.pending_governed_action_frame();
+        context
+    }
+
+    fn record_pending_governed_action(
+        &self,
+        tool_name: &str,
+        intent: &str,
+        prerequisite: Option<&str>,
+        status: PendingGovernedActionStatus,
+    ) {
+        let now = Utc::now();
+        let mut state = self
+            .pending_governed_action
+            .lock()
+            .expect("pending_governed_action mutex poisoned");
+        let existing = state
+            .as_ref()
+            .filter(|action| action.tool_name == tool_name && action.intent == intent);
+        let action_id = existing
+            .map(|action| action.action_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let created_at = existing.map(|action| action.created_at).unwrap_or(now);
+        let attempt_count = existing
+            .map(|action| action.attempt_count.max(1))
+            .unwrap_or(1);
+        *state = Some(PendingGovernedAction {
+            action_id,
+            tool_name: tool_name.to_string(),
+            intent: intent.to_string(),
+            prerequisite: prerequisite.map(str::to_string),
+            status,
+            created_at,
+            expires_at: now + chrono::Duration::seconds(PENDING_GOVERNED_ACTION_TTL_SECS),
+            attempt_count,
+            metadata_only: true,
+        });
+    }
+
+    fn pending_governed_action_snapshot(&self) -> (Option<PendingGovernedAction>, bool) {
+        let mut state = self
+            .pending_governed_action
+            .lock()
+            .expect("pending_governed_action mutex poisoned");
+        if state
+            .as_ref()
+            .is_some_and(PendingGovernedAction::is_expired)
+        {
+            *state = None;
+            return (None, true);
+        }
+        (state.clone(), false)
+    }
+
+    fn pending_governed_action(&self) -> Option<PendingGovernedAction> {
+        self.pending_governed_action_snapshot().0
+    }
+
+    fn pending_governed_action_frame(&self) -> Option<PendingGovernedActionFrame> {
+        self.pending_governed_action()
+            .map(|action| action.to_frame(false))
+    }
+
+    fn mark_pending_governed_action_retry_attempted(
+        &self,
+        tool_name: &str,
+    ) -> Option<PendingGovernedAction> {
+        let mut state = self
+            .pending_governed_action
+            .lock()
+            .expect("pending_governed_action mutex poisoned");
+        let action = state.as_mut()?;
+        if action.is_expired() {
+            *state = None;
+            return None;
+        }
+        if action.tool_name != tool_name {
+            return None;
+        }
+        action.status = PendingGovernedActionStatus::ReadyToRetry;
+        action.attempt_count = action.attempt_count.saturating_add(1).max(1);
+        action.expires_at =
+            Utc::now() + chrono::Duration::seconds(PENDING_GOVERNED_ACTION_TTL_SECS);
+        Some(action.clone())
+    }
+
+    fn mark_pending_governed_action_prerequisite_ready(
+        &self,
+        prerequisite: &str,
+    ) -> Option<PendingGovernedAction> {
+        let mut state = self
+            .pending_governed_action
+            .lock()
+            .expect("pending_governed_action mutex poisoned");
+        let action = state.as_mut()?;
+        if action.is_expired() {
+            *state = None;
+            return None;
+        }
+        if action.prerequisite.as_deref() != Some(prerequisite) {
+            return None;
+        }
+        action.status = PendingGovernedActionStatus::ReadyToRetry;
+        action.expires_at =
+            Utc::now() + chrono::Duration::seconds(PENDING_GOVERNED_ACTION_TTL_SECS);
+        Some(action.clone())
+    }
+
+    fn clear_pending_governed_action_for_tool(&self, tool_name: &str) {
+        let mut state = self
+            .pending_governed_action
+            .lock()
+            .expect("pending_governed_action mutex poisoned");
+        if state
+            .as_ref()
+            .is_some_and(|action| action.tool_name == tool_name)
+        {
+            *state = None;
+        }
+    }
+
+    #[cfg(test)]
+    fn set_pending_governed_action_for_test(&self, action: PendingGovernedAction) {
+        let mut state = self
+            .pending_governed_action
+            .lock()
+            .expect("pending_governed_action mutex poisoned");
+        *state = Some(action);
     }
 
     fn remember_tool_result_frame(&self, tool_result: ToolResultFrame) {
@@ -636,7 +881,7 @@ async fn start_assistant_response(
     let mut full_router_invoked_reason: Option<String> = None;
 
     if classify_explicit_tool_shortcut(&message).is_none() {
-        let working_context = runtime.working_context();
+        let working_context = runtime.working_context_with_pending_action();
         let mut orchestrator_attempt =
             plan_with_active_model(source, &message, &history, &working_context).await;
         orchestrator_attempt.diagnostic.request_id = Some(request_id.clone());
@@ -985,6 +1230,7 @@ async fn try_handle_work_session_chat(
         }
         WorkSessionRoutingDecision::ActiveModel => {
             let work_session_context = work_session_context_for_assistant(&runtime);
+            let working_context = runtime.working_context_with_pending_action();
             let _ = window.emit(
                 "work-session-chat-command-started",
                 serde_json::json!({
@@ -1001,16 +1247,18 @@ async fn try_handle_work_session_chat(
                 routing.history,
                 memory.as_ref(),
                 work_session_context.as_ref(),
-                Some(&runtime.working_context()),
+                Some(&working_context),
+                &runtime.llm_trace_store,
+                Some(routing.request_id),
             )
             .await;
             outcome.diagnostics.request_id = Some(routing.request_id.to_string());
+            let pending_governed_action = runtime.pending_governed_action();
             let full_router_invoked_reason = routing
                 .full_router_invoked_reason
                 .unwrap_or("work_session_active_model_router");
             outcome.diagnostics.full_router_invoked_reason =
                 Some(full_router_invoked_reason.to_string());
-            emit_router_diagnostic(window, &outcome.diagnostics);
             let _ = window.emit(
                 "work-session-chat-command-finished",
                 serde_json::json!({
@@ -1022,71 +1270,239 @@ async fn try_handle_work_session_chat(
                 }),
             );
             let route_model_label = outcome.diagnostics.model.clone();
-            match assistant_router_runtime_result_to_work_session_decision(outcome.result.clone()) {
-                Some(WorkSessionRoutingDecision::Tool {
-                    route,
-                    classifier_source,
-                    model_label,
-                }) => (route, classifier_source, model_label.or(route_model_label)),
-                Some(WorkSessionRoutingDecision::Clarify {
-                    message: clarify_text,
-                    confidence,
-                }) => {
-                    let model_label = route_model_label
-                        .clone()
-                        .unwrap_or_else(|| default_assistant_model_label().to_string());
-                    let clarify_route = WorkSessionChatRoute {
-                        intent: WorkSessionChatIntent::Unknown,
-                        confidence,
-                        target: Some(WorkSessionExecutionTarget::none()),
-                        query: None,
-                        reason_code: Some("work_session_chat_active_model_clarifier".to_string()),
-                    };
-                    let diagnostic = work_session_chat_route_diagnostic(
-                        message,
-                        &clarify_route,
-                        "work_session_chat_active_model_clarifier",
-                    );
-                    emit_route_diagnostic(window, &diagnostic);
-                    let response = start_grounded_response_with_request_id(
-                        routing.request_id.to_string(),
-                        window.clone(),
-                        runtime,
-                        message.to_string(),
-                        display_user_message,
-                        routing.source,
-                        RenderedAssistantResponse::from_display(clarify_text),
-                        &model_label,
-                        routing.response_options,
-                    )
-                    .await?;
-                    return Ok(Some(response));
-                }
-                Some(WorkSessionRoutingDecision::NormalChat) => return Ok(None),
-                Some(WorkSessionRoutingDecision::ActiveModel) => return Ok(None),
-                None => {
-                    if routing.full_router_invoked_reason
-                        == Some("planner_empty_no_grounded_context")
-                    {
-                        return Ok(None);
+            if let Some(pending) = pending_governed_action.as_ref() {
+                let pending_policy = apply_pending_governed_action_continuation_policy(
+                    &outcome.result,
+                    pending,
+                    Some(message),
+                );
+                outcome.diagnostics.pending_continuation_decision =
+                    Some(pending_policy.decision.as_str().to_string());
+                outcome.diagnostics.pending_continuation_reason =
+                    Some(pending_policy.reason.as_str().to_string());
+                outcome.diagnostics.pending_continuation_model_called =
+                    Some(pending_policy.model_called);
+                outcome.diagnostics.pending_continuation_model_failure =
+                    pending_policy.model_failure.clone();
+                outcome.diagnostics.pending_continuation_safe_to_ignore =
+                    Some(pending_policy.safe_to_ignore);
+                match pending_policy.decision {
+                    PendingGovernedActionContinuationDecision::RetryPendingAction => {
+                        let pending_route = pending_action_retry_route_from_pending_action(pending)
+                            .expect("pending continuation policy produced retry route");
+                        runtime.mark_pending_governed_action_retry_attempted(&pending.tool_name);
+                        outcome.diagnostics.pending_governed_action_policy_action =
+                            Some("retry_pending_governed_action".to_string());
+                        outcome.diagnostics.pending_governed_action_retry_attempted = Some(true);
+                        emit_router_diagnostic(window, &outcome.diagnostics);
+                        (
+                            pending_route,
+                            "pending_governed_action_continuation",
+                            route_model_label,
+                        )
                     }
-                    let model_label = route_model_label
-                        .clone()
-                        .unwrap_or_else(|| default_assistant_model_label().to_string());
-                    let response_text = render_router_runtime_failure_response(&outcome.result);
-                    let response = start_grounded_response_with_request_id(
-                        routing.request_id.to_string(),
-                        window.clone(),
-                        runtime,
-                        message.to_string(),
-                        display_user_message,
-                        routing.source,
-                        RenderedAssistantResponse::from_display(response_text),
-                        &model_label,
-                        routing.response_options,
-                    )
-                    .await?;
-                    return Ok(Some(response));
+                    PendingGovernedActionContinuationDecision::AskConfirmation => {
+                        outcome.diagnostics.pending_governed_action_policy_action =
+                            Some("clarify_pending_governed_action".to_string());
+                        outcome.diagnostics.pending_governed_action_retry_attempted = Some(false);
+                        emit_router_diagnostic(window, &outcome.diagnostics);
+                        let model_label = route_model_label
+                            .clone()
+                            .unwrap_or_else(|| default_assistant_model_label().to_string());
+                        let response = start_grounded_response_with_request_id(
+                            routing.request_id.to_string(),
+                            window.clone(),
+                            runtime,
+                            message.to_string(),
+                            display_user_message,
+                            routing.source,
+                            RenderedAssistantResponse::from_display(
+                                render_pending_governed_action_clarification(),
+                            ),
+                            &model_label,
+                            routing.response_options,
+                        )
+                        .await?;
+                        return Ok(Some(response));
+                    }
+                    PendingGovernedActionContinuationDecision::CancelPendingAction => {
+                        runtime.clear_pending_governed_action_for_tool(&pending.tool_name);
+                        outcome.diagnostics.pending_governed_action_policy_action =
+                            Some("cancel_pending_governed_action".to_string());
+                        outcome.diagnostics.pending_governed_action_retry_attempted = Some(false);
+                        emit_router_diagnostic(window, &outcome.diagnostics);
+                        let model_label = route_model_label
+                            .clone()
+                            .unwrap_or_else(|| default_assistant_model_label().to_string());
+                        let response = start_grounded_response_with_request_id(
+                            routing.request_id.to_string(),
+                            window.clone(),
+                            runtime,
+                            message.to_string(),
+                            display_user_message,
+                            routing.source,
+                            RenderedAssistantResponse::from_display(
+                                "Ho annullato l'azione Work Session in sospeso.".to_string(),
+                            ),
+                            &model_label,
+                            routing.response_options,
+                        )
+                        .await?;
+                        return Ok(Some(response));
+                    }
+                    PendingGovernedActionContinuationDecision::IgnoreAndNormalChat => {
+                        outcome.diagnostics.pending_governed_action_policy_action =
+                            Some("router_decision".to_string());
+                        outcome.diagnostics.pending_governed_action_retry_attempted = Some(false);
+                        emit_router_diagnostic(window, &outcome.diagnostics);
+                        match assistant_router_runtime_result_to_work_session_decision(
+                            outcome.result.clone(),
+                        ) {
+                            Some(WorkSessionRoutingDecision::Tool {
+                                route,
+                                classifier_source,
+                                model_label,
+                            }) => (route, classifier_source, model_label.or(route_model_label)),
+                            Some(WorkSessionRoutingDecision::Clarify {
+                                message: clarify_text,
+                                confidence,
+                            }) => {
+                                let model_label = route_model_label
+                                    .clone()
+                                    .unwrap_or_else(|| default_assistant_model_label().to_string());
+                                let clarify_route = WorkSessionChatRoute {
+                                    intent: WorkSessionChatIntent::Unknown,
+                                    confidence,
+                                    target: Some(WorkSessionExecutionTarget::none()),
+                                    query: None,
+                                    reason_code: Some(
+                                        "work_session_chat_active_model_clarifier".to_string(),
+                                    ),
+                                };
+                                let diagnostic = work_session_chat_route_diagnostic(
+                                    message,
+                                    &clarify_route,
+                                    "work_session_chat_active_model_clarifier",
+                                );
+                                emit_route_diagnostic(window, &diagnostic);
+                                let response = start_grounded_response_with_request_id(
+                                    routing.request_id.to_string(),
+                                    window.clone(),
+                                    runtime,
+                                    message.to_string(),
+                                    display_user_message,
+                                    routing.source,
+                                    RenderedAssistantResponse::from_display(clarify_text),
+                                    &model_label,
+                                    routing.response_options,
+                                )
+                                .await?;
+                                return Ok(Some(response));
+                            }
+                            Some(WorkSessionRoutingDecision::NormalChat) => return Ok(None),
+                            Some(WorkSessionRoutingDecision::ActiveModel) => return Ok(None),
+                            None => {
+                                if routing.full_router_invoked_reason
+                                    == Some("planner_empty_no_grounded_context")
+                                {
+                                    return Ok(None);
+                                }
+                                let model_label = route_model_label
+                                    .clone()
+                                    .unwrap_or_else(|| default_assistant_model_label().to_string());
+                                let response_text =
+                                    render_router_runtime_failure_response(&outcome.result);
+                                let response = start_grounded_response_with_request_id(
+                                    routing.request_id.to_string(),
+                                    window.clone(),
+                                    runtime,
+                                    message.to_string(),
+                                    display_user_message,
+                                    routing.source,
+                                    RenderedAssistantResponse::from_display(response_text),
+                                    &model_label,
+                                    routing.response_options,
+                                )
+                                .await?;
+                                return Ok(Some(response));
+                            }
+                        }
+                    }
+                }
+            } else {
+                outcome.diagnostics.pending_governed_action_policy_action = None;
+                outcome.diagnostics.pending_governed_action_retry_attempted = None;
+                emit_router_diagnostic(window, &outcome.diagnostics);
+                match assistant_router_runtime_result_to_work_session_decision(
+                    outcome.result.clone(),
+                ) {
+                    Some(WorkSessionRoutingDecision::Tool {
+                        route,
+                        classifier_source,
+                        model_label,
+                    }) => (route, classifier_source, model_label.or(route_model_label)),
+                    Some(WorkSessionRoutingDecision::Clarify {
+                        message: clarify_text,
+                        confidence,
+                    }) => {
+                        let model_label = route_model_label
+                            .clone()
+                            .unwrap_or_else(|| default_assistant_model_label().to_string());
+                        let clarify_route = WorkSessionChatRoute {
+                            intent: WorkSessionChatIntent::Unknown,
+                            confidence,
+                            target: Some(WorkSessionExecutionTarget::none()),
+                            query: None,
+                            reason_code: Some(
+                                "work_session_chat_active_model_clarifier".to_string(),
+                            ),
+                        };
+                        let diagnostic = work_session_chat_route_diagnostic(
+                            message,
+                            &clarify_route,
+                            "work_session_chat_active_model_clarifier",
+                        );
+                        emit_route_diagnostic(window, &diagnostic);
+                        let response = start_grounded_response_with_request_id(
+                            routing.request_id.to_string(),
+                            window.clone(),
+                            runtime,
+                            message.to_string(),
+                            display_user_message,
+                            routing.source,
+                            RenderedAssistantResponse::from_display(clarify_text),
+                            &model_label,
+                            routing.response_options,
+                        )
+                        .await?;
+                        return Ok(Some(response));
+                    }
+                    Some(WorkSessionRoutingDecision::NormalChat) => return Ok(None),
+                    Some(WorkSessionRoutingDecision::ActiveModel) => return Ok(None),
+                    None => {
+                        if routing.full_router_invoked_reason
+                            == Some("planner_empty_no_grounded_context")
+                        {
+                            return Ok(None);
+                        }
+                        let model_label = route_model_label
+                            .clone()
+                            .unwrap_or_else(|| default_assistant_model_label().to_string());
+                        let response_text = render_router_runtime_failure_response(&outcome.result);
+                        let response = start_grounded_response_with_request_id(
+                            routing.request_id.to_string(),
+                            window.clone(),
+                            runtime,
+                            message.to_string(),
+                            display_user_message,
+                            routing.source,
+                            RenderedAssistantResponse::from_display(response_text),
+                            &model_label,
+                            routing.response_options,
+                        )
+                        .await?;
+                        return Ok(Some(response));
+                    }
                 }
             }
         }
@@ -1106,7 +1522,7 @@ async fn try_handle_work_session_chat(
             "generated_text_included": false,
         }),
     );
-    let display_text = match execute_work_session_chat_intent(
+    let execution_result = execute_work_session_chat_intent(
         window,
         &runtime,
         &route,
@@ -1115,8 +1531,13 @@ async fn try_handle_work_session_chat(
         routing.history,
         routing.request_id,
     )
-    .await
-    {
+    .await;
+    update_pending_governed_action_after_work_session_result(
+        &runtime,
+        route.intent,
+        &execution_result,
+    );
+    let display_text = match execution_result {
         Ok(response) => response,
         Err(error) => render_work_session_error(route.intent, &error),
     };
@@ -1195,15 +1616,16 @@ async fn classify_work_session_routing_with_active_model(
     memory: Option<&WorkSessionChatMemory>,
     work_session_context: Option<&serde_json::Value>,
     working_context: Option<&WorkingContextFrame>,
+    trace_store: &LlmTraceStore,
+    request_id: Option<&str>,
 ) -> AssistantRouterCallOutcome {
-    let started = Instant::now();
     let base_url = resolve_ollama_base_url();
     let endpoint_label = sanitize_ollama_endpoint_label(&base_url);
     let mut diagnostics = AssistantRouterDiagnostics {
         request_id: None,
         router_called: true,
         model: None,
-        endpoint_label: Some(endpoint_label),
+        endpoint_label: Some(endpoint_label.clone()),
         route: None,
         tool: None,
         target_kind: None,
@@ -1217,6 +1639,32 @@ async fn classify_work_session_routing_with_active_model(
         repair_succeeded: false,
         prompt_char_count: None,
         full_router_invoked_reason: None,
+        pending_governed_action_present: work_session_context
+            .and_then(|value| value.get("pending_governed_action"))
+            .and_then(|value| value.get("present"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        pending_governed_action_tool: work_session_context
+            .and_then(|value| value.get("pending_governed_action"))
+            .and_then(|value| value.get("tool_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        pending_governed_action_status: work_session_context
+            .and_then(|value| value.get("pending_governed_action"))
+            .and_then(|value| value.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        pending_governed_action_expired: work_session_context
+            .and_then(|value| value.get("pending_governed_action"))
+            .and_then(|value| value.get("expired"))
+            .and_then(serde_json::Value::as_bool),
+        pending_governed_action_policy_action: None,
+        pending_governed_action_retry_attempted: None,
+        pending_continuation_decision: None,
+        pending_continuation_reason: None,
+        pending_continuation_model_called: None,
+        pending_continuation_model_failure: None,
+        pending_continuation_safe_to_ignore: None,
         metadata_only: true,
         raw_message_included: false,
         raw_router_prompt_included: false,
@@ -1235,13 +1683,94 @@ async fn classify_work_session_routing_with_active_model(
         work_session_context,
         working_context,
     );
-    diagnostics.prompt_char_count = Some(
-        messages
-            .iter()
-            .filter_map(|message| message.get("content").and_then(serde_json::Value::as_str))
-            .map(str::len)
-            .sum(),
-    );
+    diagnostics.prompt_char_count = Some(context_broker::prompt_char_count(&messages));
+
+    let primary = call_assistant_tool_router_model(
+        &model,
+        timeout_ms,
+        &endpoint_label,
+        messages.clone(),
+        trace_store,
+        request_id,
+        "assistant_tool_router",
+        "primary",
+    )
+    .await;
+    merge_router_model_attempt_into_diagnostics(&mut diagnostics, &primary);
+    diagnostics.repair_attempted = primary.parse_repair_attempted;
+    diagnostics.repair_succeeded = primary.parse_repair_succeeded;
+
+    if matches!(primary.result, AssistantToolRouterRuntimeResult::EmptyModelContent { .. }) {
+        let repair_messages = build_assistant_tool_router_empty_content_repair_messages(
+            message,
+            work_session_context,
+            working_context,
+        );
+        let repair = call_assistant_tool_router_model(
+            &model,
+            timeout_ms,
+            &endpoint_label,
+            repair_messages,
+            trace_store,
+            request_id,
+            "assistant_tool_router",
+            "empty_content_model_repair",
+        )
+        .await;
+        diagnostics.repair_attempted = true;
+        diagnostics.duration_ms = Some(
+            primary
+                .duration_ms
+                .unwrap_or_default()
+                .saturating_add(repair.duration_ms.unwrap_or_default()),
+        );
+        if assistant_router_runtime_result_to_work_session_decision(repair.result.clone()).is_some() {
+            diagnostics.repair_succeeded = true;
+            update_router_diagnostics_from_result(&mut diagnostics, &repair.result);
+            return AssistantRouterCallOutcome {
+                result: repair.result,
+                diagnostics,
+            };
+        }
+        diagnostics.repair_succeeded = false;
+        update_router_diagnostics_from_result(&mut diagnostics, &primary.result);
+        return AssistantRouterCallOutcome {
+            result: primary.result,
+            diagnostics,
+        };
+    }
+
+    AssistantRouterCallOutcome {
+        result: primary.result,
+        diagnostics,
+    }
+}
+
+#[derive(Debug)]
+struct RouterModelCallAttempt {
+    result: AssistantToolRouterRuntimeResult,
+    duration_ms: Option<u64>,
+    parse_repair_attempted: bool,
+    parse_repair_succeeded: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_assistant_tool_router_model(
+    model: &str,
+    timeout_ms: u64,
+    endpoint_label: &str,
+    messages: Vec<serde_json::Value>,
+    trace_store: &LlmTraceStore,
+    request_id: Option<&str>,
+    stage: &str,
+    attempt_kind: &str,
+) -> RouterModelCallAttempt {
+    let started = Instant::now();
+    let prompt_char_count = context_broker::prompt_char_count(&messages);
+    let prompt_snapshot = serde_json::to_string(&messages).unwrap_or_default();
+    let prompt_hash = trace_sha256_hex(&prompt_snapshot);
+    let trace_level = LlmTraceLevel::from_env();
+    let raw_prompt = build_trace_prompt_payload(&messages, trace_level);
     let options = serde_json::json!({
         "temperature": 0.0,
         "top_p": 0.7,
@@ -1257,11 +1786,35 @@ async fn classify_work_session_routing_with_active_model(
             let result = AssistantToolRouterRuntimeResult::Unavailable {
                 reason: RouterFailureReason::EndpointConfig,
             };
-            update_router_diagnostics_from_result(&mut diagnostics, &result);
-            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
-            return AssistantRouterCallOutcome {
+            append_router_model_trace(
+                trace_store,
+                request_id,
+                stage,
+                attempt_kind,
+                model,
+                Some(endpoint_label),
+                true,
+                started.elapsed().as_millis() as u64,
+                None,
+                prompt_char_count,
+                prompt_hash,
+                None,
+                None,
+                None,
+                None,
+                Some("endpoint_config"),
+                Some("EndpointConfig"),
+                false,
+                false,
+                Some("safe_router_failure_response"),
+                raw_prompt,
+                None,
+            );
+            return RouterModelCallAttempt {
                 result,
-                diagnostics,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                parse_repair_attempted: false,
+                parse_repair_succeeded: false,
             };
         }
     };
@@ -1281,68 +1834,431 @@ async fn classify_work_session_routing_with_active_model(
         Ok(value) => value,
         Err(error) if error.is_timeout() => {
             let result = AssistantToolRouterRuntimeResult::Timeout { timeout_ms };
-            update_router_diagnostics_from_result(&mut diagnostics, &result);
-            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
-            return AssistantRouterCallOutcome {
+            append_router_model_trace(
+                trace_store,
+                request_id,
+                stage,
+                attempt_kind,
+                model,
+                Some(endpoint_label),
+                true,
+                started.elapsed().as_millis() as u64,
+                None,
+                prompt_char_count,
+                prompt_hash,
+                None,
+                None,
+                None,
+                None,
+                Some("timeout"),
+                Some("Timeout"),
+                false,
+                false,
+                Some("safe_router_failure_response"),
+                raw_prompt,
+                None,
+            );
+            return RouterModelCallAttempt {
                 result,
-                diagnostics,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                parse_repair_attempted: false,
+                parse_repair_succeeded: false,
             };
         }
         Err(_) => {
             let result = AssistantToolRouterRuntimeResult::Unavailable {
                 reason: RouterFailureReason::OllamaUnavailable,
             };
-            update_router_diagnostics_from_result(&mut diagnostics, &result);
-            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
-            return AssistantRouterCallOutcome {
+            append_router_model_trace(
+                trace_store,
+                request_id,
+                stage,
+                attempt_kind,
+                model,
+                Some(endpoint_label),
+                true,
+                started.elapsed().as_millis() as u64,
+                None,
+                prompt_char_count,
+                prompt_hash,
+                None,
+                None,
+                None,
+                None,
+                Some("ollama_unavailable"),
+                Some("OllamaUnavailable"),
+                false,
+                false,
+                Some("safe_router_failure_response"),
+                raw_prompt,
+                None,
+            );
+            return RouterModelCallAttempt {
                 result,
-                diagnostics,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                parse_repair_attempted: false,
+                parse_repair_succeeded: false,
             };
         }
     };
+    let status = response.status().as_u16();
     if !response.status().is_success() {
+        let raw_response = response.text().await.unwrap_or_default();
         let result = AssistantToolRouterRuntimeResult::Unavailable {
             reason: RouterFailureReason::OllamaUnavailable,
         };
-        update_router_diagnostics_from_result(&mut diagnostics, &result);
-        diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
-        return AssistantRouterCallOutcome {
+        append_router_model_trace(
+            trace_store,
+            request_id,
+            stage,
+            attempt_kind,
+            model,
+            Some(endpoint_label),
+            true,
+            started.elapsed().as_millis() as u64,
+            Some(status),
+            prompt_char_count,
+            prompt_hash,
+            Some(raw_response.len()),
+            None,
+            Some(trace_sha256_hex(&raw_response)),
+            None,
+            Some("http_error"),
+            Some("OllamaUnavailable"),
+            false,
+            false,
+            Some("safe_router_failure_response"),
+            raw_prompt,
+            build_trace_response_payload(&raw_response, trace_level),
+        );
+        return RouterModelCallAttempt {
             result,
-            diagnostics,
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+            parse_repair_attempted: false,
+            parse_repair_succeeded: false,
         };
     }
-    let body: OllamaChatResponse = match response.json().await {
+    let raw_response = match response.text().await {
         Ok(value) => value,
         Err(_) => {
             let result = AssistantToolRouterRuntimeResult::Malformed {
                 reason: RouterFailureReason::InvalidSchema,
                 raw_len: 0,
             };
-            update_router_diagnostics_from_result(&mut diagnostics, &result);
-            diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
-            return AssistantRouterCallOutcome {
+            append_router_model_trace(
+                trace_store,
+                request_id,
+                stage,
+                attempt_kind,
+                model,
+                Some(endpoint_label),
+                true,
+                started.elapsed().as_millis() as u64,
+                Some(status),
+                prompt_char_count,
+                prompt_hash,
+                None,
+                None,
+                None,
+                None,
+                Some("response_read_error"),
+                Some("InvalidSchema"),
+                false,
+                false,
+                Some("safe_router_failure_response"),
+                raw_prompt,
+                None,
+            );
+            return RouterModelCallAttempt {
                 result,
-                diagnostics,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                parse_repair_attempted: false,
+                parse_repair_succeeded: false,
             };
         }
     };
-    let content = body
-        .message
-        .map(|message| message.content)
-        .unwrap_or_default();
-    let parse_outcome = parse_router_runtime_result_with_repair(
-        &content,
-        diagnostics.model.as_deref().unwrap_or(""),
-    );
-    diagnostics.repair_attempted = parse_outcome.repair_attempted;
-    diagnostics.repair_succeeded = parse_outcome.repair_succeeded;
+    let body: OllamaChatResponse = match serde_json::from_str(&raw_response) {
+        Ok(value) => value,
+        Err(_) => {
+            let result = AssistantToolRouterRuntimeResult::Malformed {
+                reason: RouterFailureReason::InvalidSchema,
+                raw_len: raw_response.len(),
+            };
+            append_router_model_trace(
+                trace_store,
+                request_id,
+                stage,
+                attempt_kind,
+                model,
+                Some(endpoint_label),
+                true,
+                started.elapsed().as_millis() as u64,
+                Some(status),
+                prompt_char_count,
+                prompt_hash,
+                Some(raw_response.len()),
+                None,
+                Some(trace_sha256_hex(&raw_response)),
+                None,
+                Some("invalid_ollama_response_schema"),
+                Some("InvalidSchema"),
+                false,
+                false,
+                Some("safe_router_failure_response"),
+                raw_prompt,
+                build_trace_response_payload(&raw_response, trace_level),
+            );
+            return RouterModelCallAttempt {
+                result,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                parse_repair_attempted: false,
+                parse_repair_succeeded: false,
+            };
+        }
+    };
+    let OllamaChatResponse {
+        message,
+        done,
+        done_reason,
+        model: response_model,
+        created_at: _,
+        total_duration,
+        load_duration,
+        prompt_eval_count,
+        prompt_eval_duration,
+        eval_count,
+        eval_duration,
+    } = body;
+    let message_present = message.is_some();
+    let content = message.map(|message| message.content).unwrap_or_default();
+    let parse_outcome = parse_router_runtime_result_with_repair(&content, model);
     let result = parse_outcome.result;
-    update_router_diagnostics_from_result(&mut diagnostics, &result);
-    diagnostics.duration_ms = Some(started.elapsed().as_millis() as u64);
-    AssistantRouterCallOutcome {
+    let parse_result = router_trace_parse_result(&result);
+    let failure_class = router_trace_failure_class(&result);
+    let fallback_kind = router_trace_fallback_kind(&result);
+    let response_model = response_model.unwrap_or_else(|| model.to_string());
+    append_router_model_trace(
+        trace_store,
+        request_id,
+        stage,
+        attempt_kind,
+        &response_model,
+        Some(endpoint_label),
+        true,
+        started.elapsed().as_millis() as u64,
+        Some(status),
+        prompt_char_count,
+        prompt_hash,
+        Some(raw_response.len()),
+        Some(content.len()),
+        Some(trace_sha256_hex(&raw_response)),
+        Some(OllamaTraceMetadata {
+            message_present,
+            done,
+            done_reason,
+            total_duration,
+            load_duration,
+            prompt_eval_count,
+            prompt_eval_duration,
+            eval_count,
+            eval_duration,
+        }),
+        parse_result.as_deref(),
+        failure_class.as_deref(),
+        parse_outcome.repair_attempted,
+        parse_outcome.repair_succeeded,
+        fallback_kind.as_deref(),
+        raw_prompt,
+        build_trace_response_payload(&raw_response, trace_level),
+    );
+    RouterModelCallAttempt {
         result,
-        diagnostics,
+        duration_ms: Some(started.elapsed().as_millis() as u64),
+        parse_repair_attempted: parse_outcome.repair_attempted,
+        parse_repair_succeeded: parse_outcome.repair_succeeded,
     }
+}
+
+#[derive(Debug)]
+struct OllamaTraceMetadata {
+    message_present: bool,
+    done: Option<bool>,
+    done_reason: Option<String>,
+    total_duration: Option<u64>,
+    load_duration: Option<u64>,
+    prompt_eval_count: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    eval_count: Option<u64>,
+    eval_duration: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_router_model_trace(
+    trace_store: &LlmTraceStore,
+    request_id: Option<&str>,
+    stage: &str,
+    attempt_kind: &str,
+    model: &str,
+    endpoint_label: Option<&str>,
+    used_json_mode: bool,
+    duration_ms: u64,
+    http_status: Option<u16>,
+    prompt_char_count: usize,
+    prompt_hash: String,
+    response_body_len: Option<usize>,
+    response_content_len: Option<usize>,
+    response_hash: Option<String>,
+    ollama: Option<OllamaTraceMetadata>,
+    parse_result: Option<&str>,
+    failure_class: Option<&str>,
+    repair_attempted: bool,
+    repair_succeeded: bool,
+    fallback_kind: Option<&str>,
+    raw_prompt: Option<serde_json::Value>,
+    raw_response: Option<String>,
+) {
+    let trace_level = LlmTraceLevel::from_env();
+    if trace_level == LlmTraceLevel::Off {
+        return;
+    }
+    let record = LlmTraceRecord {
+        schema_version: 1,
+        timestamp: Utc::now().to_rfc3339(),
+        request_id: request_id.map(str::to_string),
+        stage: stage.to_string(),
+        attempt_kind: attempt_kind.to_string(),
+        model: model.to_string(),
+        endpoint_label: endpoint_label.map(str::to_string),
+        used_json_mode,
+        duration_ms: Some(duration_ms),
+        http_status,
+        prompt_char_count,
+        prompt_hash,
+        response_body_len,
+        response_content_len,
+        response_hash,
+        message_present: ollama.as_ref().map(|value| value.message_present),
+        done: ollama.as_ref().and_then(|value| value.done),
+        done_reason: ollama.as_ref().and_then(|value| value.done_reason.clone()),
+        total_duration: ollama.as_ref().and_then(|value| value.total_duration),
+        load_duration: ollama.as_ref().and_then(|value| value.load_duration),
+        prompt_eval_count: ollama.as_ref().and_then(|value| value.prompt_eval_count),
+        prompt_eval_duration: ollama
+            .as_ref()
+            .and_then(|value| value.prompt_eval_duration),
+        eval_count: ollama.as_ref().and_then(|value| value.eval_count),
+        eval_duration: ollama.as_ref().and_then(|value| value.eval_duration),
+        parse_result: parse_result.map(str::to_string),
+        failure_class: failure_class.map(str::to_string),
+        repair_attempted,
+        repair_succeeded,
+        fallback_kind: fallback_kind.map(str::to_string),
+        raw_prompt_included: raw_prompt.is_some(),
+        raw_response_included: raw_response.is_some(),
+        raw_prompt,
+        raw_response,
+    };
+    trace_store.append(&record);
+}
+
+fn router_trace_parse_result(result: &AssistantToolRouterRuntimeResult) -> Option<String> {
+    Some(match result {
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::ToolCall(_)) => "routed_tool_call",
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::NormalChat) => "routed_normal_chat",
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::Clarify(_)) => "routed_clarify",
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::Refuse(_)) => "routed_refuse",
+        AssistantToolRouterRuntimeResult::NormalChat { .. } => "normal_chat",
+        AssistantToolRouterRuntimeResult::Clarify { .. } => "clarify",
+        AssistantToolRouterRuntimeResult::Refuse { .. } => "refuse",
+        AssistantToolRouterRuntimeResult::Unavailable { .. } => "unavailable",
+        AssistantToolRouterRuntimeResult::Malformed { .. } => "malformed",
+        AssistantToolRouterRuntimeResult::EmptyModelContent { .. } => "empty_model_content",
+        AssistantToolRouterRuntimeResult::Timeout { .. } => "timeout",
+    }
+    .to_string())
+}
+
+fn router_trace_failure_class(result: &AssistantToolRouterRuntimeResult) -> Option<String> {
+    match result {
+        AssistantToolRouterRuntimeResult::Unavailable { reason }
+        | AssistantToolRouterRuntimeResult::Malformed { reason, .. } => Some(format!("{reason:?}")),
+        AssistantToolRouterRuntimeResult::EmptyModelContent { .. } => {
+            Some("EmptyModelContent".to_string())
+        }
+        AssistantToolRouterRuntimeResult::Timeout { .. } => Some("Timeout".to_string()),
+        _ => None,
+    }
+}
+
+fn router_trace_fallback_kind(result: &AssistantToolRouterRuntimeResult) -> Option<String> {
+    matches!(
+        result,
+        AssistantToolRouterRuntimeResult::Unavailable { .. }
+            | AssistantToolRouterRuntimeResult::Malformed { .. }
+            | AssistantToolRouterRuntimeResult::EmptyModelContent { .. }
+            | AssistantToolRouterRuntimeResult::Timeout { .. }
+    )
+    .then(|| "safe_router_failure_response".to_string())
+}
+
+fn merge_router_model_attempt_into_diagnostics(
+    diagnostics: &mut AssistantRouterDiagnostics,
+    attempt: &RouterModelCallAttempt,
+) {
+    diagnostics.duration_ms = attempt.duration_ms;
+    diagnostics.repair_attempted = attempt.parse_repair_attempted;
+    diagnostics.repair_succeeded = attempt.parse_repair_succeeded;
+    update_router_diagnostics_from_result(diagnostics, &attempt.result);
+}
+
+fn build_assistant_tool_router_empty_content_repair_messages(
+    message: &str,
+    work_session_context: Option<&serde_json::Value>,
+    working_context: Option<&WorkingContextFrame>,
+) -> Vec<serde_json::Value> {
+    let repair_input = serde_json::json!({
+        "failure": "previous_router_empty_model_content",
+        "instruction": "The previous router call returned empty content. Infer the user intent using the available tools and runtime context. Return only valid JSON matching the router schema. Do not explain in prose.",
+        "user_message": bounded_text(message, 900),
+        "available_tools": context_broker::filtered_tool_manifest_json(working_context, false),
+        "runtime_context": work_session_context.map(|value| compact_json_value_for_router_repair(value, 2600)),
+        "router_schema": {
+            "route": "tool_call | normal_chat | clarify | refuse",
+            "tool": "one of available_tools.tool when route=tool_call; otherwise null",
+            "intent": "short semantic intent name",
+            "target": {"kind": "active_session | latest_archived_session | last_completed_session | last_referenced_session | archived_sessions | none"},
+            "confidence": "0.0..1.0",
+            "language": "it | en | mixed | unknown",
+            "query": "original user request or null",
+            "reason_code": "stable snake_case reason",
+            "message": "only for clarify/refuse"
+        },
+        "valid_output_shape": {
+            "route": "tool_call",
+            "tool": "work_session.recap",
+            "intent": "summarize_session",
+            "target": {"kind": "latest_archived_session"},
+            "confidence": 0.0,
+            "language": "it",
+            "query": "<user request>",
+            "reason_code": "model_repair_selected_best_available_tool"
+        }
+    });
+    vec![
+        serde_json::json!({
+            "role": "system",
+            "content": "You are AstraOS tool router repair. You recover from an empty local model output. Return exactly one JSON object. Never return markdown. Never return empty content. If a safe governed tool is needed, select it; otherwise route normal_chat or clarify."
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": repair_input.to_string()
+        }),
+    ]
+}
+
+fn compact_json_value_for_router_repair(value: &serde_json::Value, max_chars: usize) -> serde_json::Value {
+    let serialized = serde_json::to_string(value).unwrap_or_default();
+    serde_json::Value::String(bounded_text(&serialized, max_chars))
 }
 
 fn router_timeout_ms_for_model(model: &str) -> u64 {
@@ -1483,6 +2399,426 @@ fn render_router_runtime_failure_response(result: &AssistantToolRouterRuntimeRes
             "Non sono riuscito a completare il routing tool-aware locale. Nessuna azione Work Session e stata eseguita.".to_string()
         }
     }
+}
+
+fn pending_action_retry_route_from_router_result(
+    result: &AssistantToolRouterRuntimeResult,
+    pending: &PendingGovernedAction,
+) -> Option<WorkSessionChatRoute> {
+    if !router_result_confirms_pending_action_ready(result)
+        && !router_result_routes_same_pending_action(result, pending)
+    {
+        return None;
+    }
+    let intent = pending_action_tool_to_work_session_intent(pending)?;
+    Some(WorkSessionChatRoute {
+        intent,
+        confidence: 0.95,
+        target: Some(WorkSessionExecutionTarget::none()),
+        query: None,
+        reason_code: Some("pending_governed_action_retry".to_string()),
+    })
+}
+
+fn pending_action_retry_route_from_pending_action(
+    pending: &PendingGovernedAction,
+) -> Option<WorkSessionChatRoute> {
+    let intent = pending_action_tool_to_work_session_intent(pending)?;
+    Some(WorkSessionChatRoute {
+        intent,
+        confidence: 0.95,
+        target: Some(WorkSessionExecutionTarget::none()),
+        query: None,
+        reason_code: Some("pending_governed_action_retry".to_string()),
+    })
+}
+
+fn pending_action_tool_to_work_session_intent(
+    pending: &PendingGovernedAction,
+) -> Option<WorkSessionChatIntent> {
+    match (pending.tool_name.as_str(), pending.intent.as_str()) {
+        ("meeting.session.start", "start_session") | ("work_session.start", "start_session") => {
+            Some(WorkSessionChatIntent::StartSession)
+        }
+        _ => None,
+    }
+}
+
+fn router_result_confirms_pending_action_ready(result: &AssistantToolRouterRuntimeResult) -> bool {
+    match result {
+        AssistantToolRouterRuntimeResult::NormalChat { reason_code, .. } => {
+            reason_code_confirms_pending_action_ready(reason_code)
+        }
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::NormalChat) => false,
+        _ => false,
+    }
+}
+
+fn router_result_routes_same_pending_action(
+    result: &AssistantToolRouterRuntimeResult,
+    pending: &PendingGovernedAction,
+) -> bool {
+    let Some(pending_intent) = pending_action_tool_to_work_session_intent(pending) else {
+        return false;
+    };
+    match result {
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::ToolCall(intent)) => {
+            assistant_tool_intent_to_work_session_intent(intent) == Some(pending_intent)
+        }
+        _ => false,
+    }
+}
+
+fn reason_code_confirms_pending_action_ready(reason_code: &str) -> bool {
+    let normalized = normalize_pending_reason_code(reason_code);
+    matches!(
+        normalized.as_str(),
+        "userready"
+            | "ready"
+            | "readytoproceed"
+            | "userconfirmation"
+            | "confirmed"
+            | "confirmation"
+            | "acknowledged"
+            | "prerequisitecomplete"
+            | "pendingactionready"
+            | "continuependingaction"
+    )
+}
+
+fn normalize_pending_reason_code(reason_code: &str) -> String {
+    reason_code
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect::<String>()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingGovernedActionContinuationDecision {
+    RetryPendingAction,
+    AskConfirmation,
+    CancelPendingAction,
+    IgnoreAndNormalChat,
+}
+
+impl PendingGovernedActionContinuationDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryPendingAction => "retry_pending_action",
+            Self::AskConfirmation => "ask_confirmation",
+            Self::CancelPendingAction => "cancel_pending_action",
+            Self::IgnoreAndNormalChat => "ignore_and_normal_chat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingGovernedActionContinuationReason {
+    ReadyToRetry,
+    ToolCallMatchesPending,
+    NormalChatUnsafe,
+    NormalChatSafeIgnore,
+    NormalChatLowConfidence,
+    Failure,
+    Clarify,
+    RoutedOtherAction,
+    ExplicitCancel,
+}
+
+impl PendingGovernedActionContinuationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadyToRetry => "router_ready_to_retry",
+            Self::ToolCallMatchesPending => "router_tool_call_matches_pending",
+            Self::NormalChatUnsafe => "router_normal_chat_unsafe",
+            Self::NormalChatSafeIgnore => "router_normal_chat_safe_ignore",
+            Self::NormalChatLowConfidence => "router_normal_chat_low_confidence",
+            Self::Failure => "router_failure",
+            Self::Clarify => "router_clarify",
+            Self::RoutedOtherAction => "router_routed_other_action",
+            Self::ExplicitCancel => "router_explicit_cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingGovernedActionContinuationOutcome {
+    decision: PendingGovernedActionContinuationDecision,
+    reason: PendingGovernedActionContinuationReason,
+    model_called: bool,
+    model_failure: Option<String>,
+    safe_to_ignore: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingGovernedActionUserSignal {
+    Confirm,
+    Cancel,
+    Unrelated,
+    Ambiguous,
+}
+
+fn classify_pending_governed_action_user_signal(message: &str) -> PendingGovernedActionUserSignal {
+    let normalized = normalize_pending_user_message(message);
+    if normalized.is_empty() {
+        return PendingGovernedActionUserSignal::Ambiguous;
+    }
+    if normalized.len() > 140 || normalized.contains('?') {
+        return PendingGovernedActionUserSignal::Unrelated;
+    }
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    let compact = tokens.join(" ");
+
+    let cancel_tokens = [
+        "no",
+        "non",
+        "annulla",
+        "annulliamo",
+        "cancella",
+        "ferma",
+        "fermiamo",
+        "stop",
+        "cancel",
+        "abort",
+        "nevermind",
+        "never",
+    ];
+    let cancel_phrases = ["do not", "don't", "non procedere", "non farlo"];
+    if tokens.iter().any(|token| cancel_tokens.contains(token))
+        || cancel_phrases.iter().any(|phrase| compact.contains(*phrase))
+    {
+        return PendingGovernedActionUserSignal::Cancel;
+    }
+
+    let confirm_tokens = [
+        "si",
+        "sì",
+        "ok",
+        "okay",
+        "oki",
+        "oky",
+        "fatto",
+        "procedi",
+        "procediamo",
+        "prosegui",
+        "proseguiamo",
+        "continua",
+        "continuiamo",
+        "vai",
+        "confermo",
+        "conferma",
+        "pronto",
+        "ready",
+        "done",
+        "proceed",
+        "continue",
+        "yes",
+        "yep",
+        "sure",
+        "go",
+    ];
+    let confirm_phrases = ["go ahead", "all set", "sono pronto", "ho concesso"];
+    if tokens.iter().any(|token| confirm_tokens.contains(token))
+        || confirm_phrases.iter().any(|phrase| compact.contains(*phrase))
+    {
+        return PendingGovernedActionUserSignal::Confirm;
+    }
+
+    PendingGovernedActionUserSignal::Unrelated
+}
+
+fn normalize_pending_user_message(message: &str) -> String {
+    message
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|ch| match ch {
+            'à' | 'á' | 'â' | 'ä' => 'a',
+            'è' | 'é' | 'ê' | 'ë' => 'e',
+            'ì' | 'í' | 'î' | 'ï' => 'i',
+            'ò' | 'ó' | 'ô' | 'ö' => 'o',
+            'ù' | 'ú' | 'û' | 'ü' => 'u',
+            ch if ch.is_ascii_alphanumeric() || ch.is_whitespace() || ch == '?' => ch,
+            _ => ' ',
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn apply_pending_governed_action_continuation_policy(
+    result: &AssistantToolRouterRuntimeResult,
+    pending: &PendingGovernedAction,
+    user_message: Option<&str>,
+) -> PendingGovernedActionContinuationOutcome {
+    match classify_pending_governed_action_user_signal(user_message.unwrap_or_default()) {
+        PendingGovernedActionUserSignal::Cancel => {
+            return PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::CancelPendingAction,
+                reason: PendingGovernedActionContinuationReason::ExplicitCancel,
+                model_called: false,
+                model_failure: None,
+                safe_to_ignore: false,
+            };
+        }
+        PendingGovernedActionUserSignal::Confirm
+            if matches!(
+                pending.status,
+                PendingGovernedActionStatus::AwaitingConsent
+                    | PendingGovernedActionStatus::AwaitingUserConfirmation
+                    | PendingGovernedActionStatus::ReadyToRetry
+            ) =>
+        {
+            return PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::RetryPendingAction,
+                reason: PendingGovernedActionContinuationReason::ReadyToRetry,
+                model_called: false,
+                model_failure: None,
+                safe_to_ignore: false,
+            };
+        }
+        PendingGovernedActionUserSignal::Unrelated | PendingGovernedActionUserSignal::Ambiguous | PendingGovernedActionUserSignal::Confirm => {}
+    }
+
+    if router_result_confirms_pending_action_ready(result) {
+        return PendingGovernedActionContinuationOutcome {
+            decision: PendingGovernedActionContinuationDecision::RetryPendingAction,
+            reason: PendingGovernedActionContinuationReason::ReadyToRetry,
+            model_called: true,
+            model_failure: None,
+            safe_to_ignore: false,
+        };
+    }
+    if router_result_routes_same_pending_action(result, pending) {
+        return PendingGovernedActionContinuationOutcome {
+            decision: PendingGovernedActionContinuationDecision::RetryPendingAction,
+            reason: PendingGovernedActionContinuationReason::ToolCallMatchesPending,
+            model_called: true,
+            model_failure: None,
+            safe_to_ignore: false,
+        };
+    }
+
+    match result {
+        AssistantToolRouterRuntimeResult::NormalChat {
+            confidence,
+            reason_code,
+        } => {
+            let normalized = normalize_pending_reason_code(reason_code);
+            if reason_code_cancels_pending_action(&normalized) && *confidence >= 0.8 {
+                return PendingGovernedActionContinuationOutcome {
+                    decision: PendingGovernedActionContinuationDecision::CancelPendingAction,
+                    reason: PendingGovernedActionContinuationReason::ExplicitCancel,
+                    model_called: true,
+                    model_failure: None,
+                    safe_to_ignore: false,
+                };
+            }
+            if reason_code_safely_ignores_pending_action(&normalized) && *confidence >= 0.85 {
+                return PendingGovernedActionContinuationOutcome {
+                    decision: PendingGovernedActionContinuationDecision::IgnoreAndNormalChat,
+                    reason: PendingGovernedActionContinuationReason::NormalChatSafeIgnore,
+                    model_called: true,
+                    model_failure: None,
+                    safe_to_ignore: true,
+                };
+            }
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::AskConfirmation,
+                reason: if *confidence < 0.85 {
+                    PendingGovernedActionContinuationReason::NormalChatLowConfidence
+                } else {
+                    PendingGovernedActionContinuationReason::NormalChatUnsafe
+                },
+                model_called: true,
+                model_failure: None,
+                safe_to_ignore: false,
+            }
+        }
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::NormalChat) => {
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::AskConfirmation,
+                reason: PendingGovernedActionContinuationReason::NormalChatUnsafe,
+                model_called: true,
+                model_failure: None,
+                safe_to_ignore: false,
+            }
+        }
+        AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::ToolCall(_)) => {
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::IgnoreAndNormalChat,
+                reason: PendingGovernedActionContinuationReason::RoutedOtherAction,
+                model_called: true,
+                model_failure: None,
+                safe_to_ignore: true,
+            }
+        }
+        AssistantToolRouterRuntimeResult::Clarify { .. }
+        | AssistantToolRouterRuntimeResult::Refuse { .. }
+        | AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::Clarify(_))
+        | AssistantToolRouterRuntimeResult::Routed(AssistantRouteDecision::Refuse(_)) => {
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::AskConfirmation,
+                reason: PendingGovernedActionContinuationReason::Clarify,
+                model_called: true,
+                model_failure: None,
+                safe_to_ignore: false,
+            }
+        }
+        AssistantToolRouterRuntimeResult::Unavailable { reason }
+        | AssistantToolRouterRuntimeResult::Malformed { reason, .. } => {
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::AskConfirmation,
+                reason: PendingGovernedActionContinuationReason::Failure,
+                model_called: true,
+                model_failure: Some(format!("{reason:?}")),
+                safe_to_ignore: false,
+            }
+        }
+        AssistantToolRouterRuntimeResult::EmptyModelContent { .. } => {
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::AskConfirmation,
+                reason: PendingGovernedActionContinuationReason::Failure,
+                model_called: true,
+                model_failure: Some("EmptyModelContent".to_string()),
+                safe_to_ignore: false,
+            }
+        }
+        AssistantToolRouterRuntimeResult::Timeout { .. } => {
+            PendingGovernedActionContinuationOutcome {
+                decision: PendingGovernedActionContinuationDecision::AskConfirmation,
+                reason: PendingGovernedActionContinuationReason::Failure,
+                model_called: true,
+                model_failure: Some("Timeout".to_string()),
+                safe_to_ignore: false,
+            }
+        }
+    }
+}
+
+fn reason_code_safely_ignores_pending_action(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "safeignorependingaction"
+            | "unrelatednewtopic"
+            | "ordinaryquestionunrelated"
+            | "userchangedtopic"
+            | "ignorependingaction"
+    )
+}
+
+fn reason_code_cancels_pending_action(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "cancelpendingaction" | "usercancelledpendingaction" | "discardpendingaction"
+    )
+}
+
+fn render_pending_governed_action_clarification() -> String {
+    "Ho una Work Session in attesa del prerequisito richiesto. Vuoi che riprovi ad avviarla ora?"
+        .to_string()
 }
 
 fn default_assistant_model_label() -> &'static str {
@@ -1725,6 +3061,9 @@ fn build_assistant_tool_router_messages_with_manifest(
                     "Use target active_session when runtime_context says a Work Session is active and the user asks about the current/ongoing session.",
                     "Use work_session.attach_screen with target active_session when the user asks to attach the current screen to the active Work Session.",
                     "Use last_referenced_session when discourse_state contains a clear previous Work Session reference.",
+                    "If runtime_context.pending_governed_action.present is true and the user is ready to continue it, return tool_call for that pending tool.",
+                    "If pending_governed_action is present and the user is ambiguous, return clarify instead of normal_chat/no_action_needed.",
+                    "If pending_governed_action is present but the user clearly changed topic, return normal_chat only with reason_code safe_ignore_pending_action and confidence >= 0.85.",
                     "Use normal_chat for ordinary assistant questions.",
                     "Return compact JSON. Preferred target shape: string plus optional object."
                 ]
@@ -1840,13 +3179,13 @@ async fn execute_work_session_chat_intent(
     let intent = route.intent;
     match intent {
         WorkSessionChatIntent::StartSession => start_work_session_from_chat(window, runtime),
-        WorkSessionChatIntent::StopSession => stop_work_session_from_chat(window, runtime)
-            .map(|exported| render_stop_work_session_response(&exported)),
+        WorkSessionChatIntent::StopSession => request_stop_work_session_from_chat(window, runtime)
+            .map(|status| render_async_stop_work_session_response(&status)),
         WorkSessionChatIntent::StopAndGenerateRecap => {
             let intelligence = maybe_generate_intelligence_before_stop(runtime).await.ok();
-            let exported = stop_work_session_from_chat(window, runtime)?;
-            Ok(render_stop_and_recap_response(
-                &exported,
+            let status = request_stop_work_session_from_chat(window, runtime)?;
+            Ok(render_async_stop_and_recap_response(
+                &status,
                 intelligence.as_ref(),
             ))
         }
@@ -1960,6 +3299,8 @@ fn build_assistant_context_with_work_session(
 }
 
 fn work_session_context_for_assistant(runtime: &AssistantRuntime) -> Option<serde_json::Value> {
+    let (pending_governed_action, pending_governed_action_expired) =
+        runtime.pending_governed_action_snapshot();
     let active_session = read_active_work_session_governed(runtime).ok().flatten();
     let last_completed_state = read_last_completed_work_session_governed(runtime)
         .ok()
@@ -2033,6 +3374,15 @@ fn work_session_context_for_assistant(runtime: &AssistantRuntime) -> Option<serd
         "intelligence_present": state.as_ref().is_some_and(|state| state.intelligence.is_some()) || latest_archived.is_some_and(|session| session.intelligence_present),
         "session_memory_available": true,
         "recall_available": true,
+        "pending_governed_action": pending_governed_action
+            .as_ref()
+            .map(|action| action.to_prompt_value(false))
+            .unwrap_or_else(|| serde_json::json!({
+                "present": false,
+                "expired": pending_governed_action_expired,
+                "expires_at_present": false,
+                "metadata_only": true,
+            })),
         "available_work_session_actions": [
             "start_session",
             "stop_session",
@@ -2116,33 +3466,39 @@ fn start_work_session_from_chat(
     ))
 }
 
-fn stop_work_session_from_chat(
+fn request_stop_work_session_from_chat(
     window: &WebviewWindow,
     runtime: &AssistantRuntime,
-) -> Result<ExportedMeeting, String> {
+) -> Result<MeetingFinalizationStatus, String> {
     let meeting = runtime.meeting_runtime.clone();
     let value = governed_meeting_command(
         runtime,
-        "meeting.session.stop",
+        "meeting.session.stop.request",
         serde_json::json!({
             "chat_initiated": true,
             "metadata_only": true,
             "transcript_text_included": false,
+            "audio_paths_included": false,
             "generated_text_included": false,
         }),
-        move || meeting_value(meeting.stop_session().map_err(|error| error.to_string())?),
+        move || {
+            meeting_value(
+                meeting
+                    .request_stop_session_async()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
     )?;
-    let exported = meeting_from_value(value)?;
+    let status = meeting_from_value(value)?;
     emit_meeting_update_events(
         window,
         &[
+            "meeting-finalization-updated",
             "meeting-session-updated",
-            "meeting-transcript-updated",
-            "meeting-artifacts-updated",
             "meeting-diagnostics-updated",
         ],
     );
-    Ok(exported)
+    Ok(status)
 }
 
 async fn maybe_generate_intelligence_before_stop(
@@ -2977,11 +4333,36 @@ async fn attach_screen_context_from_chat(
             "meeting-diagnostics-updated",
         ],
     );
-    Ok(format!(
-        "Ho allegato lo schermo corrente alla sessione attiva.\nSummary: {}\nEvidenze collegate: {} segmenti transcript.",
-        response.context.summary,
-        response.context.linked_transcript_segment_ids.len()
-    ))
+    Ok(render_screen_context_attach_chat_response(&response))
+}
+
+
+fn render_screen_context_attach_chat_response(
+    response: &MeetingScreenContextAttachResponse,
+) -> String {
+    let linked_segments = response.context.linked_transcript_segment_ids.len();
+    let observation_status = if response.context.structured_observation.is_some() {
+        "summary visivo governato disponibile"
+    } else {
+        "solo metadata di capture disponibili"
+    };
+    let screenshot_note = if response.context.screenshot_ref.is_some() {
+        "screenshot raw salvato secondo policy"
+    } else {
+        "screenshot raw non salvato; solo contesto osservativo e metadata governati"
+    };
+    let diagnostic_count = response.context.diagnostics.len() + response.diagnostics.len();
+    let mut lines = vec![
+        "Fonte: sessione attiva.".to_string(),
+        "Ho allegato uno screen context alla Work Session attiva.".to_string(),
+        format!("Schermo: 1 contesto osservativo allegato ({observation_status})."),
+        format!("Evidenze collegate: {linked_segments} segmenti transcript."),
+        format!("Nota: {screenshot_note}."),
+    ];
+    if diagnostic_count > 0 {
+        lines.push(format!("Nota: {diagnostic_count} diagnostiche metadata-only registrate."));
+    }
+    lines.join("\n")
 }
 
 async fn answer_recall_from_chat(
@@ -3692,13 +5073,54 @@ async fn summarize_archive_transcript_from_chat(
     ))
 }
 
+
+fn work_session_evidence_max_transcript_segments() -> usize {
+    work_session_evidence_usize_from_env(
+        "ASTRA_WORK_SESSION_EVIDENCE_MAX_TRANSCRIPT_SEGMENTS",
+        64,
+        1,
+        256,
+    )
+}
+
+fn work_session_evidence_max_chars_per_segment() -> usize {
+    work_session_evidence_usize_from_env(
+        "ASTRA_WORK_SESSION_EVIDENCE_MAX_CHARS_PER_SEGMENT",
+        900,
+        120,
+        4_000,
+    )
+}
+
+fn work_session_evidence_max_total_chars() -> usize {
+    work_session_evidence_usize_from_env(
+        "ASTRA_WORK_SESSION_EVIDENCE_MAX_TOTAL_CHARS",
+        32_000,
+        2_000,
+        96_000,
+    )
+}
+
+fn work_session_evidence_usize_from_env(
+    key: &str,
+    default_value: usize,
+    min_value: usize,
+    max_value: usize,
+) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (*value >= min_value) && (*value <= max_value))
+        .unwrap_or(default_value)
+}
+
 fn build_archive_transcript_evidence_packet(
     item: &MeetingSessionListItem,
     archive: &MeetingSessionArchiveDocument,
 ) -> AssistantToolEvidencePacket {
-    const MAX_TRANSCRIPT_SEGMENTS: usize = 12;
-    const MAX_CHARS_PER_SEGMENT: usize = 700;
-    const MAX_TOTAL_CHARS: usize = 6000;
+    let max_transcript_segments = work_session_evidence_max_transcript_segments();
+    let max_chars_per_segment = work_session_evidence_max_chars_per_segment();
+    let max_total_chars = work_session_evidence_max_total_chars();
 
     let mut evidence_items = Vec::new();
     let mut total_chars = 0usize;
@@ -3707,14 +5129,14 @@ fn build_archive_transcript_evidence_packet(
         .filter(|entry| !entry.text.trim().is_empty())
         .enumerate()
     {
-        if evidence_items.len() >= MAX_TRANSCRIPT_SEGMENTS || total_chars >= MAX_TOTAL_CHARS {
+        if evidence_items.len() >= max_transcript_segments || total_chars >= max_total_chars {
             break;
         }
-        let remaining = MAX_TOTAL_CHARS.saturating_sub(total_chars);
+        let remaining = max_total_chars.saturating_sub(total_chars);
         if remaining == 0 {
             break;
         }
-        let max_chars = MAX_CHARS_PER_SEGMENT.min(remaining);
+        let max_chars = max_chars_per_segment.min(remaining);
         let text = bounded_text(&entry.text, max_chars);
         total_chars += text.chars().count();
         evidence_items.push(AssistantToolEvidenceItem {
@@ -3757,7 +5179,7 @@ fn build_archive_transcript_evidence_packet(
     }
     if transcript_count > evidence_items.len() {
         warnings.push(format!(
-            "Evidence packet bounded to {} of {} transcript entries.",
+            "Pacchetto evidenze limitato a {} di {} segmenti transcript disponibili.",
             evidence_items.len(),
             transcript_count
         ));
@@ -3784,6 +5206,7 @@ fn build_archive_transcript_evidence_packet(
             "ended_at": item.ended_at,
             "transcript_count": transcript_count,
             "included_transcript_count": evidence_items.len(),
+            "evidence_bounded": transcript_count > evidence_items.len(),
             "screen_context_count": screen_context_count,
             "stt_completeness_status": item.stt_completeness_status,
             "stt_completeness_detail_present": !item.stt_completeness_detail.trim().is_empty(),
@@ -3800,9 +5223,9 @@ fn build_runtime_transcript_evidence_packet(
     state: &MeetingSessionState,
     capabilities: Option<&MeetingLiveCapabilitySnapshot>,
 ) -> AssistantToolEvidencePacket {
-    const MAX_TRANSCRIPT_SEGMENTS: usize = 12;
-    const MAX_CHARS_PER_SEGMENT: usize = 700;
-    const MAX_TOTAL_CHARS: usize = 6000;
+    let max_transcript_segments = work_session_evidence_max_transcript_segments();
+    let max_chars_per_segment = work_session_evidence_max_chars_per_segment();
+    let max_total_chars = work_session_evidence_max_total_chars();
 
     let mut evidence_items = Vec::new();
     let mut total_chars = 0usize;
@@ -3812,14 +5235,14 @@ fn build_runtime_transcript_evidence_packet(
         .filter(|entry| !entry.text.trim().is_empty())
         .enumerate()
     {
-        if evidence_items.len() >= MAX_TRANSCRIPT_SEGMENTS || total_chars >= MAX_TOTAL_CHARS {
+        if evidence_items.len() >= max_transcript_segments || total_chars >= max_total_chars {
             break;
         }
-        let remaining = MAX_TOTAL_CHARS.saturating_sub(total_chars);
+        let remaining = max_total_chars.saturating_sub(total_chars);
         if remaining == 0 {
             break;
         }
-        let max_chars = MAX_CHARS_PER_SEGMENT.min(remaining);
+        let max_chars = max_chars_per_segment.min(remaining);
         let text = bounded_text(&entry.text, max_chars);
         total_chars += text.chars().count();
         evidence_items.push(AssistantToolEvidenceItem {
@@ -3855,7 +5278,7 @@ fn build_runtime_transcript_evidence_packet(
     }
     if transcript_count > evidence_items.len() {
         warnings.push(format!(
-            "Evidence packet bounded to {} of {} transcript entries.",
+            "Pacchetto evidenze limitato a {} di {} segmenti transcript disponibili.",
             evidence_items.len(),
             transcript_count
         ));
@@ -3931,6 +5354,7 @@ fn build_runtime_transcript_evidence_packet(
             "capture_active": state.session.capture_active,
             "transcript_count": transcript_count,
             "included_transcript_count": evidence_items.len(),
+            "evidence_bounded": transcript_count > evidence_items.len(),
             "screen_context_count": screen_context_count,
             "intelligence_present": state.intelligence.is_some(),
             "stt": stt_metadata,
@@ -4140,7 +5564,7 @@ fn build_tool_answer_synthesis_messages(
     user_question: &str,
     packet: &AssistantToolEvidencePacket,
 ) -> Vec<serde_json::Value> {
-    let system = "You are Astra's evidence-grounded answer synthesizer. Return strict JSON only. You do not answer from general knowledge. Use only the evidence packet. Do not include markdown. Use the user's language.";
+    let system = "You are Astra's evidence-grounded answer synthesizer. Return strict JSON only. You do not answer from general knowledge. Use only the evidence packet. Do not include markdown. Use the user's language. Keep operational diagnostics out of answer.";
     let user_payload = serde_json::json!({
         "user_question": bounded_text(user_question, 800),
         "source": packet.source_kind.clone(),
@@ -4154,7 +5578,8 @@ fn build_tool_answer_synthesis_messages(
         },
         "rules": [
             "Answer only from evidence_packet.evidence_items.",
-            "Mention active-session or STT warnings when present.",
+            "Do not include STT completeness, source labels, evidence IDs, evidence bounds, or operational diagnostics inside answer.",
+            "If active-session or STT warnings are needed, put them only in warnings.",
             "Set status=partial when evidence is incomplete or session is still active.",
             "Every used_evidence_ids item must exist in the packet."
         ]
@@ -4226,8 +5651,8 @@ fn tool_synthesis_num_predict() -> u64 {
 fn tool_synthesis_num_predict_from_env(override_value: Option<&str>) -> u64 {
     override_value
         .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (128..=2_048).contains(value))
-        .unwrap_or(900)
+        .filter(|value| (128..=4_096).contains(value))
+        .unwrap_or(1_600)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4302,6 +5727,7 @@ fn parse_tool_answer_synthesis_json(
     let mut output: AssistantToolSynthesisOutput = serde_json::from_str(json).ok()?;
     output.status = output.status.trim().to_ascii_lowercase();
     output.confidence = output.confidence.clamp(0.0, 1.0);
+    output.answer = sanitize_tool_result_answer_summary(&output.answer);
     if !matches!(
         output.status.as_str(),
         "answered" | "partial" | "insufficient_evidence"
@@ -4384,15 +5810,10 @@ fn render_tool_synthesis_answer(
         lines.push(format!("Nota: {warning}"));
     }
     if !output.used_evidence_ids.is_empty() {
-        lines.push(format!(
-            "Evidenze usate: {}.",
-            output
-                .used_evidence_ids
-                .iter()
-                .take(6)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
+        lines.push(user_facing_evidence_usage_summary(
+            packet,
+            &output.used_evidence_ids,
+            "Evidenze usate",
         ));
     } else if !packet.evidence_items.is_empty() {
         lines.push(format!(
@@ -4401,6 +5822,65 @@ fn render_tool_synthesis_answer(
         ));
     }
     lines.join("\n")
+}
+
+fn user_facing_evidence_usage_summary(
+    packet: &AssistantToolEvidencePacket,
+    used_evidence_ids: &[String],
+    label: &str,
+) -> String {
+    let mut transcript_count = 0usize;
+    let mut screen_context_count = 0usize;
+    let mut other_count = 0usize;
+
+    for evidence_id in used_evidence_ids {
+        let kind = packet
+            .evidence_items
+            .iter()
+            .find(|item| item.evidence_id == *evidence_id)
+            .map(|item| item.kind.as_str());
+        match kind {
+            Some("transcript") => transcript_count += 1,
+            Some("screen_context") | Some("screen") => screen_context_count += 1,
+            Some(_) => other_count += 1,
+            None if evidence_id.starts_with("segment:")
+                || evidence_id.starts_with("transcript") =>
+            {
+                transcript_count += 1;
+            }
+            None if evidence_id.starts_with("screen_context:")
+                || evidence_id.starts_with("screen:") =>
+            {
+                screen_context_count += 1;
+            }
+            None => other_count += 1,
+        }
+    }
+
+    let mut parts = Vec::new();
+    if transcript_count > 0 {
+        parts.push(format!(
+            "{} segment{} transcript",
+            transcript_count,
+            if transcript_count == 1 { "o" } else { "i" }
+        ));
+    }
+    if screen_context_count > 0 {
+        parts.push(format!("{} screen context", screen_context_count));
+    }
+    if other_count > 0 {
+        parts.push(format!(
+            "{} element{}",
+            other_count,
+            if other_count == 1 { "o" } else { "i" }
+        ));
+    }
+
+    if parts.is_empty() {
+        format!("{label}: {} elementi.", used_evidence_ids.len())
+    } else {
+        format!("{label}: {}.", parts.join(", "))
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -5116,27 +6596,36 @@ fn render_recall_response(response: &MeetingRecallResponse) -> String {
     )
 }
 
-fn render_stop_work_session_response(exported: &ExportedMeeting) -> String {
+fn render_async_stop_work_session_response(status: &MeetingFinalizationStatus) -> String {
+    let session = status
+        .session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\nSessione: {value}"))
+        .unwrap_or_default();
     format!(
-        "Sessione salvata.\nTranscript: {} entrate.\nScreen contexts: {}.\nMeeting Intelligence: {}.",
-        exported.transcript.len(),
-        exported.screen_contexts.len(),
-        if exported.intelligence.is_some() { "presente" } else { "non generata" }
+        "Sto fermando e finalizzando la Work Session in background. Il recap completo sara disponibile appena archivio e transcript sono completi.{}",
+        session
     )
 }
 
-fn render_stop_and_recap_response(
-    exported: &ExportedMeeting,
+fn render_async_stop_and_recap_response(
+    status: &MeetingFinalizationStatus,
     intelligence: Option<&MeetingIntelligenceResult>,
 ) -> String {
-    let recap = intelligence
+    let provisional = intelligence
         .and_then(|result| result.summary.as_ref())
-        .map(|summary| format!("\nSummary: {}", summary.text))
-        .unwrap_or_else(|| "\nRecap non generato: servono segmenti transcript validi.".to_string());
+        .map(|summary| {
+            format!(
+                "\n\nRecap provvisorio dalla sessione attiva: {}",
+                summary.text
+            )
+        })
+        .unwrap_or_else(|| "\n\nRecap completo disponibile dopo finalizzazione.".to_string());
     format!(
-        "Ho fermato la Work Session e salvato l'archivio.\nTranscript: {} entrate.{}",
-        exported.transcript.len(),
-        recap
+        "{}{}",
+        render_async_stop_work_session_response(status),
+        provisional
     )
 }
 
@@ -5168,6 +6657,29 @@ fn ensure_work_session_chat_response_text(intent: WorkSessionChatIntent, text: S
     }
 }
 
+fn update_pending_governed_action_after_work_session_result(
+    runtime: &AssistantRuntime,
+    intent: WorkSessionChatIntent,
+    result: &Result<String, String>,
+) {
+    if intent != WorkSessionChatIntent::StartSession {
+        return;
+    }
+
+    match result {
+        Ok(_) => runtime.clear_pending_governed_action_for_tool("meeting.session.start"),
+        Err(error) if is_consent_required_error(error) => {
+            runtime.record_pending_governed_action(
+                "meeting.session.start",
+                "start_session",
+                Some("meeting_consent"),
+                PendingGovernedActionStatus::AwaitingConsent,
+            );
+        }
+        Err(_) => runtime.clear_pending_governed_action_for_tool("meeting.session.start"),
+    }
+}
+
 fn render_work_session_error(intent: WorkSessionChatIntent, error: &str) -> String {
     let sanitized = sanitize_chat_meeting_error(error);
     let lower = sanitized.to_lowercase();
@@ -5185,8 +6697,8 @@ fn render_work_session_error(intent: WorkSessionChatIntent, error: &str) -> Stri
         {
             "Non posso generare il recap perche non trovo transcript nella sessione corrente, nell'ultima completata o nelle sessioni archiviate.".to_string()
         }
-        WorkSessionChatIntent::StartSession if sanitized.contains("consent") => {
-            "Per avviare una Work Session serve prima il consenso Meeting. Apri Dettagli > Meeting e concedi il consenso, poi puoi scrivere di nuovo: Avvia una sessione di lavoro.".to_string()
+        WorkSessionChatIntent::StartSession if is_consent_required_error(&sanitized) => {
+            "Per avviare una Work Session serve prima il consenso Meeting. Apri Dettagli > Meeting e concedi il consenso. Quando lo hai concesso, puoi scrivere \"procedi\" e riprovero l'avvio.".to_string()
         }
         WorkSessionChatIntent::AttachScreenContext if sanitized.contains("NoActiveSession") || sanitized.contains("no active") => {
             "Non c'è una Work Session attiva a cui allegare lo schermo. Avvia prima una sessione di lavoro.".to_string()
@@ -5197,6 +6709,10 @@ fn render_work_session_error(intent: WorkSessionChatIntent, error: &str) -> Stri
             sanitized
         ),
     }
+}
+
+fn is_consent_required_error(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("consent")
 }
 
 fn sanitize_chat_meeting_error(error: &str) -> String {
@@ -5467,6 +6983,8 @@ async fn run_ollama_stream(
         let mut final_text = present_display_text(&full_text);
         if final_text.trim().is_empty() {
             final_text = fallback_display_for_empty_response(&original_message);
+        } else {
+            final_text = append_incomplete_response_notice_if_needed(&final_text);
         }
 
         if !emitted_display_text {
@@ -7161,7 +8679,12 @@ fn grant_meeting_consent(
             )
         },
     )?;
-    let consent = meeting_from_value(value)?;
+    let consent: ConsentState = meeting_from_value(value)?;
+    if consent.given {
+        state
+            .inner()
+            .mark_pending_governed_action_prerequisite_ready("meeting_consent");
+    }
     emit_meeting_update_events(
         &window,
         &["meeting-session-updated", "meeting-diagnostics-updated"],
@@ -7188,7 +8711,7 @@ fn revoke_meeting_consent(
             )
         },
     )?;
-    let consent = meeting_from_value(value)?;
+    let consent: ConsentState = meeting_from_value(value)?;
     emit_meeting_update_events(
         &window,
         &["meeting-session-updated", "meeting-diagnostics-updated"],
@@ -7692,6 +9215,101 @@ fn stop_meeting_session(
         ],
     );
     Ok(exported)
+}
+
+#[tauri::command]
+fn request_stop_meeting_session(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingFinalizationStatus, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.stop.request",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "audio_paths_included": false,
+            "generated_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .request_stop_session_async()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    let status = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-finalization-updated",
+            "meeting-session-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(status)
+}
+
+#[tauri::command]
+fn read_meeting_finalization_status(
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingFinalizationStatus, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.finalization.read",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "audio_paths_included": false,
+            "generated_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .read_finalization_status()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    meeting_from_value(value)
+}
+
+#[tauri::command]
+fn retry_meeting_finalization(
+    window: WebviewWindow,
+    state: State<'_, AssistantRuntime>,
+) -> Result<MeetingFinalizationStatus, String> {
+    let meeting = state.meeting_runtime.clone();
+    let value = governed_meeting_command(
+        state.inner(),
+        "meeting.session.finalization.retry",
+        serde_json::json!({
+            "metadata_only": true,
+            "transcript_text_included": false,
+            "audio_paths_included": false,
+            "generated_text_included": false,
+        }),
+        move || {
+            meeting_value(
+                meeting
+                    .retry_meeting_finalization()
+                    .map_err(|error| error.to_string())?,
+            )
+        },
+    )?;
+    let status = meeting_from_value(value)?;
+    emit_meeting_update_events(
+        &window,
+        &[
+            "meeting-finalization-updated",
+            "meeting-session-updated",
+            "meeting-diagnostics-updated",
+        ],
+    );
+    Ok(status)
 }
 
 #[tauri::command]
@@ -8268,6 +9886,12 @@ mod tests {
         (DesktopAgentRuntime::new(root.clone()), root)
     }
 
+    fn test_assistant_runtime(name: &str) -> (AssistantRuntime, PathBuf) {
+        let root = std::env::temp_dir().join(format!("{name}_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("temp root");
+        (AssistantRuntime::new(root.clone()), root)
+    }
+
     fn archived_transcript_fixture(
         transcript_texts: &[&str],
     ) -> (
@@ -8760,6 +10384,20 @@ mod tests {
     }
 
     #[test]
+    fn tool_answer_synthesis_prompt_keeps_operational_warnings_out_of_answer() {
+        let (mut item, archive, _root) =
+            archived_transcript_fixture(&["contenuto transcript per sintesi dedicata"]);
+        item.stt_completeness_status = "incomplete_drain_timeout".to_string();
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let messages = build_tool_answer_synthesis_messages("riassumi", &packet);
+        let serialized = serde_json::to_string(&messages).expect("messages json");
+
+        assert!(serialized.contains("Do not include STT completeness"));
+        assert!(serialized.contains("put them only in warnings"));
+        assert!(serialized.contains("STT completeness"));
+    }
+
+    #[test]
     fn valid_synthesis_json_returns_answer_with_existing_evidence_ids() {
         let (item, archive, _root) = archived_transcript_fixture(&[
             "La sessione parla di asteroidi e impatti con la Terra",
@@ -8782,7 +10420,58 @@ mod tests {
         let rendered = render_tool_synthesis_answer(&packet, &output);
 
         assert!(rendered.contains("asteroidi"));
-        assert!(rendered.contains(&first_id));
+        assert!(rendered.contains("Evidenze usate: 1 segmento transcript."));
+        assert!(!rendered.contains(&first_id));
+        assert!(!rendered.contains("segment:"));
+    }
+
+    #[test]
+    fn synthesis_parser_sanitizes_operational_metadata_from_answer() {
+        let (item, archive, _root) =
+            archived_transcript_fixture(&["La sessione parla della Terra primordiale"]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let first_id = packet.evidence_items[0].evidence_id.clone();
+        let json = format!(
+            r#"{{
+                "answer": "Fonte: ultima sessione archiviata\nSTT completeness: incomplete_drain_timeout\nLa sessione parla della Terra primordiale.\nEvidenze usate: {}",
+                "status": "answered",
+                "used_evidence_ids": ["{}"],
+                "confidence": 0.84,
+                "warnings": []
+            }}"#,
+            first_id, first_id
+        );
+
+        let output = parse_tool_answer_synthesis_output(&json, &packet).expect("valid synthesis");
+
+        assert_eq!(output.answer, "La sessione parla della Terra primordiale.");
+        assert!(!output.answer.contains("STT completeness"));
+        assert!(!output.answer.contains("segment:"));
+    }
+
+    #[test]
+    fn tool_synthesis_answer_summarizes_evidence_without_raw_segment_ids() {
+        let (item, archive, _root) = archived_transcript_fixture(&[
+            "primo segmento verificabile",
+            "secondo segmento verificabile",
+        ]);
+        let packet = build_archive_transcript_evidence_packet(&item, &archive);
+        let output = AssistantToolSynthesisOutput {
+            answer: "Risposta grounded.".to_string(),
+            status: "answered".to_string(),
+            used_evidence_ids: packet
+                .evidence_items
+                .iter()
+                .map(|item| item.evidence_id.clone())
+                .collect(),
+            confidence: 0.86,
+            warnings: Vec::new(),
+        };
+
+        let rendered = render_tool_synthesis_answer(&packet, &output);
+
+        assert!(rendered.contains("Evidenze usate: 2 segmenti transcript."));
+        assert!(!rendered.contains("segment:"));
     }
 
     #[test]
@@ -9099,6 +10788,17 @@ mod tests {
             repair_succeeded: false,
             prompt_char_count: Some(1200),
             full_router_invoked_reason: None,
+            pending_governed_action_present: false,
+            pending_governed_action_tool: None,
+            pending_governed_action_status: None,
+            pending_governed_action_expired: None,
+            pending_governed_action_policy_action: None,
+            pending_governed_action_retry_attempted: None,
+            pending_continuation_decision: None,
+            pending_continuation_reason: None,
+            pending_continuation_model_called: None,
+            pending_continuation_model_failure: None,
+            pending_continuation_safe_to_ignore: None,
             metadata_only: true,
             raw_message_included: false,
             raw_router_prompt_included: false,
@@ -9121,7 +10821,331 @@ mod tests {
         assert!(!diagnostics.transcript_text_included);
         assert!(!diagnostics.answer_text_included);
         assert!(!serialized.contains("raw user message"));
+        assert!(serialized.contains("pending_continuation_decision"));
+        assert!(serialized.contains("pending_continuation_safe_to_ignore"));
         assert_eq!(diagnostics.failure_reason.as_deref(), Some("MalformedJson"));
+    }
+
+    #[test]
+    fn start_session_consent_required_creates_pending_governed_action() {
+        let (runtime, _root) = test_assistant_runtime("pending_consent");
+        let result = Err(
+            "Explicit meeting recording/transcription consent is required for teams".to_string(),
+        );
+
+        update_pending_governed_action_after_work_session_result(
+            &runtime,
+            WorkSessionChatIntent::StartSession,
+            &result,
+        );
+
+        let pending = runtime.pending_governed_action().expect("pending action");
+        assert_eq!(pending.tool_name, "meeting.session.start");
+        assert_eq!(pending.intent, "start_session");
+        assert_eq!(pending.prerequisite.as_deref(), Some("meeting_consent"));
+        assert_eq!(
+            pending.status,
+            PendingGovernedActionStatus::AwaitingConsent
+        );
+        assert!(pending.metadata_only);
+    }
+
+    #[test]
+    fn pending_action_metadata_appears_in_router_and_planner_context() {
+        let (runtime, _root) = test_assistant_runtime("pending_context");
+        runtime.record_pending_governed_action(
+            "meeting.session.start",
+            "start_session",
+            Some("meeting_consent"),
+            PendingGovernedActionStatus::AwaitingUserConfirmation,
+        );
+
+        let router_context = work_session_context_for_assistant(&runtime).expect("router context");
+        let pending = router_context
+            .get("pending_governed_action")
+            .expect("pending metadata");
+        assert_eq!(
+            pending.get("present").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            pending.get("tool_name").and_then(serde_json::Value::as_str),
+            Some("meeting.session.start")
+        );
+        assert_eq!(
+            pending
+                .get("metadata_only")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let working_context = runtime.working_context_with_pending_action();
+        assert!(working_context.pending_governed_action.is_some());
+        let prompt =
+            context_broker::build_context_planner_messages("continua", &[], &working_context);
+        let serialized = serde_json::to_string(&prompt.messages).expect("planner prompt json");
+        assert!(serialized.contains("pending_governed_action"));
+        assert!(serialized.contains("metadata_only"));
+        assert!(!serialized.contains("raw_audio"));
+        assert!(!serialized.contains("screen_pixels"));
+    }
+
+    #[test]
+    fn pending_action_normal_chat_user_ready_retries_start_route() {
+        let pending = sample_pending_start_action();
+        let result = AssistantToolRouterRuntimeResult::NormalChat {
+            confidence: 0.0,
+            reason_code: "user_ready".to_string(),
+        };
+
+        let route =
+            pending_action_retry_route_from_router_result(&result, &pending).expect("retry route");
+
+        assert_eq!(route.intent, WorkSessionChatIntent::StartSession);
+        assert_eq!(
+            route.reason_code.as_deref(),
+            Some("pending_governed_action_retry")
+        );
+        assert_eq!(
+            route.intent.primary_tool_name(),
+            Some("meeting.session.start")
+        );
+    }
+
+    fn sample_pending_start_action() -> PendingGovernedAction {
+        PendingGovernedAction {
+            action_id: "action-1".to_string(),
+            tool_name: "meeting.session.start".to_string(),
+            intent: "start_session".to_string(),
+            prerequisite: Some("meeting_consent".to_string()),
+            status: PendingGovernedActionStatus::AwaitingUserConfirmation,
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::seconds(60),
+            attempt_count: 1,
+            metadata_only: true,
+        }
+    }
+
+    #[test]
+    fn pending_action_router_normal_chat_no_action_needed_asks_confirmation() {
+        let pending = sample_pending_start_action();
+        let result = AssistantToolRouterRuntimeResult::NormalChat {
+            confidence: 0.0,
+            reason_code: "no_action_needed".to_string(),
+        };
+
+        let policy = apply_pending_governed_action_continuation_policy(&result, &pending, None);
+
+        assert_eq!(
+            policy.decision,
+            PendingGovernedActionContinuationDecision::AskConfirmation
+        );
+        assert_eq!(
+            policy.reason,
+            PendingGovernedActionContinuationReason::NormalChatLowConfidence
+        );
+        assert!(!policy.safe_to_ignore);
+    }
+
+    #[test]
+    fn pending_action_safe_ignore_allows_unrelated_normal_chat() {
+        let pending = sample_pending_start_action();
+        let result = AssistantToolRouterRuntimeResult::NormalChat {
+            confidence: 0.91,
+            reason_code: "safe_ignore_pending_action".to_string(),
+        };
+
+        let policy = apply_pending_governed_action_continuation_policy(&result, &pending, None);
+
+        assert_eq!(
+            policy.decision,
+            PendingGovernedActionContinuationDecision::IgnoreAndNormalChat
+        );
+        assert_eq!(
+            policy.reason,
+            PendingGovernedActionContinuationReason::NormalChatSafeIgnore
+        );
+        assert!(policy.safe_to_ignore);
+    }
+
+    #[test]
+    fn pending_action_router_unavailable_asks_confirmation_not_empty() {
+        let pending = sample_pending_start_action();
+        let result = AssistantToolRouterRuntimeResult::Unavailable {
+            reason: RouterFailureReason::OllamaUnavailable,
+        };
+
+        let policy = apply_pending_governed_action_continuation_policy(&result, &pending, None);
+
+        assert_eq!(
+            policy.decision,
+            PendingGovernedActionContinuationDecision::AskConfirmation
+        );
+        assert_eq!(
+            policy.reason,
+            PendingGovernedActionContinuationReason::Failure
+        );
+        assert_eq!(policy.model_failure.as_deref(), Some("OllamaUnavailable"));
+        assert!(render_pending_governed_action_clarification().contains("Work Session"));
+    }
+
+    #[test]
+    fn pending_action_retry_success_clears_state() {
+        let (runtime, _root) = test_assistant_runtime("pending_success");
+        runtime.record_pending_governed_action(
+            "meeting.session.start",
+            "start_session",
+            Some("meeting_consent"),
+            PendingGovernedActionStatus::AwaitingUserConfirmation,
+        );
+
+        let result = Ok("Ho avviato la Work Session.".to_string());
+        update_pending_governed_action_after_work_session_result(
+            &runtime,
+            WorkSessionChatIntent::StartSession,
+            &result,
+        );
+
+        assert!(runtime.pending_governed_action().is_none());
+    }
+
+    #[test]
+    fn pending_action_repeated_consent_failure_preserves_state() {
+        let (runtime, _root) = test_assistant_runtime("pending_repeated_consent");
+        runtime.record_pending_governed_action(
+            "meeting.session.start",
+            "start_session",
+            Some("meeting_consent"),
+            PendingGovernedActionStatus::AwaitingUserConfirmation,
+        );
+        runtime.mark_pending_governed_action_retry_attempted("meeting.session.start");
+
+        let result = Err("meeting consent required".to_string());
+        update_pending_governed_action_after_work_session_result(
+            &runtime,
+            WorkSessionChatIntent::StartSession,
+            &result,
+        );
+
+        let pending = runtime.pending_governed_action().expect("pending action");
+        assert_eq!(pending.tool_name, "meeting.session.start");
+        assert_eq!(pending.status, PendingGovernedActionStatus::AwaitingConsent);
+        assert_eq!(pending.attempt_count, 2);
+    }
+
+    #[test]
+    fn meeting_consent_grant_marks_pending_action_ready_to_retry() {
+        let (runtime, _root) = test_assistant_runtime("pending_consent_ready");
+        runtime.record_pending_governed_action(
+            "meeting.session.start",
+            "start_session",
+            Some("meeting_consent"),
+            PendingGovernedActionStatus::AwaitingConsent,
+        );
+
+        let marked = runtime
+            .mark_pending_governed_action_prerequisite_ready("meeting_consent")
+            .expect("pending marked ready");
+
+        assert_eq!(marked.status, PendingGovernedActionStatus::ReadyToRetry);
+        let pending = runtime.pending_governed_action().expect("pending action");
+        assert_eq!(pending.status, PendingGovernedActionStatus::ReadyToRetry);
+        assert_eq!(pending.tool_name, "meeting.session.start");
+    }
+
+    #[test]
+    fn pending_action_ready_user_confirmation_retries_even_when_router_is_empty() {
+        let mut pending = sample_pending_start_action();
+        pending.status = PendingGovernedActionStatus::ReadyToRetry;
+        let result = AssistantToolRouterRuntimeResult::EmptyModelContent {
+            model: "gpt-oss:20b".to_string(),
+        };
+
+        let policy = apply_pending_governed_action_continuation_policy(
+            &result,
+            &pending,
+            Some("fatto, procediamo"),
+        );
+
+        assert_eq!(
+            policy.decision,
+            PendingGovernedActionContinuationDecision::RetryPendingAction
+        );
+        assert_eq!(
+            policy.reason,
+            PendingGovernedActionContinuationReason::ReadyToRetry
+        );
+        assert!(!policy.safe_to_ignore);
+    }
+
+    #[test]
+    fn pending_action_user_cancel_signal_cancels_without_retry() {
+        let mut pending = sample_pending_start_action();
+        pending.status = PendingGovernedActionStatus::ReadyToRetry;
+        let result = AssistantToolRouterRuntimeResult::EmptyModelContent {
+            model: "gpt-oss:20b".to_string(),
+        };
+
+        let policy = apply_pending_governed_action_continuation_policy(
+            &result,
+            &pending,
+            Some("no, annulla"),
+        );
+
+        assert_eq!(
+            policy.decision,
+            PendingGovernedActionContinuationDecision::CancelPendingAction
+        );
+        assert_eq!(
+            policy.reason,
+            PendingGovernedActionContinuationReason::ExplicitCancel
+        );
+    }
+
+    #[test]
+    fn pending_action_unrelated_message_still_asks_confirmation_on_router_failure() {
+        let mut pending = sample_pending_start_action();
+        pending.status = PendingGovernedActionStatus::ReadyToRetry;
+        let result = AssistantToolRouterRuntimeResult::EmptyModelContent {
+            model: "gpt-oss:20b".to_string(),
+        };
+
+        let policy = apply_pending_governed_action_continuation_policy(
+            &result,
+            &pending,
+            Some("parlami della formazione della terra"),
+        );
+
+        assert_eq!(
+            policy.decision,
+            PendingGovernedActionContinuationDecision::AskConfirmation
+        );
+        assert_eq!(
+            policy.reason,
+            PendingGovernedActionContinuationReason::Failure
+        );
+    }
+
+    #[test]
+    fn pending_action_expiry_clears_state() {
+        let (runtime, _root) = test_assistant_runtime("pending_expired");
+        runtime.set_pending_governed_action_for_test(PendingGovernedAction {
+            action_id: "action-1".to_string(),
+            tool_name: "meeting.session.start".to_string(),
+            intent: "start_session".to_string(),
+            prerequisite: Some("meeting_consent".to_string()),
+            status: PendingGovernedActionStatus::AwaitingUserConfirmation,
+            created_at: Utc::now() - chrono::Duration::seconds(120),
+            expires_at: Utc::now() - chrono::Duration::seconds(1),
+            attempt_count: 1,
+            metadata_only: true,
+        });
+
+        let (pending, expired) = runtime.pending_governed_action_snapshot();
+
+        assert!(pending.is_none());
+        assert!(expired);
+        assert!(runtime.pending_governed_action().is_none());
     }
 
     #[test]
@@ -9726,6 +11750,9 @@ pub fn run() {
             pause_meeting_session,
             resume_meeting_session,
             stop_meeting_session,
+            request_stop_meeting_session,
+            read_meeting_finalization_status,
+            retry_meeting_finalization,
             recover_failed_meeting_capture,
             force_finalize_failed_meeting_capture,
             list_meeting_sessions,

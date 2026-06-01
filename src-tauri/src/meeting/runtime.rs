@@ -2,11 +2,12 @@ pub use super::types::MeetingRuntimeError;
 use super::{
     audio_capture::{
         wasapi_backend_available, wasapi_unavailable_reason, AudioCapture, CaptureMetricsReporter,
-        CapturedSegmentQueue,
+        CapturedSegmentQueue, CapturedSegmentSender,
     },
     call_detector::CallDetector,
     capture_controller::{
-        CaptureController, CaptureControllerConfig, CaptureControllerStartRequest,
+        meeting_stt_background_drain_timeout, CaptureController, CaptureControllerConfig,
+        CaptureControllerStartRequest, CaptureSegmentDrainWaiter,
     },
     intelligence_engine::{
         build_meeting_llm_language_retry_prompt_input, build_meeting_llm_prompt_input,
@@ -25,17 +26,18 @@ use super::{
         CaptureSummaryStatus, ClearMeetingDataRequest, ConsentState, DecisionLogEntry,
         ExportedMeeting, MeetingAudioFileTranscriptionRequest, MeetingAudioFileTranscriptionResult,
         MeetingCapabilityReadiness, MeetingCapabilityState, MeetingConfig, MeetingDataClearPreview,
-        MeetingDataClearResult, MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult,
-        MeetingLanguage, MeetingLanguageSource, MeetingLiveCapabilitySnapshot,
-        MeetingRecallDiagnostics, MeetingRecallEvidence, MeetingRecallEvidenceRelation,
-        MeetingRecallIntent, MeetingRecallRequest, MeetingRecallResponse, MeetingRecallStatus,
-        MeetingScreenContext, MeetingScreenContextAttachResponse, MeetingSession,
-        MeetingSessionExportRequest, MeetingSessionExportResponse, MeetingSessionListRequest,
-        MeetingSessionListResponse, MeetingSessionMode, MeetingSessionReadRequest,
-        MeetingSessionReadResponse, MeetingSessionSearchRequest, MeetingSessionSearchResponse,
-        MeetingSessionState, MeetingSessionType, MeetingSessionTypeSource, MeetingStatus,
-        RenameSpeakerRequest, RenameSpeakerResult, SpeakerAttributionMethod, TranscriptEntry,
-        TranscriptSource, CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
+        MeetingDataClearResult, MeetingFinalizationStage, MeetingFinalizationStatus,
+        MeetingIntelligenceGenerationOptions, MeetingIntelligenceResult, MeetingLanguage,
+        MeetingLanguageSource, MeetingLiveCapabilitySnapshot, MeetingRecallDiagnostics,
+        MeetingRecallEvidence, MeetingRecallEvidenceRelation, MeetingRecallIntent,
+        MeetingRecallRequest, MeetingRecallResponse, MeetingRecallStatus, MeetingScreenContext,
+        MeetingScreenContextAttachResponse, MeetingSession, MeetingSessionExportRequest,
+        MeetingSessionExportResponse, MeetingSessionListRequest, MeetingSessionListResponse,
+        MeetingSessionMode, MeetingSessionReadRequest, MeetingSessionReadResponse,
+        MeetingSessionSearchRequest, MeetingSessionSearchResponse, MeetingSessionState,
+        MeetingSessionType, MeetingSessionTypeSource, MeetingStatus, RenameSpeakerRequest,
+        RenameSpeakerResult, SpeakerAttributionMethod, TranscriptEntry, TranscriptSource,
+        CLEAR_MEETING_DATA_CONFIRMATION_PHRASE,
     },
 };
 use crate::stt_client::SttClient;
@@ -55,6 +57,33 @@ const MAX_RECALL_EVIDENCE: usize = 20;
 const MAX_RECALL_PROMPT_CHARS: usize = 12_000;
 const MAX_RECALL_ANSWER_CHARS: usize = 2_000;
 
+struct CapturedSegmentInFlightGuard {
+    receiver: CapturedSegmentSender,
+    finished: bool,
+}
+
+impl CapturedSegmentInFlightGuard {
+    fn new(receiver: CapturedSegmentSender) -> Self {
+        Self {
+            receiver,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) {
+        self.finished = true;
+        self.receiver.finish_in_flight();
+    }
+}
+
+impl Drop for CapturedSegmentInFlightGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.receiver.finish_in_flight();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct MeetingRuntime {
     registry: Arc<Mutex<SessionRegistry>>,
@@ -66,6 +95,32 @@ pub struct MeetingRuntime {
     organizer: NoteOrganizer,
     session_memory: SessionMemoryStore,
     meeting_storage_dir: PathBuf,
+    finalization: Arc<Mutex<MeetingFinalizationController>>,
+}
+
+#[derive(Clone)]
+struct MeetingFinalizationRetryPayload {
+    exported: ExportedMeeting,
+    completed_state: MeetingSessionState,
+    system_capture_health: CaptureHealth,
+    microphone_capture_health: CaptureHealth,
+    export_written: bool,
+}
+
+struct MeetingFinalizationController {
+    status: MeetingFinalizationStatus,
+    running: bool,
+    retry_payload: Option<MeetingFinalizationRetryPayload>,
+}
+
+impl Default for MeetingFinalizationController {
+    fn default() -> Self {
+        Self {
+            status: MeetingFinalizationStatus::idle(),
+            running: false,
+            retry_payload: None,
+        }
+    }
 }
 
 impl MeetingRuntime {
@@ -110,6 +165,7 @@ impl MeetingRuntime {
             organizer: NoteOrganizer::new(meeting_storage_dir.clone()),
             session_memory: SessionMemoryStore::new(meeting_storage_dir.clone()),
             meeting_storage_dir,
+            finalization: Arc::new(Mutex::new(MeetingFinalizationController::default())),
         }
     }
 
@@ -223,6 +279,23 @@ impl MeetingRuntime {
 
         let options = config.capture_options;
         let emit_segments = options.segment_transcription || config.live_transcription_enabled;
+        if emit_segments {
+            if let Err(error) = self.stt_adapter.request_warm_up() {
+                let mut registry = self.lock_registry()?;
+                registry.add_diagnostic(
+                    "meeting_stt_warmup_request_failed",
+                    super::types::MeetingDiagnosticSeverity::Warning,
+                    format!("meeting STT warmup request failed: {error}"),
+                )?;
+            } else {
+                let mut registry = self.lock_registry()?;
+                registry.add_diagnostic(
+                    "meeting_stt_warmup_requested",
+                    super::types::MeetingDiagnosticSeverity::Info,
+                    "meeting STT worker warmup requested before capture segments".to_string(),
+                )?;
+            }
+        }
         let mut started_sources = Vec::new();
         let mut failures = Vec::new();
 
@@ -304,10 +377,11 @@ impl MeetingRuntime {
             let runtime = self.clone();
             let task = tauri::async_runtime::spawn(async move {
                 while let Some(segment) = receiver.recv().await {
+                    let in_flight_guard = CapturedSegmentInFlightGuard::new(receiver.clone());
                     let result = runtime
                         .transcribe_captured_segment(segment, None, true)
                         .await;
-                    receiver.finish_in_flight();
+                    in_flight_guard.finish();
                     if let Err(error) = result {
                         log::warn!("managed meeting capture segment transcription failed: {error}");
                         if matches!(
@@ -417,7 +491,7 @@ impl MeetingRuntime {
         if let Err(error) = self.ensure_can_transcribe_platform(&active_session.platform) {
             if matches!(error, MeetingRuntimeError::ConsentRequired { .. }) {
                 self.with_capture_mut_for_source(segment.transcript_source, |capture| {
-                    capture.record_consent_revoked(&active_session.platform);
+                    capture.record_consent_revoked_from_segment_worker(&active_session.platform);
                 })?;
             }
             let cleanup = self
@@ -488,7 +562,7 @@ impl MeetingRuntime {
             Err(MeetingRuntimeError::ConsentRequired { .. })
             | Err(MeetingRuntimeError::ConsentRevoked { .. }) => {
                 self.with_capture_mut_for_source(segment.transcript_source, |capture| {
-                    capture.record_consent_revoked(&active_session.platform);
+                    capture.record_consent_revoked_from_segment_worker(&active_session.platform);
                 })?;
             }
             Err(error) => {
@@ -928,6 +1002,311 @@ impl MeetingRuntime {
         Ok(exported)
     }
 
+    pub fn request_stop_session_async(
+        &self,
+    ) -> Result<MeetingFinalizationStatus, MeetingRuntimeError> {
+        {
+            let controller = self.lock_finalization()?;
+            if controller.running {
+                return Ok(controller.status.clone());
+            }
+            if controller.status.is_terminal()
+                && controller.status.stage != MeetingFinalizationStage::Idle
+            {
+                let registry = self.lock_registry()?;
+                if registry.get_active_session().is_none() {
+                    return Ok(controller.status.clone());
+                }
+            }
+        }
+
+        self.reconcile_active_capture_state()?;
+        let session = {
+            let mut registry = self.lock_registry()?;
+            let session = registry
+                .get_active_session()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)?;
+            let _ = registry.transition_to(MeetingStatus::Stopping);
+            session
+        };
+
+        let now = Utc::now();
+        let status = {
+            let mut controller = self.lock_finalization()?;
+            controller.running = true;
+            controller.retry_payload = None;
+            controller.status = MeetingFinalizationStatus {
+                session_id: Some(session.session_id.clone()),
+                stage: MeetingFinalizationStage::StopRequested,
+                started_at: Some(now),
+                updated_at: Some(now),
+                completed_at: None,
+                foreground_returned_at: Some(now),
+                progress_label: "stop requested".to_string(),
+                pending_segments: 0,
+                queue_depth: 0,
+                in_flight_segments: 0,
+                transcribed_segments: 0,
+                written_segments: 0,
+                failed_segments: 0,
+                drain_timeout: false,
+                archive_written: false,
+                export_written: false,
+                recoverable: false,
+                error_code: None,
+                error_message_redacted: None,
+                metadata_only: true,
+            };
+            controller.status.clone()
+        };
+
+        let runtime = self.clone();
+        let session_id = session.session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            runtime.run_finalization_task(session_id).await;
+        });
+
+        Ok(status)
+    }
+
+    pub fn read_finalization_status(
+        &self,
+    ) -> Result<MeetingFinalizationStatus, MeetingRuntimeError> {
+        let controller = self.lock_finalization()?;
+        Ok(controller.status.clone())
+    }
+
+    pub fn retry_meeting_finalization(
+        &self,
+    ) -> Result<MeetingFinalizationStatus, MeetingRuntimeError> {
+        let payload = {
+            let mut controller = self.lock_finalization()?;
+            if controller.running {
+                return Ok(controller.status.clone());
+            }
+            let Some(payload) = controller.retry_payload.clone() else {
+                return Ok(controller.status.clone());
+            };
+            controller.running = true;
+            controller.status.stage = MeetingFinalizationStage::Exporting;
+            controller.status.updated_at = Some(Utc::now());
+            controller.status.progress_label = "retrying finalization".to_string();
+            controller.status.recoverable = false;
+            controller.status.error_code = None;
+            controller.status.error_message_redacted = None;
+            payload
+        };
+
+        let runtime = self.clone();
+        let status = self.read_finalization_status()?;
+        tauri::async_runtime::spawn(async move {
+            runtime.run_finalization_retry_task(payload).await;
+        });
+        Ok(status)
+    }
+
+    async fn run_finalization_task(&self, session_id: String) {
+        let result = self.run_finalization_task_inner(session_id.clone()).await;
+        if let Err(error) = result {
+            let still_running = self
+                .lock_finalization()
+                .map(|controller| controller.running)
+                .unwrap_or(false);
+            if still_running {
+                self.mark_finalization_failed(
+                    Some(session_id),
+                    finalization_error_code(&error),
+                    false,
+                    false,
+                );
+            }
+        }
+    }
+
+    async fn run_finalization_task_inner(
+        &self,
+        session_id: String,
+    ) -> Result<(), MeetingRuntimeError> {
+        self.update_finalization_stage(
+            &session_id,
+            MeetingFinalizationStage::StoppingCapture,
+            "stopping capture",
+            None,
+        )?;
+        let stop_outcome = self.stop_all_captures_for_async_finalization().await?;
+        self.apply_capture_stop_diagnostics(&stop_outcome)?;
+        self.record_segment_stt_stop_diagnostics(
+            &stop_outcome.system_health,
+            &stop_outcome.microphone_health,
+        )?;
+
+        self.update_finalization_stage(
+            &session_id,
+            MeetingFinalizationStage::StoppingRegistry,
+            "stopping registry",
+            Some(&stop_outcome),
+        )?;
+        let mut exported = {
+            let mut registry = self.lock_registry()?;
+            registry.stop()?
+        };
+        apply_segment_stt_export_metadata(
+            &mut exported,
+            &stop_outcome.system_health,
+            &stop_outcome.microphone_health,
+        );
+        let completed_state = {
+            let registry = self.lock_registry()?;
+            registry
+                .get_last_completed_state()
+                .cloned()
+                .ok_or(MeetingRuntimeError::NoActiveSession)?
+        };
+        let combined_capture_health = aggregate_capture_health(
+            stop_outcome.system_health.clone(),
+            stop_outcome.microphone_health.clone(),
+        );
+
+        self.update_finalization_stage(
+            &session_id,
+            MeetingFinalizationStage::Exporting,
+            "exporting",
+            Some(&stop_outcome),
+        )?;
+        if let Err(message) = self.organizer.save_meeting_data(&exported) {
+            self.store_finalization_retry_payload(
+                exported,
+                completed_state,
+                stop_outcome.system_health,
+                stop_outcome.microphone_health,
+                false,
+            );
+            self.mark_finalization_failed(
+                Some(session_id),
+                "export_failed".to_string(),
+                true,
+                false,
+            );
+            return Err(MeetingRuntimeError::StorageError { message });
+        }
+        self.set_finalization_export_written(true)?;
+
+        self.update_finalization_stage(
+            &session_id,
+            MeetingFinalizationStage::Archiving,
+            "archiving",
+            Some(&stop_outcome),
+        )?;
+        if let Err(error) = self.session_memory.archive_completed_session(
+            &completed_state,
+            &exported,
+            &combined_capture_health,
+            &stop_outcome.system_health,
+            &stop_outcome.microphone_health,
+        ) {
+            self.store_finalization_retry_payload(
+                exported,
+                completed_state,
+                stop_outcome.system_health,
+                stop_outcome.microphone_health,
+                true,
+            );
+            self.mark_finalization_failed(
+                Some(session_id),
+                finalization_error_code(&error),
+                true,
+                true,
+            );
+            return Err(error);
+        }
+        self.mark_finalization_completed(
+            &session_id,
+            &stop_outcome.system_health,
+            &stop_outcome.microphone_health,
+        )?;
+        Ok(())
+    }
+
+    async fn run_finalization_retry_task(&self, payload: MeetingFinalizationRetryPayload) {
+        let session_id = payload.exported.session_id.clone();
+        let outcome = CaptureStopOutcome {
+            system_health: payload.system_capture_health.clone(),
+            microphone_health: payload.microphone_capture_health.clone(),
+            idempotent_no_handle: false,
+            error_kinds: Vec::new(),
+            poison_recovered: false,
+        };
+        let combined_capture_health = aggregate_capture_health(
+            payload.system_capture_health.clone(),
+            payload.microphone_capture_health.clone(),
+        );
+
+        if !payload.export_written {
+            self.update_finalization_stage(
+                &session_id,
+                MeetingFinalizationStage::Exporting,
+                "retrying export",
+                Some(&outcome),
+            )
+            .ok();
+            if let Err(message) = self.organizer.save_meeting_data(&payload.exported) {
+                self.store_finalization_retry_payload(
+                    payload.exported,
+                    payload.completed_state,
+                    payload.system_capture_health,
+                    payload.microphone_capture_health,
+                    false,
+                );
+                self.mark_finalization_failed(
+                    Some(session_id),
+                    "export_failed".to_string(),
+                    true,
+                    false,
+                );
+                let _ = message;
+                return;
+            }
+            self.set_finalization_export_written(true).ok();
+        }
+
+        self.update_finalization_stage(
+            &session_id,
+            MeetingFinalizationStage::Archiving,
+            "retrying archive",
+            Some(&outcome),
+        )
+        .ok();
+        if let Err(error) = self.session_memory.archive_completed_session(
+            &payload.completed_state,
+            &payload.exported,
+            &combined_capture_health,
+            &payload.system_capture_health,
+            &payload.microphone_capture_health,
+        ) {
+            self.store_finalization_retry_payload(
+                payload.exported,
+                payload.completed_state,
+                payload.system_capture_health,
+                payload.microphone_capture_health,
+                true,
+            );
+            self.mark_finalization_failed(
+                Some(session_id),
+                finalization_error_code(&error),
+                true,
+                true,
+            );
+            return;
+        }
+
+        let _ = self.mark_finalization_completed(
+            &session_id,
+            &payload.system_capture_health,
+            &payload.microphone_capture_health,
+        );
+    }
+
     pub fn recover_failed_capture_session(
         &self,
     ) -> Result<MeetingSessionState, MeetingRuntimeError> {
@@ -1230,6 +1609,7 @@ impl MeetingRuntime {
         let wasapi_available = wasapi_backend_available();
         let live_segment_transcription_ready =
             capture_health.active_handle_present && stt_status.file_transcription.available;
+        let finalization_status = self.read_finalization_status()?;
 
         Ok(MeetingLiveCapabilitySnapshot {
             manual_session: readiness(
@@ -1349,6 +1729,7 @@ impl MeetingRuntime {
             capture_summary_reason: capture_summary.reason,
             active_sources: capture_summary.active_sources,
             failed_sources: capture_summary.failed_sources,
+            finalization_status,
             stt_adapter: stt_status,
         })
     }
@@ -1362,14 +1743,17 @@ impl MeetingRuntime {
     ) -> Result<(), MeetingRuntimeError> {
         let error_kind = captured_segment_error_kind(error);
         let immediate_failure = captured_segment_error_fails_capture_immediately(error);
+        let mut stt_stalled_reason: Option<String> = None;
         let terminal_reason = {
             self.with_capture_mut_for_source(source, |capture| {
                 if immediate_failure {
                     capture.record_terminal_segment_transcription_failure(&error_kind);
-                    Some(format!(
+                    let reason = format!(
                         "{}_segment_transcription_failed:{error_kind}",
                         source.as_str()
-                    ))
+                    );
+                    capture.request_stop_after_segment_transcription_failure(reason.clone());
+                    Some(reason)
                 } else {
                     let health = capture
                         .record_segment_transcription_failure_with_id(&error_kind, segment_id);
@@ -1378,14 +1762,12 @@ impl MeetingRuntime {
                         .max_consecutive_transcription_failures
                         .max(1) as u64;
                     if health.metrics.segment_transcription_failures_consecutive >= threshold {
-                        let _ = capture.abort(format!(
-                            "{}_segment_transcription_failure_threshold",
+                        stt_stalled_reason = Some(format!(
+                            "{}_segment_stt_stalled:{error_kind}",
                             source.as_str()
                         ));
-                        Some("segment_transcription_failure_threshold".to_string())
-                    } else {
-                        None
                     }
+                    None
                 }
             })?
         };
@@ -1399,6 +1781,24 @@ impl MeetingRuntime {
                         "{} segment transcription failed: {error_kind}",
                         source.as_str()
                     ),
+                )?;
+            }
+        }
+
+        if let Some(reason) = stt_stalled_reason {
+            let mut registry = self.lock_registry()?;
+            if registry.get_active_session().is_some() {
+                registry.add_diagnostic(
+                    format!("{}_segment_stt_stalled", source.as_str()),
+                    super::types::MeetingDiagnosticSeverity::Warning,
+                    format!(
+                        "{} segment STT is stalled ({error_kind}); capture remains governed and finalizable",
+                        source.as_str()
+                    ),
+                )?;
+                registry.update_capture_status(
+                    true,
+                    Some(format!("segment STT stalled: {reason}")),
                 )?;
             }
         }
@@ -1643,6 +2043,145 @@ impl MeetingRuntime {
         }
     }
 
+    fn lock_finalization(
+        &self,
+    ) -> Result<MutexGuard<'_, MeetingFinalizationController>, MeetingRuntimeError> {
+        self.finalization
+            .lock()
+            .map_err(|_| MeetingRuntimeError::MutexPoisoned {
+                component: "meeting_finalization".to_string(),
+            })
+    }
+
+    fn current_finalization_session_id(&self) -> Result<Option<String>, MeetingRuntimeError> {
+        let controller = self.lock_finalization()?;
+        Ok(controller.status.session_id.clone())
+    }
+
+    fn update_finalization_stage(
+        &self,
+        session_id: &str,
+        stage: MeetingFinalizationStage,
+        progress_label: &str,
+        capture_outcome: Option<&CaptureStopOutcome>,
+    ) -> Result<MeetingFinalizationStatus, MeetingRuntimeError> {
+        let mut controller = self.lock_finalization()?;
+        controller.status.session_id = Some(session_id.to_string());
+        controller.status.stage = stage;
+        controller.status.updated_at = Some(Utc::now());
+        controller.status.progress_label = progress_label.to_string();
+        controller.status.metadata_only = true;
+        controller.status.error_code = None;
+        controller.status.error_message_redacted = None;
+        if let Some(outcome) = capture_outcome {
+            apply_capture_metrics_to_finalization_status(
+                &mut controller.status,
+                &outcome.system_health,
+                &outcome.microphone_health,
+            );
+        }
+        Ok(controller.status.clone())
+    }
+
+    fn set_finalization_export_written(&self, written: bool) -> Result<(), MeetingRuntimeError> {
+        let mut controller = self.lock_finalization()?;
+        controller.status.export_written = written;
+        controller.status.updated_at = Some(Utc::now());
+        Ok(())
+    }
+
+    fn store_finalization_retry_payload(
+        &self,
+        exported: ExportedMeeting,
+        completed_state: MeetingSessionState,
+        system_capture_health: CaptureHealth,
+        microphone_capture_health: CaptureHealth,
+        export_written: bool,
+    ) {
+        if let Ok(mut controller) = self.lock_finalization() {
+            controller.retry_payload = Some(MeetingFinalizationRetryPayload {
+                exported,
+                completed_state,
+                system_capture_health,
+                microphone_capture_health,
+                export_written,
+            });
+        }
+    }
+
+    fn mark_finalization_failed(
+        &self,
+        session_id: Option<String>,
+        error_code: String,
+        recoverable: bool,
+        export_written: bool,
+    ) {
+        if let Ok(mut controller) = self.lock_finalization() {
+            let now = Utc::now();
+            controller.running = false;
+            let existing_session_id = controller.status.session_id.clone();
+            controller.status.session_id = session_id.or(existing_session_id);
+            controller.status.stage = if recoverable {
+                MeetingFinalizationStage::FailedRecoverable
+            } else {
+                MeetingFinalizationStage::Failed
+            };
+            controller.status.updated_at = Some(now);
+            controller.status.completed_at = Some(now);
+            controller.status.progress_label = if recoverable {
+                "finalization failed: recoverable".to_string()
+            } else {
+                "finalization failed".to_string()
+            };
+            controller.status.recoverable = recoverable;
+            controller.status.export_written = export_written;
+            controller.status.archive_written = false;
+            controller.status.error_code = Some(error_code);
+            controller.status.error_message_redacted = Some("redacted".to_string());
+            controller.status.metadata_only = true;
+        }
+    }
+
+    fn mark_finalization_completed(
+        &self,
+        session_id: &str,
+        system_capture_health: &CaptureHealth,
+        microphone_capture_health: &CaptureHealth,
+    ) -> Result<(), MeetingRuntimeError> {
+        let completeness =
+            derive_meeting_stt_completeness(system_capture_health, microphone_capture_health);
+        let partial = completeness.overall.is_incomplete();
+        let mut controller = self.lock_finalization()?;
+        let now = Utc::now();
+        controller.running = false;
+        controller.retry_payload = None;
+        controller.status.session_id = Some(session_id.to_string());
+        controller.status.stage = if partial {
+            MeetingFinalizationStage::CompletedPartial
+        } else {
+            MeetingFinalizationStage::Completed
+        };
+        controller.status.updated_at = Some(now);
+        controller.status.completed_at = Some(now);
+        controller.status.progress_label = if partial {
+            "finalized with partial transcript".to_string()
+        } else {
+            "finalized".to_string()
+        };
+        apply_capture_metrics_to_finalization_status(
+            &mut controller.status,
+            system_capture_health,
+            microphone_capture_health,
+        );
+        controller.status.export_written = true;
+        controller.status.archive_written = true;
+        controller.status.recoverable = false;
+        controller.status.error_code = None;
+        controller.status.error_message_redacted = None;
+        controller.status.metadata_only = true;
+        Ok(())
+    }
+
     fn with_capture_mut_for_source<T>(
         &self,
         source: TranscriptSource,
@@ -1789,6 +2328,159 @@ impl MeetingRuntime {
                 }
             }
         })
+    }
+
+    async fn stop_all_captures_for_async_finalization(
+        &self,
+    ) -> Result<CaptureStopOutcome, MeetingRuntimeError> {
+        let (system_initial, system_drain, system_no_handle, system_error) =
+            self.stop_capture_source_for_async_finalization(TranscriptSource::SystemAudio)?;
+        let (microphone_initial, microphone_drain, microphone_no_handle, microphone_error) =
+            self.stop_capture_source_for_async_finalization(TranscriptSource::Microphone)?;
+
+        if system_drain.is_some() || microphone_drain.is_some() {
+            let initial_outcome = CaptureStopOutcome {
+                system_health: system_initial,
+                microphone_health: microphone_initial,
+                idempotent_no_handle: system_no_handle || microphone_no_handle,
+                error_kinds: [system_error.clone(), microphone_error.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+                poison_recovered: false,
+            };
+            if let Some(session_id) = self.current_finalization_session_id()? {
+                self.update_finalization_stage(
+                    &session_id,
+                    MeetingFinalizationStage::DrainingStt,
+                    "draining STT",
+                    Some(&initial_outcome),
+                )?;
+            }
+        }
+
+        if let Some(drain) = system_drain {
+            let _ = drain.wait().await;
+        }
+        if let Some(drain) = microphone_drain {
+            let _ = drain.wait().await;
+        }
+
+        let system_health = self.capture_health()?;
+        let microphone_health = self.microphone_capture_health()?;
+        let error_kinds = [system_error, microphone_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let poison_recovered = error_kinds
+            .iter()
+            .any(|kind| kind == "mutex_poisoned" || kind.contains("poison"))
+            || [&system_health, &microphone_health].iter().any(|health| {
+                health
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("poison"))
+            });
+        Ok(CaptureStopOutcome {
+            system_health,
+            microphone_health,
+            idempotent_no_handle: system_no_handle || microphone_no_handle,
+            error_kinds,
+            poison_recovered,
+        })
+    }
+
+    fn stop_capture_source_for_async_finalization(
+        &self,
+        source: TranscriptSource,
+    ) -> Result<
+        (
+            CaptureHealth,
+            Option<CaptureSegmentDrainWaiter>,
+            bool,
+            Option<String>,
+        ),
+        MeetingRuntimeError,
+    > {
+        let drain_timeout = meeting_stt_background_drain_timeout();
+        self.with_capture_mut_for_source(source, |capture| {
+            let attempted = capture.has_active_handle()
+                || matches!(
+                    capture.state(),
+                    CaptureControllerState::Starting
+                        | CaptureControllerState::Capturing
+                        | CaptureControllerState::Paused
+                        | CaptureControllerState::Stopping
+                        | CaptureControllerState::Failed
+                );
+            let poison_recovered = capture
+                .health_snapshot()
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("poison"));
+            let (health, drain, error) = capture.stop_for_background_finalization(drain_timeout);
+            match error {
+                Some(error) => {
+                    let error_kind = capture_stop_error_kind(&error).to_string();
+                    (health, drain, false, Some(error_kind))
+                }
+                None => {
+                    let no_handle = !attempted && !health.active_handle_present;
+                    let error_kind = poison_recovered.then(|| "mutex_poisoned".to_string());
+                    (health, drain, no_handle, error_kind)
+                }
+            }
+        })
+    }
+
+    fn apply_capture_stop_diagnostics(
+        &self,
+        stop_outcome: &CaptureStopOutcome,
+    ) -> Result<(), MeetingRuntimeError> {
+        if stop_outcome.error_kinds.is_empty()
+            && !stop_outcome.poison_recovered
+            && !stop_outcome.idempotent_no_handle
+        {
+            return Ok(());
+        }
+
+        let mut registry = self.lock_registry()?;
+        if registry.get_active_session().is_none() {
+            return Ok(());
+        }
+        if stop_outcome.idempotent_no_handle {
+            registry.add_diagnostic(
+                "capture_stop_idempotent_no_handle".to_string(),
+                super::types::MeetingDiagnosticSeverity::Info,
+                "Stop requested with no active capture handle; session finalization continued"
+                    .to_string(),
+            )?;
+        }
+        for error_kind in &stop_outcome.error_kinds {
+            registry.add_diagnostic(
+                "capture_stop_degraded".to_string(),
+                super::types::MeetingDiagnosticSeverity::Warning,
+                format!(
+                    "Capture stop was degraded but session finalization continued: {error_kind}"
+                ),
+            )?;
+        }
+        if stop_outcome.poison_recovered {
+            registry.add_diagnostic(
+                "capture_stop_poison_recovered".to_string(),
+                super::types::MeetingDiagnosticSeverity::Warning,
+                "Capture controller poison was quarantined during stop; session finalization continued"
+                    .to_string(),
+            )?;
+        }
+        let status_message =
+            if stop_outcome.error_kinds.is_empty() && !stop_outcome.poison_recovered {
+                "capture stopped: no active handle".to_string()
+            } else {
+                "capture stopped with recoverable diagnostics".to_string()
+            };
+        registry.update_capture_status(false, Some(status_message))?;
+        Ok(())
     }
 
     fn record_segment_stt_stop_diagnostics(
@@ -2522,6 +3214,16 @@ fn captured_segment_error_kind(error: &MeetingRuntimeError) -> String {
     }
 }
 
+fn finalization_error_code(error: &MeetingRuntimeError) -> String {
+    match error {
+        MeetingRuntimeError::StorageError { .. } => "storage_error".to_string(),
+        MeetingRuntimeError::SerializationError { .. } => "serialization_error".to_string(),
+        MeetingRuntimeError::NoActiveSession => "no_active_session".to_string(),
+        MeetingRuntimeError::MutexPoisoned { .. } => "mutex_poisoned".to_string(),
+        _ => capture_stop_error_kind(error).to_string(),
+    }
+}
+
 fn classify_stt_failure_reason(reason: &str) -> &'static str {
     let normalized = reason.to_ascii_lowercase();
     if normalized.contains("timed out") || normalized.contains("timeout") {
@@ -2790,6 +3492,25 @@ fn readiness(
         state,
         reason,
     }
+}
+
+fn apply_capture_metrics_to_finalization_status(
+    status: &mut MeetingFinalizationStatus,
+    system_health: &CaptureHealth,
+    microphone_health: &CaptureHealth,
+) {
+    let aggregate = aggregate_capture_health(system_health.clone(), microphone_health.clone());
+    let metrics = aggregate.metrics;
+    status.written_segments = metrics.segments_written;
+    status.transcribed_segments = metrics.segments_transcribed;
+    status.pending_segments = metrics
+        .segments_written
+        .saturating_sub(metrics.segments_transcribed);
+    status.queue_depth = metrics.current_queue_depth;
+    status.in_flight_segments = metrics.segments_in_flight;
+    status.failed_segments = metrics.segments_failed;
+    status.drain_timeout = metrics.drain_timeout;
+    status.metadata_only = true;
 }
 
 fn aggregate_capture_health(system: CaptureHealth, microphone: CaptureHealth) -> CaptureHealth {

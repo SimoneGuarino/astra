@@ -238,6 +238,22 @@ fn looks_reasoning_heavy(message: &str) -> bool {
         "performance",
         "scalabilita",
         "enterprise",
+        "spiegami",
+        "come funziona",
+        "com'e nata",
+        "com'è nata",
+        "come è nata",
+        "come e nata",
+        "perche",
+        "perché",
+        "origine",
+        "storia",
+        "processo",
+        "cosa c'era",
+        "come si forma",
+        "come nasce",
+        "approfondisci",
+        "nel dettaglio",
         "spiega nel dettaglio",
         "analisi",
         "design",
@@ -278,10 +294,10 @@ fn build_system_prompt(
             let detail = if reasoning {
                 "Quando il tema è tecnico o complesso, ragiona bene, dai una risposta solida e strutturata, con trade-off chiari."
             } else {
-                "Per richieste semplici, sii diretta, fluida e naturale."
+                "Per richieste semplici, sii diretta, fluida e naturale, ma comunque completa."
             };
             let mut prompt = format!(
-                "Sei Astra, un'assistente AI locale molto competente. Rispondi in italiano naturale, chiaro e professionale. Evita ripetizioni e tono robotico. Se utile, usa una struttura leggibile, ma senza gonfiare la risposta. {detail}"
+                "Sei Astra, un'assistente AI locale molto competente. Rispondi in italiano naturale, chiaro e professionale. Per chat scritta, dai risposte utili e complete di default. Sii breve solo se l'utente chiede esplicitamente una risposta breve o un riassunto. Se usi elenchi numerati, completa tutti i punti introdotti e non fermarti mai su un numero nudo. Evita ripetizioni e tono robotico. Se utile, usa una struttura leggibile. {detail}"
             );
             if let Some(context) = assistant_context.filter(|value| !value.trim().is_empty()) {
                 prompt.push_str(
@@ -328,15 +344,34 @@ fn build_options(source: RequestSource, message: &str) -> Value {
             "temperature": if reasoning { 0.45 } else { 0.62 },
             "top_p": 0.9,
             "repeat_penalty": 1.08,
-            "num_predict": if reasoning { 220 } else { 120 },
+            "num_predict": if reasoning {
+                num_predict_from_env("ASTRA_VOICE_REASONING_NUM_PREDICT", 260, 160, 800)
+            } else {
+                num_predict_from_env("ASTRA_VOICE_NUM_PREDICT", 140, 80, 600)
+            },
         }),
         RequestSource::Typed => json!({
             "temperature": if reasoning { 0.28 } else { 0.42 },
             "top_p": 0.9,
             "repeat_penalty": 1.07,
-            "num_predict": if reasoning { 900 } else { 360 },
+            "num_predict": if reasoning {
+                num_predict_from_env("ASTRA_TYPED_REASONING_NUM_PREDICT", 1400, 1200, 2400)
+            } else {
+                num_predict_from_env("ASTRA_TYPED_NUM_PREDICT", 800, 600, 1800)
+            },
         }),
     }
+}
+
+fn num_predict_from_env(key: &str, default: i64, min: i64, max: i64) -> i64 {
+    num_predict_from_override(env::var(key).ok().as_deref(), default, min, max)
+}
+
+fn num_predict_from_override(value: Option<&str>, default: i64, min: i64, max: i64) -> i64 {
+    value
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 #[cfg(test)]
@@ -384,5 +419,34 @@ mod tests {
             sanitize_ollama_endpoint_label("https://user:secret@example.com/ollama"),
             "configured endpoint"
         );
+    }
+
+    #[test]
+    fn reasoning_detection_catches_conceptual_questions() {
+        assert!(looks_reasoning_heavy("spiegami come è nata la Terra"));
+        assert!(looks_reasoning_heavy(
+            "prima dell'impatto iniziale cosa c'era?"
+        ));
+        assert!(looks_reasoning_heavy("come funziona la gravità?"));
+    }
+
+    #[test]
+    fn typed_num_predict_defaults_are_not_too_small() {
+        let ordinary = build_options(RequestSource::Typed, "chi sei?");
+        let reasoning = build_options(RequestSource::Typed, "spiegami come è nata la Terra");
+
+        assert!(ordinary["num_predict"].as_i64().unwrap() >= 600);
+        assert!(reasoning["num_predict"].as_i64().unwrap() >= 1200);
+    }
+
+    #[test]
+    fn num_predict_overrides_are_clamped() {
+        assert_eq!(num_predict_from_override(Some("50"), 800, 600, 1800), 600);
+        assert_eq!(
+            num_predict_from_override(Some("9999"), 800, 600, 1800),
+            1800
+        );
+        assert_eq!(num_predict_from_override(Some("900"), 800, 600, 1800), 900);
+        assert_eq!(num_predict_from_override(Some("bad"), 800, 600, 1800), 800);
     }
 }

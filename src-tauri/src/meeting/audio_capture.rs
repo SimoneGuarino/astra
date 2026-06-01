@@ -743,6 +743,18 @@ impl AudioCapture {
         Ok(())
     }
 
+    /// Request the active capture thread to stop without joining it.
+    ///
+    /// This is used by failure paths that may execute from the managed STT
+    /// worker. Joining/draining remains owned by the governed stop/finalization
+    /// path so a segment worker cannot accidentally wait on itself.
+    pub fn request_stop_nonblocking(&mut self) {
+        if let Some(running_capture) = self.running_capture.as_ref() {
+            running_capture.request_stop_nonblocking();
+        }
+        self.capture_running = false;
+    }
+
     pub fn pause_loopback_capture(&self) -> Result<(), MeetingRuntimeError> {
         let capture = self.running_capture.as_ref().ok_or_else(|| {
             MeetingRuntimeError::UnsupportedCapability {
@@ -914,6 +926,11 @@ impl RunningAudioCapture {
 
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
+    }
+
+    pub fn request_stop_nonblocking(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
     }
 
     pub fn stop(&mut self) -> Result<(), MeetingRuntimeError> {

@@ -16,6 +16,43 @@ export type MeetingStatus =
     | { failed: string }
     | { error: string };
 
+export type MeetingFinalizationStage =
+    | "idle"
+    | "stop_requested"
+    | "stopping_capture"
+    | "closing_segment_queues"
+    | "draining_stt"
+    | "stopping_registry"
+    | "exporting"
+    | "archiving"
+    | "completed"
+    | "completed_partial"
+    | "failed_recoverable"
+    | "failed";
+
+export type MeetingFinalizationStatus = {
+    session_id?: string | null;
+    stage: MeetingFinalizationStage;
+    started_at?: string | null;
+    updated_at?: string | null;
+    completed_at?: string | null;
+    foreground_returned_at?: string | null;
+    progress_label: string;
+    pending_segments: number;
+    queue_depth: number;
+    in_flight_segments: number;
+    transcribed_segments: number;
+    written_segments: number;
+    failed_segments: number;
+    drain_timeout: boolean;
+    archive_written: boolean;
+    export_written: boolean;
+    recoverable: boolean;
+    error_code?: string | null;
+    error_message_redacted?: string | null;
+    metadata_only: boolean;
+};
+
 export type MeetingSessionMode = "manual" | "real_capture";
 export type TranscriptSource = "microphone" | "system_audio" | "manual" | "imported_file" | "unknown";
 export type SpeakerAttributionMethod =
@@ -853,5 +890,6 @@ export type MeetingLiveCapabilitySnapshot = {
     capture_summary_reason?: string | null;
     active_sources: string[];
     failed_sources: string[];
+    finalization_status: MeetingFinalizationStatus;
     stt_adapter: MeetingSttAdapterStatus;
 };

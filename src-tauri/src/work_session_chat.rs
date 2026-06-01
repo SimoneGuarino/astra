@@ -41,7 +41,7 @@ impl WorkSessionChatIntent {
     pub fn primary_tool_name(self) -> Option<&'static str> {
         match self {
             Self::StartSession => Some("meeting.session.start"),
-            Self::StopSession | Self::StopAndGenerateRecap => Some("meeting.session.stop"),
+            Self::StopSession | Self::StopAndGenerateRecap => Some("meeting.session.stop.request"),
             Self::AttachScreenContext => Some("meeting.screen_context.attach_current"),
             Self::GenerateIntelligence | Self::GenerateTechnicalRecap => {
                 Some("meeting.intelligence.generate")

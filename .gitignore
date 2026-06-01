@@ -44,4 +44,7 @@ Thumbs.db
 .astra/audit/*
 .astra/screen/*
 .astra/state/*
-.astra
+.astra/meetings/*
+.astra/diagnostics/*
+.astra-dev-council-launchers
+.astra-dev-council

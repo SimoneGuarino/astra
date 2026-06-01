@@ -12,6 +12,7 @@ import type {
     MeetingConfig,
     MeetingDataClearPreview,
     MeetingDiagnostic,
+    MeetingFinalizationStatus,
     MeetingIntelligenceResult,
     MeetingLiveCapabilitySnapshot,
     MeetingRecallResponse,
@@ -656,6 +657,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const screenContexts = displayedState?.screen_contexts ?? [];
     const diagnostics = displayedState?.diagnostics ?? [];
     const metrics = liveCapabilities?.capture_health.metrics;
+    const finalizationStatus: MeetingFinalizationStatus | null = liveCapabilities?.finalization_status ?? null;
     const systemHealth = liveCapabilities?.system_capture_health;
     const microphoneHealth = liveCapabilities?.microphone_capture_health;
     const systemMetrics = systemHealth?.metrics;
@@ -673,7 +675,11 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         segmentsWritten > 0 && segmentsTranscribed === 0 && transcriptEntries.length === 0;
     const drainStatus = metrics?.segment_transcription_drain_status ?? "idle";
     const drainTimedOut = metrics?.drain_timeout === true;
-    const finalizingStt = isStoppingSession || drainStatus === "running";
+    const finalizingMeeting = Boolean(
+        finalizationStatus &&
+        !["idle", "completed", "completed_partial", "failed_recoverable", "failed"].includes(finalizationStatus.stage)
+    );
+    const finalizingStt = isStoppingSession || drainStatus === "running" || finalizationStatus?.stage === "draining_stt";
     const lastTranscriptAt = transcriptEntries.length
         ? displayedTranscriptEntries[0]?.timestamp
         : null;
@@ -1096,6 +1102,7 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
         let cancelled = false;
         const unlisteners: Array<() => void> = [];
         const eventNames = [
+            "meeting-finalization-updated",
             "meeting-session-updated",
             "meeting-transcript-updated",
             "meeting-artifacts-updated",
@@ -1127,12 +1134,12 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     }, [refreshMeeting]);
 
     useEffect(() => {
-        const intervalMs = hasActiveSession || uiSummary.isRecording || uiSummary.isTranscribing ? 1000 : 5000;
+        const intervalMs = hasActiveSession || uiSummary.isRecording || uiSummary.isTranscribing || finalizingMeeting ? 1000 : 5000;
         const timer = window.setInterval(() => {
             void refreshMeeting();
         }, intervalMs);
         return () => window.clearInterval(timer);
-    }, [hasActiveSession, refreshMeeting, uiSummary.isRecording, uiSummary.isTranscribing]);
+    }, [finalizingMeeting, hasActiveSession, refreshMeeting, uiSummary.isRecording, uiSummary.isTranscribing]);
 
     const runOperation = useCallback(
         async (label: string, operation: () => Promise<unknown>, refreshAfter = true) => {
@@ -1328,11 +1335,16 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
     const handleStopSession = useCallback(async () => {
         try {
             setIsStoppingSession(true);
-            await runOperation("stop session", meeting.stopSession);
+            await runOperation("request stop session", meeting.requestStopSession);
         } finally {
             setIsStoppingSession(false);
         }
     }, [meeting, runOperation]);
+
+    const handleRetryFinalization = useCallback(
+        () => runOperation("retry finalization", meeting.retryFinalization),
+        [meeting, runOperation]
+    );
 
     const handleRecoverFailedCapture = useCallback(
         () => runOperation("recover capture", meeting.recoverFailedCapture),
@@ -1745,6 +1757,28 @@ export function MeetingDebugPanel({ capabilities }: MeetingDebugPanelProps) {
                     <span>Failed: <strong>{segmentsFailed}</strong></span>
                     <span>Drain: <strong>{drainTimedOut ? "timed out" : drainStatus}</strong></span>
                     <span>Silence dropped: <strong>{metrics?.dropped_silence_segments ?? 0}</strong></span>
+                </div>
+                <div className="meeting-capture-summary">
+                    <span>Finalization: <strong>{finalizationStatus?.stage ?? "idle"}</strong></span>
+                    <span>Session: <strong>{finalizationStatus?.session_id ?? "none"}</strong></span>
+                    <span>Pending: <strong>{finalizationStatus?.pending_segments ?? 0}</strong></span>
+                    <span>Queue: <strong>{finalizationStatus?.queue_depth ?? 0}</strong></span>
+                    <span>In flight: <strong>{finalizationStatus?.in_flight_segments ?? 0}</strong></span>
+                    <span>Drain timeout: <strong>{finalizationStatus?.drain_timeout ? "yes" : "no"}</strong></span>
+                    <span>Export: <strong>{finalizationStatus?.export_written ? "written" : "pending"}</strong></span>
+                    <span>Archive: <strong>{finalizationStatus?.archive_written ? "written" : "pending"}</strong></span>
+                    <span>Recoverable: <strong>{finalizationStatus?.recoverable ? "yes" : "no"}</strong></span>
+                    {finalizationStatus?.recoverable ? (
+                        <Button
+                            variant="secondary"
+                            radius="full"
+                            size="xs"
+                            disabled={isBusy}
+                            onClick={() => void handleRetryFinalization()}
+                        >
+                            Retry finalization
+                        </Button>
+                    ) : null}
                 </div>
                 {capturedWithoutTranscript ? (
                     <div className="meeting-stt-warning">

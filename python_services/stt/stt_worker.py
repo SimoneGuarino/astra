@@ -3,6 +3,7 @@ import contextlib
 import os
 import sys
 import traceback
+import time
 from pathlib import Path
 from typing import Any
 
@@ -148,12 +149,19 @@ MODEL: Any | None = None
 def _get_model() -> Any:
     global MODEL
     if MODEL is None:
+        started = time.perf_counter()
         MODEL = _create_model()
+        _log_stt_event(
+            "stt_model_ready",
+            model=MODEL_SIZE,
+            load_ms=round((time.perf_counter() - started) * 1000),
+        )
     return MODEL
 
 
 def transcribe(audio_path: str) -> dict[str, Any]:
     model = _get_model()
+    started = time.perf_counter()
     with contextlib.redirect_stdout(sys.stderr):
         segments, info = model.transcribe(
             audio_path,
@@ -182,15 +190,39 @@ def transcribe(audio_path: str) -> dict[str, Any]:
 
     return {
         "ok": True,
+        "kind": "transcription_result",
         "audio_path": audio_path,
         "text": text,
         "language": getattr(info, "language", DEFAULT_LANGUAGE),
+        "timings": {
+            "transcribe_ms": round((time.perf_counter() - started) * 1000),
+            "model_ready": True,
+        },
     }
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any]:
+    request_id = request.get("request_id")
+    kind = str(request.get("kind") or "transcribe").strip().lower()
+
+    if kind in {"warm_up", "warmup", "ready"}:
+        started = time.perf_counter()
+        _get_model()
+        return {
+            "ok": True,
+            "request_id": request_id,
+            "kind": "warmup_result",
+            "text": "",
+            "timings": {
+                "warmup_ms": round((time.perf_counter() - started) * 1000),
+                "model_ready": True,
+            },
+        }
+
     audio_path = str(request["audio_path"])
-    return transcribe(audio_path)
+    response = transcribe(audio_path)
+    response["request_id"] = request_id
+    return response
 
 
 def safe_get(value: Any, key: str) -> Any:
@@ -200,9 +232,8 @@ def safe_get(value: Any, key: str) -> Any:
 
 
 def run_server() -> None:
-    _get_model()
     _log_stt_event(
-        "stt_worker_ready",
+        "stt_worker_listening",
         requested_device=_normalize_stt_device(DEFAULT_DEVICE),
         model=MODEL_SIZE,
         language=DEFAULT_LANGUAGE,
@@ -221,6 +252,8 @@ def run_server() -> None:
             traceback.print_exc(file=sys.stderr)
             response = {
                 "ok": False,
+                "request_id": safe_get(locals().get("request"), "request_id"),
+                "kind": safe_get(locals().get("request"), "kind") or "error",
                 "audio_path": safe_get(locals().get("request"), "audio_path"),
                 "error": f"{type(exc).__name__}: {exc}",
             }

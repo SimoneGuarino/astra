@@ -2651,6 +2651,9 @@ fn meeting_audit_data_category(tool_name: &str) -> &'static str {
         | "meeting.session.pause"
         | "meeting.session.resume"
         | "meeting.session.stop"
+        | "meeting.session.stop.request"
+        | "meeting.session.finalization.read"
+        | "meeting.session.finalization.retry"
         | "meeting.session.clear"
         | "meeting.screen_context.attach_current" => "meeting_session_metadata",
         "meeting.transcript.add" => "meeting_transcript",

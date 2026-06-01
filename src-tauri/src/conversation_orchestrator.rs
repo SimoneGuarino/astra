@@ -12,7 +12,9 @@ use std::{collections::HashSet, time::Instant};
 
 pub const MIN_ANSWER_FROM_CONTEXT_CONFIDENCE: f32 = 0.70;
 pub const MIN_CONTEXT_BOUNDARY_CONFIDENCE: f32 = 0.60;
-pub const MIN_NORMAL_CHAT_CONFIDENCE: f32 = 0.85;
+pub const NORMAL_CHAT_DIRECT_CONFIDENCE_THRESHOLD: f32 = 0.85;
+#[allow(dead_code)]
+pub const MIN_NORMAL_CHAT_CONFIDENCE: f32 = NORMAL_CHAT_DIRECT_CONFIDENCE_THRESHOLD;
 pub const MIN_CLARIFY_CONFIDENCE: f32 = 0.60;
 pub const MIN_REFUSE_CONFIDENCE: f32 = 0.80;
 pub const MIN_NEEDS_TOOL_CONFIDENCE: f32 = 0.70;
@@ -40,6 +42,8 @@ pub struct WorkingContextFrame {
     pub last_tool_result: Option<ToolResultFrame>,
     pub available_evidence_refs: Vec<EvidenceReference>,
     pub unresolved_followups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_governed_action: Option<PendingGovernedActionFrame>,
     pub salience: ContextSalience,
     pub confidence: f32,
     pub updated_at_ms: i64,
@@ -74,6 +78,19 @@ pub struct EvidenceReference {
     pub evidence_id: String,
     pub evidence_kind: String,
     pub source_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingGovernedActionFrame {
+    pub present: bool,
+    pub tool_name: String,
+    pub intent: String,
+    pub prerequisite: Option<String>,
+    pub status: String,
+    pub expires_at_present: bool,
+    pub expired: bool,
+    pub attempt_count: u8,
+    pub metadata_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,6 +133,14 @@ pub struct ContextAnswerPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NormalChatPlan {
+    pub intent_kind: Option<PlannerIntentKind>,
+    pub capability_family: Option<PlannerCapabilityFamily>,
+    pub requires_tool_arbitration: Option<bool>,
+    pub requires_memory_lookup: Option<bool>,
+    pub requires_governed_action: Option<bool>,
+    pub requires_context_boundary: Option<bool>,
+    pub safe_to_bypass_tools: Option<bool>,
+    pub context_ref: Option<String>,
     pub reason_code: String,
     pub confidence: f32,
 }
@@ -169,6 +194,80 @@ pub enum OrchestratorPolicyAction {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlannerIntentKind {
+    OrdinaryQuestion,
+    CasualChat,
+    GeneralKnowledge,
+    SessionMemoryQuery,
+    GovernedAction,
+    ContextFollowup,
+    ContextBoundary,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PlannerCapabilityFamily {
+    None,
+    WorkSession,
+    Meeting,
+    ScreenContext,
+    SessionMemory,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PlannerSafetyMetadata {
+    pub intent_kind: Option<PlannerIntentKind>,
+    pub capability_family: Option<PlannerCapabilityFamily>,
+    pub requires_tool_arbitration: Option<bool>,
+    pub requires_memory_lookup: Option<bool>,
+    pub requires_governed_action: Option<bool>,
+    pub requires_context_boundary: Option<bool>,
+    pub safe_to_bypass_tools: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalChatArbitrationAction {
+    AcceptDirectNormalChat,
+    VerifyWithToolRouter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormalChatArbitrationReason {
+    SafeToBypassTools,
+    LowConfidence,
+    MissingSafetyFields,
+    UnsafeToBypassTools,
+    UnknownIntentKind,
+    UnknownCapabilityFamily,
+    CapabilityRequiresTools,
+    RequiresToolArbitration,
+    RequiresMemoryLookup,
+    RequiresGovernedAction,
+    RequiresContextBoundary,
+    ToolAffinityRisk,
+    PendingGovernedToolFlow,
+    ExplicitUiAction,
+    SlashCommand,
+    ContextReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalChatArbitrationDecision {
+    pub action: NormalChatArbitrationAction,
+    pub reason: NormalChatArbitrationReason,
+}
+
+pub struct NormalChatArbitrationInput<'a> {
+    pub plan: &'a NormalChatPlan,
+    pub working_context: &'a WorkingContextFrame,
+    pub tool_affinity_risk: Option<bool>,
+    pub pending_governed_tool_flow: bool,
+    pub explicit_ui_action: bool,
+    pub slash_command: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ToolAffinitySignal {
@@ -218,6 +317,7 @@ pub enum NeedsToolPolicyReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrchestratorFallbackReason {
     NormalChatLowConfidence,
+    NormalChatUnsafeToBypassTools,
     AnswerFromContextLowConfidence,
     ClarifyLowConfidence,
     RefuseLowConfidence,
@@ -252,6 +352,17 @@ pub struct AssistantOrchestratorDiagnostic {
     pub used_context_boundary_fallback: bool,
     pub normal_chat_context_injected: bool,
     pub normal_chat_bypassed_tool_router: Option<bool>,
+    pub normal_chat_policy_action: Option<String>,
+    pub normal_chat_policy_reason: Option<String>,
+    pub normal_chat_direct_confidence_threshold: Option<f32>,
+    pub normal_chat_accepted_directly: Option<bool>,
+    pub planner_intent_kind: Option<String>,
+    pub planner_capability_family: Option<String>,
+    pub planner_requires_tool_arbitration: Option<bool>,
+    pub planner_requires_memory_lookup: Option<bool>,
+    pub planner_requires_governed_action: Option<bool>,
+    pub planner_requires_context_boundary: Option<bool>,
+    pub planner_safe_to_bypass_tools: Option<bool>,
     pub tool_router_invoked_reason: Option<String>,
     pub needs_tool_policy_action: Option<String>,
     pub needs_tool_policy_reason: Option<String>,
@@ -267,6 +378,11 @@ pub struct AssistantOrchestratorDiagnostic {
     pub context_turn_age: Option<u32>,
     pub context_stale: Option<bool>,
     pub context_decay_action: Option<String>,
+    pub context_continuation_policy_action: Option<String>,
+    pub context_continuation_policy_reason: Option<String>,
+    pub context_answer_first_attempted: Option<bool>,
+    pub context_answer_fallback_used: Option<bool>,
+    pub context_answer_empty_model_content: Option<bool>,
     pub expected_language: Option<String>,
     pub output_language: Option<String>,
     pub language_mismatch: Option<bool>,
@@ -291,6 +407,7 @@ pub struct PlannerParseOutcome {
     pub failure_reason: Option<String>,
     pub planner_confidence: Option<f32>,
     pub tool_affinity_risk: Option<bool>,
+    pub planner_safety: PlannerSafetyMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -384,6 +501,7 @@ impl OrchestratorFallbackReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NormalChatLowConfidence => "NormalChatLowConfidence",
+            Self::NormalChatUnsafeToBypassTools => "NormalChatUnsafeToBypassTools",
             Self::AnswerFromContextLowConfidence => "AnswerFromContextLowConfidence",
             Self::ClarifyLowConfidence => "ClarifyLowConfidence",
             Self::RefuseLowConfidence => "RefuseLowConfidence",
@@ -429,12 +547,126 @@ impl NeedsToolPolicyReason {
     }
 }
 
+impl PlannerIntentKind {
+    fn from_raw(value: Option<&str>) -> Option<Self> {
+        value.map(|value| match normalize_route(value).as_str() {
+            "ordinaryquestion" => Self::OrdinaryQuestion,
+            "casualchat" => Self::CasualChat,
+            "generalknowledge" => Self::GeneralKnowledge,
+            "sessionmemoryquery" => Self::SessionMemoryQuery,
+            "governedaction" => Self::GovernedAction,
+            "contextfollowup" => Self::ContextFollowup,
+            "contextboundary" => Self::ContextBoundary,
+            "unknown" => Self::Unknown,
+            _ => Self::Unknown,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OrdinaryQuestion => "ordinary_question",
+            Self::CasualChat => "casual_chat",
+            Self::GeneralKnowledge => "general_knowledge",
+            Self::SessionMemoryQuery => "session_memory_query",
+            Self::GovernedAction => "governed_action",
+            Self::ContextFollowup => "context_followup",
+            Self::ContextBoundary => "context_boundary",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn direct_normal_chat_allowed(self) -> bool {
+        matches!(
+            self,
+            Self::OrdinaryQuestion | Self::CasualChat | Self::GeneralKnowledge
+        )
+    }
+}
+
+impl PlannerCapabilityFamily {
+    fn from_raw(value: Option<&str>) -> Option<Self> {
+        value.map(|value| match normalize_route(value).as_str() {
+            "none" => Self::None,
+            "worksession" => Self::WorkSession,
+            "meeting" => Self::Meeting,
+            "screencontext" => Self::ScreenContext,
+            "sessionmemory" => Self::SessionMemory,
+            "unknown" => Self::Unknown,
+            _ => Self::Unknown,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::WorkSession => "work_session",
+            Self::Meeting => "meeting",
+            Self::ScreenContext => "screen_context",
+            Self::SessionMemory => "session_memory",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl PlannerSafetyMetadata {
+    fn from_raw(raw: &RawPlannerOutput) -> Self {
+        Self {
+            intent_kind: PlannerIntentKind::from_raw(raw.intent_kind.as_deref()),
+            capability_family: PlannerCapabilityFamily::from_raw(raw.capability_family.as_deref()),
+            requires_tool_arbitration: raw.requires_tool_arbitration,
+            requires_memory_lookup: raw.requires_memory_lookup,
+            requires_governed_action: raw.requires_governed_action,
+            requires_context_boundary: raw.requires_context_boundary,
+            safe_to_bypass_tools: raw.safe_to_bypass_tools,
+        }
+    }
+}
+
+impl NormalChatArbitrationAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptDirectNormalChat => "accept_direct_normal_chat",
+            Self::VerifyWithToolRouter => "verify_with_tool_router",
+        }
+    }
+}
+
+impl NormalChatArbitrationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SafeToBypassTools => "safe_to_bypass_tools",
+            Self::LowConfidence => "low_confidence",
+            Self::MissingSafetyFields => "missing_safety_fields",
+            Self::UnsafeToBypassTools => "unsafe_to_bypass_tools",
+            Self::UnknownIntentKind => "unknown_intent_kind",
+            Self::UnknownCapabilityFamily => "unknown_capability_family",
+            Self::CapabilityRequiresTools => "capability_requires_tools",
+            Self::RequiresToolArbitration => "requires_tool_arbitration",
+            Self::RequiresMemoryLookup => "requires_memory_lookup",
+            Self::RequiresGovernedAction => "requires_governed_action",
+            Self::RequiresContextBoundary => "requires_context_boundary",
+            Self::ToolAffinityRisk => "tool_affinity_risk",
+            Self::PendingGovernedToolFlow => "pending_governed_tool_flow",
+            Self::ExplicitUiAction => "explicit_ui_action",
+            Self::SlashCommand => "slash_command",
+            Self::ContextReference => "context_reference",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawPlannerOutput {
     route: Option<String>,
     context_ref: Option<String>,
     confidence: Option<f32>,
     tool_affinity_risk: Option<bool>,
+    safe_to_bypass_tools: Option<bool>,
+    intent_kind: Option<String>,
+    capability_family: Option<String>,
+    requires_governed_action: Option<bool>,
+    requires_memory_lookup: Option<bool>,
+    requires_context_boundary: Option<bool>,
+    requires_tool_arbitration: Option<bool>,
     reason_code: Option<String>,
     answer_plan: Option<RawAnswerPlan>,
 }
@@ -471,6 +703,7 @@ impl Default for WorkingContextFrame {
             last_tool_result: None,
             available_evidence_refs: Vec::new(),
             unresolved_followups: Vec::new(),
+            pending_governed_action: None,
             salience: ContextSalience::default(),
             confidence: 0.0,
             updated_at_ms: now_ms(),
@@ -507,6 +740,15 @@ impl ContextSalience {
         self.stale = self.turn_age >= CONTEXT_SALIENCE_STALE_TURNS;
     }
 
+    fn decay_from_context_boundary(&mut self) {
+        self.turn_age = self.turn_age.saturating_add(1);
+        self.normal_chat_turns_since_update = self.normal_chat_turns_since_update.saturating_add(1);
+        self.salience_score = (self.salience_score * 0.82).max(0.0);
+        self.stale = self.normal_chat_turns_since_update >= CONTEXT_SALIENCE_STALE_NORMAL_TURNS
+            || self.turn_age >= CONTEXT_SALIENCE_STALE_TURNS
+            || self.salience_score < MIN_CONTEXT_SALIENCE_SCORE;
+    }
+
     fn decay_from_normal_chat(&mut self) {
         self.turn_age = self.turn_age.saturating_add(1);
         self.normal_chat_turns_since_update = self.normal_chat_turns_since_update.saturating_add(1);
@@ -526,6 +768,7 @@ impl WorkingContextFrame {
         (self.last_tool_result.is_some() && self.salience.is_usable())
             || self.current_topic.is_some()
             || self.last_assistant_answer_summary.is_some()
+            || self.pending_governed_action.is_some()
     }
 
     pub fn last_tool_result_usable(&self) -> bool {
@@ -587,7 +830,20 @@ impl WorkingContextFrame {
         self.last_assistant_action = Some("answer_from_context".to_string());
         self.updated_at_ms = now_ms();
         if self.last_tool_result.is_some() {
-            self.salience.reinforce_from_context_answer();
+            match classify_context_attachment(user_message, self) {
+                ContextAttachmentKind::ExplicitEvidenceReference
+                | ContextAttachmentKind::TopicPresenceCheck
+                | ContextAttachmentKind::ContextDetailExpansion => {
+                    self.salience.reinforce_from_context_answer();
+                }
+                ContextAttachmentKind::BoundaryGeneralKnowledge
+                | ContextAttachmentKind::TopicOverlapOnly
+                | ContextAttachmentKind::ToolBoundRequest
+                | ContextAttachmentKind::Unrelated
+                | ContextAttachmentKind::Ambiguous => {
+                    self.salience.decay_from_context_boundary();
+                }
+            }
         }
     }
 }
@@ -606,7 +862,9 @@ impl ToolResultFrame {
         warnings: Vec<String>,
         confidence: Option<f32>,
     ) -> Self {
-        let summary = context_broker::bounded_text(&answer_summary.into(), 700);
+        let raw_summary = answer_summary.into();
+        let summary =
+            context_broker::bounded_text(&sanitize_tool_result_answer_summary(&raw_summary), 700);
         let key_topics = extract_compact_topics(&summary, 8);
         let active_entities = extract_compact_entities(&summary, 8);
         Self {
@@ -627,16 +885,619 @@ impl ToolResultFrame {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextEvidenceSupport {
+    Supported { matched_terms: Vec<String> },
+    NotSupported { checked_terms: Vec<String> },
+    Ambiguous { reason: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAttachmentKind {
+    ExplicitEvidenceReference,
+    TopicPresenceCheck,
+    ContextDetailExpansion,
+    BoundaryGeneralKnowledge,
+    TopicOverlapOnly,
+    ToolBoundRequest,
+    Unrelated,
+    Ambiguous,
+}
+
+impl ContextAttachmentKind {
+    fn as_reason_code(self) -> &'static str {
+        match self {
+            Self::ExplicitEvidenceReference => "explicit_evidence_reference",
+            Self::TopicPresenceCheck => "topic_presence_check",
+            Self::ContextDetailExpansion => "context_detail_expansion",
+            Self::BoundaryGeneralKnowledge => "boundary_general_knowledge",
+            Self::TopicOverlapOnly => "topic_overlap_only",
+            Self::ToolBoundRequest => "tool_bound_request",
+            Self::Unrelated => "unrelated",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+
+    fn should_answer_from_context(self) -> bool {
+        matches!(
+            self,
+            Self::ExplicitEvidenceReference
+                | Self::TopicPresenceCheck
+                | Self::ContextDetailExpansion
+        )
+    }
+}
+
+pub(crate) fn sanitize_tool_result_answer_summary(input: &str) -> String {
+    input
+        .lines()
+        .filter_map(sanitize_tool_result_summary_line)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn sanitize_tool_result_summary_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let operational_prefix = [
+        "fonte:",
+        "source:",
+        "nota:",
+        "note:",
+        "evidenze usate:",
+        "evidenze disponibili:",
+        "evidence used:",
+        "available evidence:",
+        "stt completeness:",
+        "contesto usato:",
+        "context used:",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix));
+    let internal_label = [
+        "context_answer_synthesizer_fallback",
+        "stt completeness:",
+        "toolresultframe",
+        "evidencereference",
+        "metadata_only",
+        "raw_model_output",
+        "audit",
+        "diagnostic",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if operational_prefix || internal_label {
+        return None;
+    }
+    let cleaned = trimmed
+        .split_whitespace()
+        .filter(|token| !is_segment_reference_token(token) && !is_uuidish_token(token))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ',' | ';' | ':'))
+        .to_string();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+fn is_segment_reference_token(token: &str) -> bool {
+    token
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != ':' && ch != '-')
+        .to_ascii_lowercase()
+        .starts_with("segment:")
+}
+
+fn is_uuidish_token(token: &str) -> bool {
+    let token = token.trim_matches(|ch: char| !ch.is_ascii_hexdigit() && ch != '-');
+    let hex_count = token.chars().filter(|ch| ch.is_ascii_hexdigit()).count();
+    let hyphen_count = token.chars().filter(|ch| *ch == '-').count();
+    hex_count >= 32 && hyphen_count >= 4
+}
+
+pub fn extract_context_query_terms(user_message: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    normalized_context_tokens(user_message)
+        .into_iter()
+        .filter(|token| is_strong_context_query_term(token))
+        .filter(|token| seen.insert(token.clone()))
+        .take(8)
+        .collect()
+}
+
+pub fn score_context_evidence_support(
+    user_message: &str,
+    tool_result: &ToolResultFrame,
+) -> ContextEvidenceSupport {
+    if looks_like_open_context_boundary_query(user_message) {
+        return ContextEvidenceSupport::Ambiguous {
+            reason: "open_boundary_question".to_string(),
+        };
+    }
+    let terms = extract_context_query_terms(user_message);
+    if terms.is_empty() {
+        return ContextEvidenceSupport::Ambiguous {
+            reason: "no_strong_query_terms".to_string(),
+        };
+    }
+    let context_text = normalized_tool_result_context_text(tool_result);
+    let evidence_tokens = normalized_context_tokens(&context_text)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let matched_terms = terms
+        .iter()
+        .filter(|term| context_term_matches_evidence(term, &evidence_tokens))
+        .cloned()
+        .collect::<Vec<_>>();
+    if matched_terms.is_empty() {
+        ContextEvidenceSupport::NotSupported {
+            checked_terms: terms,
+        }
+    } else {
+        ContextEvidenceSupport::Supported { matched_terms }
+    }
+}
+
+pub fn normalized_tool_result_context_text(tool_result: &ToolResultFrame) -> String {
+    let mut parts = vec![sanitize_tool_result_answer_summary(
+        &tool_result.answer_summary,
+    )];
+    parts.extend(
+        tool_result
+            .key_topics
+            .iter()
+            .take(8)
+            .map(|value| context_broker::bounded_text(value, 90)),
+    );
+    parts.extend(
+        tool_result
+            .active_entities
+            .iter()
+            .take(8)
+            .map(|value| context_broker::bounded_text(value, 90)),
+    );
+    context_broker::bounded_text(&parts.join(" "), 1_200)
+}
+
+fn normalized_context_tokens(input: &str) -> Vec<String> {
+    normalize_context_text(input)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn normalize_context_text(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let normalized = match ch {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => {
+                'a'
+            }
+            'è' | 'é' | 'ê' | 'ë' | 'È' | 'É' | 'Ê' | 'Ë' => 'e',
+            'ì' | 'í' | 'î' | 'ï' | 'Ì' | 'Í' | 'Î' | 'Ï' => 'i',
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => 'o',
+            'ù' | 'ú' | 'û' | 'ü' | 'Ù' | 'Ú' | 'Û' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
+            other if other.is_alphanumeric() => {
+                for lower in other.to_lowercase() {
+                    output.push(lower);
+                }
+                continue;
+            }
+            _ => ' ',
+        };
+        output.push(normalized);
+    }
+    output
+}
+
+fn is_strong_context_query_term(token: &str) -> bool {
+    if token.chars().count() < 3 {
+        return false;
+    }
+    !CONTEXT_QUERY_STOPWORDS.contains(&token)
+}
+
+fn looks_like_open_context_boundary_query(user_message: &str) -> bool {
+    let tokens = normalized_context_tokens(user_message);
+    let has_open_marker = tokens.iter().any(|token| {
+        CONTEXT_OPEN_QUESTION_MARKERS
+            .iter()
+            .any(|marker| token == marker)
+    });
+    let has_presence_marker = tokens.iter().any(|token| {
+        CONTEXT_PRESENCE_MARKERS
+            .iter()
+            .any(|marker| token == marker)
+    });
+    has_open_marker && !has_presence_marker
+}
+
+fn context_term_matches_evidence(term: &str, evidence_tokens: &HashSet<String>) -> bool {
+    evidence_tokens.contains(term)
+        || context_term_variants(term)
+            .iter()
+            .any(|variant| evidence_tokens.contains(variant))
+}
+
+fn context_term_variants(term: &str) -> Vec<String> {
+    let mut variants = Vec::new();
+    if let Some(stem) = term.strip_suffix('s') {
+        variants.push(stem.to_string());
+    }
+    if let Some(stem) = term.strip_suffix('i') {
+        variants.push(format!("{stem}o"));
+        variants.push(format!("{stem}e"));
+    }
+    if let Some(stem) = term.strip_suffix('e') {
+        variants.push(format!("{stem}a"));
+        variants.push(format!("{stem}o"));
+    }
+    variants.push(format!("{term}s"));
+    variants.push(format!("{term}i"));
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+
+fn context_request_requires_tool_arbitration(user_message: &str) -> bool {
+    let tokens = normalized_context_tokens(user_message);
+    if tokens.is_empty() {
+        return false;
+    }
+    let has_governed_lifecycle = tokens_contain_any(&tokens, CONTEXT_GOVERNED_ACTION_MARKERS);
+    let has_screen_context_target = tokens_contain_any(&tokens, CONTEXT_SCREEN_CONTEXT_TARGET_MARKERS);
+    let has_screen_context_action = tokens_contain_any(&tokens, CONTEXT_SCREEN_CONTEXT_ACTION_MARKERS);
+    let has_session_target = tokens_contain_any(&tokens, CONTEXT_TOOL_SESSION_TARGET_MARKERS);
+    let has_generation_action = tokens_contain_any(&tokens, CONTEXT_TOOL_GENERATION_ACTION_MARKERS);
+    let has_intelligence_artifact = tokens_contain_any(&tokens, CONTEXT_TOOL_ARTIFACT_MARKERS);
+
+    has_governed_lifecycle
+        || (has_screen_context_target && has_screen_context_action)
+        || (has_session_target && (has_generation_action || has_intelligence_artifact))
+}
+
+fn classify_context_attachment(
+    user_message: &str,
+    working_context: &WorkingContextFrame,
+) -> ContextAttachmentKind {
+    if !working_context.last_tool_result_usable() {
+        return ContextAttachmentKind::Unrelated;
+    }
+    let Some(tool_result) = working_context.last_tool_result.as_ref() else {
+        return ContextAttachmentKind::Unrelated;
+    };
+    let tokens = normalized_context_tokens(user_message);
+    if tokens.is_empty() {
+        return ContextAttachmentKind::Ambiguous;
+    }
+    if context_request_requires_tool_arbitration(user_message) {
+        return ContextAttachmentKind::ToolBoundRequest;
+    }
+
+    let has_presence_marker = tokens_contain_any(&tokens, CONTEXT_PRESENCE_MARKERS);
+    let has_explicit_evidence_reference =
+        tokens_contain_any(&tokens, CONTEXT_EXPLICIT_EVIDENCE_MARKERS);
+    let has_detail_marker = tokens_contain_any(&tokens, CONTEXT_DETAIL_MARKERS);
+    let has_continuation_marker = tokens_contain_any(&tokens, CONTEXT_CONTINUATION_MARKERS);
+    let has_open_boundary_marker = looks_like_open_context_boundary_query(user_message);
+    let query_terms = extract_context_query_terms(user_message);
+    let support = score_context_evidence_support(user_message, tool_result);
+    let support_is_supported = matches!(support, ContextEvidenceSupport::Supported { .. });
+    let support_is_not_supported = matches!(support, ContextEvidenceSupport::NotSupported { .. });
+
+    if has_presence_marker
+        || (has_continuation_marker
+            && !has_open_boundary_marker
+            && !has_detail_marker
+            && !query_terms.is_empty())
+    {
+        return ContextAttachmentKind::TopicPresenceCheck;
+    }
+
+    if has_explicit_evidence_reference && !has_open_boundary_marker {
+        return ContextAttachmentKind::ExplicitEvidenceReference;
+    }
+
+    if has_detail_marker && (support_is_supported || has_explicit_evidence_reference) {
+        return ContextAttachmentKind::ContextDetailExpansion;
+    }
+
+    if has_open_boundary_marker {
+        return ContextAttachmentKind::BoundaryGeneralKnowledge;
+    }
+
+    if support_is_supported {
+        return ContextAttachmentKind::TopicOverlapOnly;
+    }
+
+    if support_is_not_supported && has_explicit_evidence_reference {
+        return ContextAttachmentKind::TopicPresenceCheck;
+    }
+
+    if query_terms.is_empty() {
+        ContextAttachmentKind::Ambiguous
+    } else {
+        ContextAttachmentKind::Unrelated
+    }
+}
+
+fn tokens_contain_any(tokens: &[String], markers: &[&str]) -> bool {
+    tokens
+        .iter()
+        .any(|token| markers.iter().any(|marker| token == marker))
+}
+
+fn contextual_chat_plan(reason_code: &str, _user_message: Option<&str>) -> ContextualChatPlan {
+    ContextualChatPlan {
+        context_ref: "last_tool_result".to_string(),
+        reason_code: reason_code.to_string(),
+        confidence: 0.72,
+    }
+}
+
+fn context_attachment_reason(base_reason: &str, attachment: ContextAttachmentKind) -> String {
+    format!("{base_reason}_{}", attachment.as_reason_code())
+}
+
+const CONTEXT_EXPLICIT_EVIDENCE_MARKERS: &[&str] = &[
+    "archive",
+    "archiviata",
+    "archivio",
+    "evidence",
+    "evidenze",
+    "recap",
+    "transcript",
+    "trascrizione",
+];
+
+const CONTEXT_GOVERNED_ACTION_MARKERS: &[&str] = &[
+    "avvia",
+    "avviamo",
+    "avviare",
+    "inizia",
+    "iniziamo",
+    "start",
+    "stop",
+    "ferma",
+    "fermiamo",
+    "termina",
+    "terminiamo",
+    "registra",
+    "registrare",
+];
+
+
+const CONTEXT_SCREEN_CONTEXT_TARGET_MARKERS: &[&str] = &[
+    "screen",
+    "schermo",
+    "screenshot",
+    "capture",
+    "cattura",
+    "immagine",
+];
+
+const CONTEXT_SCREEN_CONTEXT_ACTION_MARKERS: &[&str] = &[
+    "allega",
+    "allegare",
+    "attach",
+    "aggiungi",
+    "aggiungere",
+    "collega",
+    "collegare",
+    "analizza",
+    "analizzare",
+];
+
+const CONTEXT_TOOL_SESSION_TARGET_MARKERS: &[&str] = &[
+    "attuale",
+    "active",
+    "corrente",
+    "current",
+    "intelligence",
+    "intelligent",
+    "meeting",
+    "registrata",
+    "registrazione",
+    "session",
+    "sessione",
+    "transcript",
+    "trascrizione",
+    "work",
+];
+
+const CONTEXT_TOOL_GENERATION_ACTION_MARKERS: &[&str] = &[
+    "crea",
+    "creami",
+    "elabora",
+    "elaborami",
+    "fammi",
+    "fai",
+    "genera",
+    "generami",
+    "generare",
+    "generi",
+    "produce",
+    "produci",
+    "produrre",
+    "sintetizza",
+    "sintetizzami",
+    "riepiloga",
+    "riepilogami",
+];
+
+const CONTEXT_TOOL_ARTIFACT_MARKERS: &[&str] = &[
+    "analysis",
+    "analisi",
+    "completo",
+    "completa",
+    "dettagli",
+    "dettagliato",
+    "intelligence",
+    "intelligent",
+    "recap",
+    "report",
+    "riassunto",
+    "riepilogo",
+    "sintesi",
+    "summary",
+];
+
+const CONTEXT_DETAIL_MARKERS: &[&str] = &[
+    "approfondisci",
+    "approfondire",
+    "detail",
+    "details",
+    "dettagli",
+    "dettaglio",
+    "meglio",
+    "parte",
+    "spiega",
+    "spiegami",
+    "spiegare",
+    "spieghi",
+];
+
+const CONTEXT_CONTINUATION_MARKERS: &[&str] = &[
+    "allora",
+    "quindi",
+    "so",
+    "then",
+    "therefore",
+    "invece",
+    "dunque",
+];
+
+const CONTEXT_QUERY_STOPWORDS: &[&str] = &[
+    "about",
+    "abbiamo",
+    "after",
+    "anche",
+    "argomento",
+    "argomenti",
+    "before",
+    "che",
+    "cosa",
+    "dalla",
+    "dalle",
+    "degli",
+    "dei",
+    "del",
+    "della",
+    "delle",
+    "did",
+    "discusso",
+    "discuss",
+    "discussed",
+    "era",
+    "erano",
+    "evidenze",
+    "from",
+    "have",
+    "last",
+    "meeting",
+    "nella",
+    "nelle",
+    "parlava",
+    "parlavamo",
+    "parlato",
+    "previous",
+    "prima",
+    "quindi",
+    "recap",
+    "recording",
+    "riferimento",
+    "session",
+    "sessione",
+    "sul",
+    "sulla",
+    "talk",
+    "talked",
+    "the",
+    "topic",
+    "transcript",
+    "was",
+    "were",
+    "what",
+];
+
+const CONTEXT_OPEN_QUESTION_MARKERS: &[&str] = &[
+    "before",
+    "com",
+    "come",
+    "cosa",
+    "formata",
+    "formato",
+    "formed",
+    "how",
+    "nata",
+    "nato",
+    "origin",
+    "origine",
+    "perche",
+    "prima",
+    "processo",
+    "what",
+    "why",
+];
+
+const CONTEXT_PRESENCE_MARKERS: &[&str] = &[
+    "about",
+    "discusso",
+    "discussed",
+    "parlava",
+    "parlavamo",
+    "parlato",
+    "riferimento",
+    "talked",
+    "topic",
+];
+
 fn planner_failure_fallback(
     working_context: &WorkingContextFrame,
     reason_code: &str,
+    user_message: Option<&str>,
 ) -> ConversationOrchestratorDecision {
     if working_context.last_tool_result_usable() {
-        return ConversationOrchestratorDecision::NormalChatWithContext(ContextualChatPlan {
-            context_ref: "last_tool_result".to_string(),
-            reason_code: reason_code.to_string(),
-            confidence: MIN_NORMAL_CHAT_CONFIDENCE,
-        });
+        let attachment = classify_context_attachment(user_message.unwrap_or_default(), working_context);
+        let attachment_reason = context_attachment_reason(reason_code, attachment);
+        if matches!(attachment, ContextAttachmentKind::ToolBoundRequest) {
+            let reason = if reason_code == "empty_model_content" {
+                "planner_empty_no_grounded_context"
+            } else {
+                "planner_failure_no_grounded_context"
+            };
+            return ConversationOrchestratorDecision::DeferToToolRouter(DeferToToolRouterPlan {
+                reason: reason.to_string(),
+                planner_failure_reason: Some(reason_code.to_string()),
+                confidence: None,
+            });
+        }
+        if attachment.should_answer_from_context() {
+            return ConversationOrchestratorDecision::AnswerFromContext(context_continuation_plan(
+                &attachment_reason,
+                user_message,
+            ));
+        }
+        if matches!(
+            attachment,
+            ContextAttachmentKind::BoundaryGeneralKnowledge
+                | ContextAttachmentKind::TopicOverlapOnly
+                | ContextAttachmentKind::Ambiguous
+        ) {
+            return ConversationOrchestratorDecision::NormalChatWithContext(contextual_chat_plan(
+                &attachment_reason,
+                user_message,
+            ));
+        }
     }
     let reason = if reason_code == "empty_model_content" {
         "planner_empty_no_grounded_context"
@@ -648,6 +1509,213 @@ fn planner_failure_fallback(
         planner_failure_reason: Some(reason_code.to_string()),
         confidence: None,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ContextContinuationPolicyAction {
+    UseContextAnswerFirst,
+    UseNormalChatWithContext,
+    DeferToToolRouter,
+    AskClarification,
+    DecayContextAndNormalChat,
+}
+
+impl ContextContinuationPolicyAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UseContextAnswerFirst => "use_context_answer_first",
+            Self::UseNormalChatWithContext => "use_normal_chat_with_context",
+            Self::DeferToToolRouter => "defer_to_tool_router",
+            Self::AskClarification => "ask_clarification",
+            Self::DecayContextAndNormalChat => "decay_context_and_normal_chat",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextContinuationPolicyReason {
+    PlannerEmptyWithSalientToolResult,
+    PlannerFailureWithSalientToolResult,
+    LowConfidenceContextualChat,
+    PlannerSelectedContextualChat,
+    PlannerFailureBoundaryGeneralKnowledge,
+    PlannerFailureTopicOverlapOnly,
+    PlannerFailureAmbiguousAttachment,
+    ToolBoundContinuationRequest,
+    PlannerSelectedToolBoundRequest,
+    NoSalientToolResult,
+    PendingGovernedActionPriority,
+}
+
+impl ContextContinuationPolicyReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PlannerEmptyWithSalientToolResult => "planner_empty_with_salient_tool_result",
+            Self::PlannerFailureWithSalientToolResult => "planner_failure_with_salient_tool_result",
+            Self::LowConfidenceContextualChat => "low_confidence_contextual_chat",
+            Self::PlannerSelectedContextualChat => "planner_selected_contextual_chat",
+            Self::PlannerFailureBoundaryGeneralKnowledge => {
+                "planner_failure_boundary_general_knowledge"
+            }
+            Self::PlannerFailureTopicOverlapOnly => "planner_failure_topic_overlap_only",
+            Self::PlannerFailureAmbiguousAttachment => "planner_failure_ambiguous_attachment",
+            Self::ToolBoundContinuationRequest => "tool_bound_continuation_request",
+            Self::PlannerSelectedToolBoundRequest => "planner_selected_tool_bound_request",
+            Self::NoSalientToolResult => "no_salient_tool_result",
+            Self::PendingGovernedActionPriority => "pending_governed_action_priority",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextContinuationPolicyDecision {
+    pub action: ContextContinuationPolicyAction,
+    pub reason: ContextContinuationPolicyReason,
+}
+
+fn context_continuation_plan(reason_code: &str, user_message: Option<&str>) -> ContextAnswerPlan {
+    ContextAnswerPlan {
+        strategy: "context_continuation".to_string(),
+        focus: user_message
+            .and_then(|message| non_empty(context_broker::bounded_text(message, 160))),
+        context_ref: "last_tool_result".to_string(),
+        reason_code: reason_code.to_string(),
+        confidence: MIN_ANSWER_FROM_CONTEXT_CONFIDENCE,
+    }
+}
+
+fn apply_context_continuation_policy(
+    decision: &ConversationOrchestratorDecision,
+    working_context: &WorkingContextFrame,
+    planner_failure_reason: Option<&str>,
+    planner_confidence: Option<f32>,
+    user_message: Option<&str>,
+) -> Option<ContextContinuationPolicyDecision> {
+    if working_context.pending_governed_action.is_some() {
+        return Some(ContextContinuationPolicyDecision {
+            action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+            reason: ContextContinuationPolicyReason::PendingGovernedActionPriority,
+        });
+    }
+
+    if !working_context.last_tool_result_usable() {
+        return match decision {
+            ConversationOrchestratorDecision::NormalChatWithContext(_) => {
+                Some(ContextContinuationPolicyDecision {
+                    action: ContextContinuationPolicyAction::DecayContextAndNormalChat,
+                    reason: ContextContinuationPolicyReason::NoSalientToolResult,
+                })
+            }
+            _ => None,
+        };
+    }
+
+    if let Some(reason) = planner_failure_reason {
+        let attachment = classify_context_attachment(user_message.unwrap_or_default(), working_context);
+        return Some(match attachment {
+            ContextAttachmentKind::ExplicitEvidenceReference
+            | ContextAttachmentKind::TopicPresenceCheck
+            | ContextAttachmentKind::ContextDetailExpansion => ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::UseContextAnswerFirst,
+                reason: if reason == "empty_model_content" {
+                    ContextContinuationPolicyReason::PlannerEmptyWithSalientToolResult
+                } else {
+                    ContextContinuationPolicyReason::PlannerFailureWithSalientToolResult
+                },
+            },
+            ContextAttachmentKind::BoundaryGeneralKnowledge => ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+                reason: ContextContinuationPolicyReason::PlannerFailureBoundaryGeneralKnowledge,
+            },
+            ContextAttachmentKind::ToolBoundRequest => ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::DeferToToolRouter,
+                reason: ContextContinuationPolicyReason::ToolBoundContinuationRequest,
+            },
+            ContextAttachmentKind::TopicOverlapOnly => ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+                reason: ContextContinuationPolicyReason::PlannerFailureTopicOverlapOnly,
+            },
+            ContextAttachmentKind::Ambiguous => ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+                reason: ContextContinuationPolicyReason::PlannerFailureAmbiguousAttachment,
+            },
+            ContextAttachmentKind::Unrelated => return None,
+        });
+    }
+
+    if let ConversationOrchestratorDecision::AnswerFromContext(plan) = decision {
+        if let Some(focus) = plan.focus.as_deref() {
+            let attachment = classify_context_attachment(user_message.unwrap_or(focus), working_context);
+            if matches!(attachment, ContextAttachmentKind::ToolBoundRequest) {
+                return Some(ContextContinuationPolicyDecision {
+                    action: ContextContinuationPolicyAction::DeferToToolRouter,
+                    reason: ContextContinuationPolicyReason::PlannerSelectedToolBoundRequest,
+                });
+            }
+            if matches!(
+                attachment,
+                ContextAttachmentKind::BoundaryGeneralKnowledge
+                    | ContextAttachmentKind::TopicOverlapOnly
+            ) {
+                return Some(ContextContinuationPolicyDecision {
+                    action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+                    reason: match attachment {
+                        ContextAttachmentKind::BoundaryGeneralKnowledge => {
+                            ContextContinuationPolicyReason::PlannerFailureBoundaryGeneralKnowledge
+                        }
+                        _ => ContextContinuationPolicyReason::PlannerFailureTopicOverlapOnly,
+                    },
+                });
+            }
+        }
+    }
+
+    if let ConversationOrchestratorDecision::NormalChatWithContext(plan) = decision {
+        if planner_confidence.unwrap_or(plan.confidence) <= 0.0 {
+            let attachment = classify_context_attachment(user_message.unwrap_or_default(), working_context);
+            if matches!(attachment, ContextAttachmentKind::ToolBoundRequest) {
+                return Some(ContextContinuationPolicyDecision {
+                    action: ContextContinuationPolicyAction::DeferToToolRouter,
+                    reason: ContextContinuationPolicyReason::ToolBoundContinuationRequest,
+                });
+            }
+            if attachment.should_answer_from_context() {
+                return Some(ContextContinuationPolicyDecision {
+                    action: ContextContinuationPolicyAction::UseContextAnswerFirst,
+                    reason: ContextContinuationPolicyReason::LowConfidenceContextualChat,
+                });
+            }
+            return Some(ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+                reason: match attachment {
+                    ContextAttachmentKind::BoundaryGeneralKnowledge => {
+                        ContextContinuationPolicyReason::PlannerFailureBoundaryGeneralKnowledge
+                    }
+                    ContextAttachmentKind::TopicOverlapOnly => {
+                        ContextContinuationPolicyReason::PlannerFailureTopicOverlapOnly
+                    }
+                    ContextAttachmentKind::ToolBoundRequest => {
+                        ContextContinuationPolicyReason::ToolBoundContinuationRequest
+                    }
+                    _ => ContextContinuationPolicyReason::PlannerFailureAmbiguousAttachment,
+                },
+            });
+        }
+        let attachment = classify_context_attachment(user_message.unwrap_or_default(), working_context);
+        if matches!(attachment, ContextAttachmentKind::ToolBoundRequest) {
+            return Some(ContextContinuationPolicyDecision {
+                action: ContextContinuationPolicyAction::DeferToToolRouter,
+                reason: ContextContinuationPolicyReason::PlannerSelectedToolBoundRequest,
+            });
+        }
+        return Some(ContextContinuationPolicyDecision {
+            action: ContextContinuationPolicyAction::UseNormalChatWithContext,
+            reason: ContextContinuationPolicyReason::PlannerSelectedContextualChat,
+        });
+    }
+
+    None
 }
 
 pub async fn plan_with_active_model(
@@ -679,6 +1747,17 @@ pub async fn plan_with_active_model(
         used_context_boundary_fallback: false,
         normal_chat_context_injected: false,
         normal_chat_bypassed_tool_router: None,
+        normal_chat_policy_action: None,
+        normal_chat_policy_reason: None,
+        normal_chat_direct_confidence_threshold: None,
+        normal_chat_accepted_directly: None,
+        planner_intent_kind: None,
+        planner_capability_family: None,
+        planner_requires_tool_arbitration: None,
+        planner_requires_memory_lookup: None,
+        planner_requires_governed_action: None,
+        planner_requires_context_boundary: None,
+        planner_safe_to_bypass_tools: None,
         tool_router_invoked_reason: None,
         needs_tool_policy_action: None,
         needs_tool_policy_reason: None,
@@ -694,6 +1773,11 @@ pub async fn plan_with_active_model(
         context_turn_age: salience_turn_age_for_diagnostic(working_context),
         context_stale: salience_stale_for_diagnostic(working_context),
         context_decay_action: None,
+        context_continuation_policy_action: None,
+        context_continuation_policy_reason: None,
+        context_answer_first_attempted: None,
+        context_answer_fallback_used: None,
+        context_answer_empty_model_content: None,
         expected_language: None,
         output_language: None,
         language_mismatch: None,
@@ -706,7 +1790,7 @@ pub async fn plan_with_active_model(
         metadata_only: true,
     };
 
-    let fallback = planner_failure_fallback(working_context, "planner_failure");
+    let fallback = planner_failure_fallback(working_context, "planner_failure", Some(user_message));
     let client = match Client::builder()
         .timeout(std::time::Duration::from_millis(8_000))
         .build()
@@ -838,18 +1922,51 @@ pub async fn plan_with_active_model(
         .map(|message| message.content)
         .unwrap_or_default();
     let parsed = parse_context_planner_output(&content, working_context);
-    let decision = parsed.decision.unwrap_or_else(|| {
+    let mut decision = parsed.decision.unwrap_or_else(|| {
         planner_failure_fallback(
             working_context,
             parsed
                 .failure_reason
                 .as_deref()
                 .unwrap_or("planner_failure"),
+            Some(user_message),
         )
     });
     diagnostic.planner_failure_reason = parsed.failure_reason;
     diagnostic.planner_confidence = parsed.planner_confidence;
     diagnostic.tool_affinity_risk = parsed.tool_affinity_risk;
+    apply_planner_safety_to_diagnostic(&mut diagnostic, &parsed.planner_safety);
+    if let Some(context_policy) = apply_context_continuation_policy(
+        &decision,
+        working_context,
+        diagnostic.planner_failure_reason.as_deref(),
+        diagnostic.planner_confidence,
+        Some(user_message),
+    ) {
+        diagnostic.context_continuation_policy_action =
+            Some(context_policy.action.as_str().to_string());
+        diagnostic.context_continuation_policy_reason =
+            Some(context_policy.reason.as_str().to_string());
+        if context_policy.action == ContextContinuationPolicyAction::UseContextAnswerFirst {
+            decision = ConversationOrchestratorDecision::AnswerFromContext(
+                context_continuation_plan(context_policy.reason.as_str(), Some(user_message)),
+            );
+            diagnostic.context_answer_first_attempted = Some(true);
+        } else if context_policy.action == ContextContinuationPolicyAction::DeferToToolRouter {
+            decision = ConversationOrchestratorDecision::DeferToToolRouter(DeferToToolRouterPlan {
+                reason: context_policy.reason.as_str().to_string(),
+                planner_failure_reason: diagnostic.planner_failure_reason.clone(),
+                confidence: diagnostic.planner_confidence,
+            });
+        } else if context_policy.action == ContextContinuationPolicyAction::UseNormalChatWithContext
+            && matches!(decision, ConversationOrchestratorDecision::AnswerFromContext(_))
+        {
+            decision = ConversationOrchestratorDecision::NormalChatWithContext(contextual_chat_plan(
+                context_policy.reason.as_str(),
+                Some(user_message),
+            ));
+        }
+    }
     diagnostic.selected_route = Some(decision_route_label(&decision).to_string());
     diagnostic.context_ref = decision_context_ref(&decision).map(str::to_string);
     diagnostic.used_full_router = matches!(
@@ -866,7 +1983,18 @@ pub async fn plan_with_active_model(
         ConversationOrchestratorDecision::NormalChatWithContext(_)
     );
     if diagnostic.used_context_boundary_fallback {
-        diagnostic.fallback_policy = Some("context_boundary_on_planner_failure".to_string());
+        diagnostic.fallback_policy = Some(
+            match &decision {
+                ConversationOrchestratorDecision::AnswerFromContext(_) => {
+                    "context_answer_on_planner_failure"
+                }
+                ConversationOrchestratorDecision::NormalChatWithContext(_) => {
+                    "normal_chat_with_context_on_planner_failure"
+                }
+                _ => "context_attachment_on_planner_failure",
+            }
+            .to_string(),
+        );
     }
     if diagnostic.used_full_router {
         diagnostic.tool_router_invoked_reason = match &decision {
@@ -938,6 +2066,17 @@ pub async fn synthesize_context_answer_with_active_model(
         used_context_boundary_fallback: plan.strategy == "context_boundary",
         normal_chat_context_injected: false,
         normal_chat_bypassed_tool_router: None,
+        normal_chat_policy_action: None,
+        normal_chat_policy_reason: None,
+        normal_chat_direct_confidence_threshold: None,
+        normal_chat_accepted_directly: None,
+        planner_intent_kind: None,
+        planner_capability_family: None,
+        planner_requires_tool_arbitration: None,
+        planner_requires_memory_lookup: None,
+        planner_requires_governed_action: None,
+        planner_requires_context_boundary: None,
+        planner_safe_to_bypass_tools: None,
         tool_router_invoked_reason: None,
         needs_tool_policy_action: None,
         needs_tool_policy_reason: None,
@@ -953,6 +2092,11 @@ pub async fn synthesize_context_answer_with_active_model(
         context_turn_age: salience_turn_age_for_diagnostic(working_context),
         context_stale: salience_stale_for_diagnostic(working_context),
         context_decay_action: Some("reinforce_on_context_answer".to_string()),
+        context_continuation_policy_action: None,
+        context_continuation_policy_reason: None,
+        context_answer_first_attempted: Some(true),
+        context_answer_fallback_used: Some(false),
+        context_answer_empty_model_content: Some(false),
         expected_language: Some(expected_language.code().to_string()),
         output_language: None,
         language_mismatch: None,
@@ -972,6 +2116,8 @@ pub async fn synthesize_context_answer_with_active_model(
         Err(_) => {
             diagnostic.planner_failure_reason = Some("endpoint_config".to_string());
             diagnostic.planner_duration_ms = Some(started.elapsed().as_millis() as u64);
+            diagnostic.context_answer_fallback_used = Some(true);
+            diagnostic.context_answer_empty_model_content = Some(false);
             return ContextAnswerAttempt {
                 output: Some(fallback_context_answer(
                     tool_result,
@@ -1004,6 +2150,8 @@ pub async fn synthesize_context_answer_with_active_model(
         Err(error) if error.is_timeout() => {
             diagnostic.planner_failure_reason = Some("timeout".to_string());
             diagnostic.planner_duration_ms = Some(started.elapsed().as_millis() as u64);
+            diagnostic.context_answer_fallback_used = Some(true);
+            diagnostic.context_answer_empty_model_content = Some(false);
             return ContextAnswerAttempt {
                 output: Some(fallback_context_answer(
                     tool_result,
@@ -1016,6 +2164,8 @@ pub async fn synthesize_context_answer_with_active_model(
         Err(_) => {
             diagnostic.planner_failure_reason = Some("ollama_unavailable".to_string());
             diagnostic.planner_duration_ms = Some(started.elapsed().as_millis() as u64);
+            diagnostic.context_answer_fallback_used = Some(true);
+            diagnostic.context_answer_empty_model_content = Some(false);
             return ContextAnswerAttempt {
                 output: Some(fallback_context_answer(
                     tool_result,
@@ -1029,6 +2179,8 @@ pub async fn synthesize_context_answer_with_active_model(
     if !response.status().is_success() {
         diagnostic.planner_failure_reason = Some("ollama_http_error".to_string());
         diagnostic.planner_duration_ms = Some(started.elapsed().as_millis() as u64);
+        diagnostic.context_answer_fallback_used = Some(true);
+        diagnostic.context_answer_empty_model_content = Some(false);
         return ContextAnswerAttempt {
             output: Some(fallback_context_answer(
                 tool_result,
@@ -1043,6 +2195,8 @@ pub async fn synthesize_context_answer_with_active_model(
         Err(_) => {
             diagnostic.planner_failure_reason = Some("invalid_response_schema".to_string());
             diagnostic.planner_duration_ms = Some(started.elapsed().as_millis() as u64);
+            diagnostic.context_answer_fallback_used = Some(true);
+            diagnostic.context_answer_empty_model_content = Some(false);
             return ContextAnswerAttempt {
                 output: Some(fallback_context_answer(
                     tool_result,
@@ -1058,7 +2212,16 @@ pub async fn synthesize_context_answer_with_active_model(
         .map(|message| message.content)
         .unwrap_or_default();
     let mut output = parse_context_answer_output(&content).or_else(|| {
-        diagnostic.planner_failure_reason = Some("invalid_context_answer_json".to_string());
+        diagnostic.planner_failure_reason = Some(
+            if content.trim().is_empty() {
+                "empty_model_content"
+            } else {
+                "invalid_context_answer_json"
+            }
+            .to_string(),
+        );
+        diagnostic.context_answer_fallback_used = Some(true);
+        diagnostic.context_answer_empty_model_content = Some(content.trim().is_empty());
         Some(fallback_context_answer(
             tool_result,
             plan,
@@ -1090,11 +2253,13 @@ pub async fn synthesize_context_answer_with_active_model(
                 } else {
                     *output = fallback_context_answer(tool_result, plan, expected_language);
                     diagnostic.language_retry_succeeded = Some(false);
+                    diagnostic.context_answer_fallback_used = Some(true);
                     diagnostic.output_language = Some(output.language.code().to_string());
                 }
             } else {
                 *output = fallback_context_answer(tool_result, plan, expected_language);
                 diagnostic.language_retry_succeeded = Some(false);
+                diagnostic.context_answer_fallback_used = Some(true);
                 diagnostic.output_language = Some(output.language.code().to_string());
             }
         } else {
@@ -1162,6 +2327,7 @@ pub fn parse_context_planner_output(
             }),
             planner_confidence: None,
             tool_affinity_risk: None,
+            planner_safety: PlannerSafetyMetadata::default(),
         };
     };
     let raw: RawPlannerOutput = match serde_json::from_str(candidate) {
@@ -1172,13 +2338,21 @@ pub fn parse_context_planner_output(
                 failure_reason: Some("invalid_schema".to_string()),
                 planner_confidence: None,
                 tool_affinity_risk: None,
+                planner_safety: PlannerSafetyMetadata::default(),
             }
         }
     };
+    let planner_safety = PlannerSafetyMetadata::from_raw(&raw);
     let route = normalize_route(raw.route.as_deref().unwrap_or("normal_chat"));
     let confidence = raw.confidence.unwrap_or(0.0).clamp(0.0, 1.0);
-    let reason_code = raw.reason_code.unwrap_or_else(|| "unspecified".to_string());
-    let context_ref = raw.context_ref.unwrap_or_else(|| "none".to_string());
+    let reason_code = raw
+        .reason_code
+        .clone()
+        .unwrap_or_else(|| "unspecified".to_string());
+    let context_ref = raw
+        .context_ref
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
     let decision = match route.as_str() {
         "answerfromcontext" => {
             let answer_plan = raw.answer_plan.unwrap_or(RawAnswerPlan {
@@ -1221,6 +2395,14 @@ pub fn parse_context_planner_output(
             })
         }
         "normalchat" => ConversationOrchestratorDecision::NormalChat(NormalChatPlan {
+            intent_kind: planner_safety.intent_kind,
+            capability_family: planner_safety.capability_family,
+            requires_tool_arbitration: planner_safety.requires_tool_arbitration,
+            requires_memory_lookup: planner_safety.requires_memory_lookup,
+            requires_governed_action: planner_safety.requires_governed_action,
+            requires_context_boundary: planner_safety.requires_context_boundary,
+            safe_to_bypass_tools: planner_safety.safe_to_bypass_tools,
+            context_ref: non_empty(context_ref.clone()),
             reason_code,
             confidence,
         }),
@@ -1244,6 +2426,7 @@ pub fn parse_context_planner_output(
                 failure_reason: Some("invalid_route".to_string()),
                 planner_confidence: Some(confidence),
                 tool_affinity_risk: raw.tool_affinity_risk,
+                planner_safety,
             }
         }
     };
@@ -1252,6 +2435,7 @@ pub fn parse_context_planner_output(
         failure_reason: None,
         planner_confidence: Some(confidence),
         tool_affinity_risk: raw.tool_affinity_risk,
+        planner_safety,
     }
 }
 
@@ -1315,7 +2499,9 @@ pub fn parse_context_answer_output(content: &str) -> Option<ContextAnswerOutput>
             .warnings
             .into_iter()
             .map(|warning| context_broker::bounded_text(&warning, 160))
-            .filter(|warning| !warning.trim().is_empty())
+            .filter(|warning| {
+                !warning.trim().is_empty() && !is_internal_context_answer_warning(warning)
+            })
             .take(6)
             .collect(),
         sanitized_internal_context_refs: false,
@@ -1339,7 +2525,12 @@ pub fn render_context_answer(
         ),
         answer.to_string(),
     ];
-    for warning in output.warnings.iter().take(3) {
+    for warning in output
+        .warnings
+        .iter()
+        .filter(|warning| !is_internal_context_answer_warning(warning))
+        .take(3)
+    {
         lines.push(format!("Nota: {warning}"));
     }
     lines.join("\n")
@@ -1359,6 +2550,11 @@ pub fn sanitize_context_answer_output(output: &mut ContextAnswerOutput) -> bool 
                 "contextframe",
                 "context used:",
                 "contesto usato:",
+                "context_answer_synthesizer_fallback",
+                "stt completeness:",
+                "evidenze usate:",
+                "evidenze disponibili:",
+                "segment:",
             ]
             .iter()
             .any(|marker| lower.contains(marker));
@@ -1376,6 +2572,19 @@ pub fn sanitize_context_answer_output(output: &mut ContextAnswerOutput) -> bool 
     output.sanitized_internal_context_refs
 }
 
+fn is_internal_context_answer_warning(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "context_answer_synthesizer_fallback",
+        "toolresultframe",
+        "evidencereference",
+        "metadata_only",
+        "raw_model_output",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 pub fn user_facing_context_label(tool_result: &ToolResultFrame) -> String {
     format!(
         "Fonte: {}.",
@@ -1385,7 +2594,7 @@ pub fn user_facing_context_label(tool_result: &ToolResultFrame) -> String {
 
 pub fn build_normal_chat_with_context_preamble(
     working_context: &WorkingContextFrame,
-    _plan: &ContextualChatPlan,
+    plan: &ContextualChatPlan,
 ) -> Option<String> {
     let tool_result = working_context.last_tool_result.as_ref()?;
     let topics = tool_result
@@ -1395,8 +2604,16 @@ pub fn build_normal_chat_with_context_preamble(
         .map(|topic| context_broker::bounded_text(topic, 80))
         .collect::<Vec<_>>()
         .join(", ");
+    let boundary_mode = plan.reason_code.contains("boundary_general_knowledge")
+        || plan.reason_code.contains("topic_overlap_only")
+        || plan.reason_code.contains("normal_chat_with_context");
+    let instruction = if boundary_mode {
+        "Questo recap e solo contesto secondario, non la fonte primaria della risposta. Rispondi normalmente alla domanda dell'utente usando conoscenza generale quando necessario; cita il recap solo per separare cosa risulta dalla registrazione da cosa e spiegazione generale. Non aprire la risposta con 'Fonte' e non attribuire al transcript dettagli che non contiene."
+    } else {
+        "Usa il recap come contesto conversazionale, ma se rispondi con conoscenza generale distinguila chiaramente dalle evidenze della registrazione e non attribuire al transcript dettagli non presenti."
+    };
     Some(format!(
-        "Contesto conversazionale compatto: l'utente sta proseguendo una conversazione basata su un recap Work Session da '{}'. Recap sintetico: {}. Temi: {}. Se rispondi con conoscenza generale, distinguila chiaramente dalle evidenze della registrazione e non attribuire al transcript dettagli non presenti.",
+        "Contesto conversazionale compatto da '{}'. Recap sintetico: {}. Temi: {}. {instruction}",
         context_broker::bounded_text(&tool_result.source_label, 120),
         context_broker::bounded_text(&tool_result.answer_summary, 360),
         if topics.trim().is_empty() { "non specificati".to_string() } else { topics },
@@ -1540,8 +2757,118 @@ pub fn decision_context_ref(decision: &ConversationOrchestratorDecision) -> Opti
             Some(&plan.context_ref)
         }
         ConversationOrchestratorDecision::NormalChatWithContext(plan) => Some(&plan.context_ref),
+        ConversationOrchestratorDecision::NormalChat(plan) => plan.context_ref.as_deref(),
         _ => None,
     }
+}
+
+pub fn apply_normal_chat_arbitration_policy(
+    input: &NormalChatArbitrationInput<'_>,
+) -> NormalChatArbitrationDecision {
+    let verify = |reason| NormalChatArbitrationDecision {
+        action: NormalChatArbitrationAction::VerifyWithToolRouter,
+        reason,
+    };
+
+    if input.plan.confidence < NORMAL_CHAT_DIRECT_CONFIDENCE_THRESHOLD {
+        return verify(NormalChatArbitrationReason::LowConfidence);
+    }
+    if input.slash_command {
+        return verify(NormalChatArbitrationReason::SlashCommand);
+    }
+    if input.explicit_ui_action {
+        return verify(NormalChatArbitrationReason::ExplicitUiAction);
+    }
+    if input.pending_governed_tool_flow {
+        return verify(NormalChatArbitrationReason::PendingGovernedToolFlow);
+    }
+    if input.tool_affinity_risk == Some(true) {
+        return verify(NormalChatArbitrationReason::ToolAffinityRisk);
+    }
+
+    let Some(intent_kind) = input.plan.intent_kind else {
+        return verify(NormalChatArbitrationReason::MissingSafetyFields);
+    };
+    if matches!(intent_kind, PlannerIntentKind::Unknown) {
+        return verify(NormalChatArbitrationReason::UnknownIntentKind);
+    }
+    if !intent_kind.direct_normal_chat_allowed() {
+        return verify(NormalChatArbitrationReason::UnsafeToBypassTools);
+    }
+
+    match input.plan.capability_family {
+        Some(PlannerCapabilityFamily::None) => {}
+        Some(PlannerCapabilityFamily::Unknown) => {
+            return verify(NormalChatArbitrationReason::UnknownCapabilityFamily);
+        }
+        Some(_) => return verify(NormalChatArbitrationReason::CapabilityRequiresTools),
+        None => return verify(NormalChatArbitrationReason::MissingSafetyFields),
+    }
+
+    if input.plan.requires_tool_arbitration.is_none()
+        || input.plan.requires_memory_lookup.is_none()
+        || input.plan.requires_governed_action.is_none()
+        || input.plan.requires_context_boundary.is_none()
+        || input.plan.safe_to_bypass_tools.is_none()
+    {
+        return verify(NormalChatArbitrationReason::MissingSafetyFields);
+    }
+    if input.plan.safe_to_bypass_tools != Some(true) {
+        return verify(NormalChatArbitrationReason::UnsafeToBypassTools);
+    }
+    if input.plan.requires_tool_arbitration == Some(true) {
+        return verify(NormalChatArbitrationReason::RequiresToolArbitration);
+    }
+    if input.plan.requires_memory_lookup == Some(true) {
+        return verify(NormalChatArbitrationReason::RequiresMemoryLookup);
+    }
+    if input.plan.requires_governed_action == Some(true) {
+        return verify(NormalChatArbitrationReason::RequiresGovernedAction);
+    }
+    if input.plan.requires_context_boundary == Some(true) {
+        return verify(NormalChatArbitrationReason::RequiresContextBoundary);
+    }
+    if input
+        .plan
+        .context_ref
+        .as_deref()
+        .is_some_and(|value| normalize_route(value) != "none")
+        && input.working_context.last_tool_result_usable()
+    {
+        return verify(NormalChatArbitrationReason::ContextReference);
+    }
+
+    NormalChatArbitrationDecision {
+        action: NormalChatArbitrationAction::AcceptDirectNormalChat,
+        reason: NormalChatArbitrationReason::SafeToBypassTools,
+    }
+}
+
+fn normal_chat_fallback_reason(
+    arbitration: NormalChatArbitrationDecision,
+) -> OrchestratorFallbackReason {
+    match arbitration.reason {
+        NormalChatArbitrationReason::LowConfidence => {
+            OrchestratorFallbackReason::NormalChatLowConfidence
+        }
+        _ => OrchestratorFallbackReason::NormalChatUnsafeToBypassTools,
+    }
+}
+
+
+fn planner_safety_requires_router(diagnostic: &AssistantOrchestratorDiagnostic) -> bool {
+    diagnostic.planner_requires_governed_action == Some(true)
+        || diagnostic.planner_requires_memory_lookup == Some(true)
+        || diagnostic.planner_requires_tool_arbitration == Some(true)
+        || diagnostic.planner_safe_to_bypass_tools == Some(false)
+        || matches!(
+            diagnostic.planner_intent_kind.as_deref(),
+            Some("governed_action") | Some("session_memory_query")
+        )
+        || matches!(
+            diagnostic.planner_capability_family.as_deref(),
+            Some("work_session") | Some("meeting") | Some("screen_context") | Some("session_memory")
+        )
 }
 
 pub fn apply_orchestrator_policy(
@@ -1606,19 +2933,31 @@ pub fn apply_orchestrator_policy(
             OrchestratorPolicyAction::AcceptDecision
         }
         ConversationOrchestratorDecision::NormalChat(plan) => {
-            if plan.confidence < MIN_NORMAL_CHAT_CONFIDENCE {
-                return OrchestratorPolicyAction::UseFullToolRouter {
-                    reason: OrchestratorFallbackReason::NormalChatLowConfidence,
-                };
+            let arbitration = apply_normal_chat_arbitration_policy(&NormalChatArbitrationInput {
+                plan,
+                working_context,
+                tool_affinity_risk: attempt.diagnostic.tool_affinity_risk,
+                pending_governed_tool_flow: working_context.pending_governed_action.is_some(),
+                explicit_ui_action: false,
+                slash_command: false,
+            });
+            match arbitration.action {
+                NormalChatArbitrationAction::AcceptDirectNormalChat => {
+                    OrchestratorPolicyAction::AcceptDecision
+                }
+                NormalChatArbitrationAction::VerifyWithToolRouter => {
+                    OrchestratorPolicyAction::UseFullToolRouter {
+                        reason: normal_chat_fallback_reason(arbitration),
+                    }
+                }
             }
-            if attempt.diagnostic.tool_affinity_risk == Some(true) {
+        }
+        ConversationOrchestratorDecision::Clarify(plan) => {
+            if planner_safety_requires_router(&attempt.diagnostic) {
                 return OrchestratorPolicyAction::UseFullToolRouter {
                     reason: OrchestratorFallbackReason::ToolAffinityUnresolved,
                 };
             }
-            OrchestratorPolicyAction::AcceptDecision
-        }
-        ConversationOrchestratorDecision::Clarify(plan) => {
             if plan.confidence < MIN_CLARIFY_CONFIDENCE {
                 return OrchestratorPolicyAction::UseFullToolRouter {
                     reason: OrchestratorFallbackReason::ClarifyLowConfidence,
@@ -1627,6 +2966,11 @@ pub fn apply_orchestrator_policy(
             OrchestratorPolicyAction::AcceptDecision
         }
         ConversationOrchestratorDecision::Refuse(plan) => {
+            if planner_safety_requires_router(&attempt.diagnostic) {
+                return OrchestratorPolicyAction::UseFullToolRouter {
+                    reason: OrchestratorFallbackReason::ToolAffinityUnresolved,
+                };
+            }
             if plan.confidence < MIN_REFUSE_CONFIDENCE {
                 return OrchestratorPolicyAction::UseFullToolRouter {
                     reason: OrchestratorFallbackReason::RefuseLowConfidence,
@@ -1663,7 +3007,7 @@ pub fn apply_orchestrator_policy(
                     planner_confidence: attempt.diagnostic.planner_confidence,
                     context_ref: attempt.diagnostic.context_ref.clone(),
                     last_tool_result_present: working_context.last_tool_result_usable(),
-                    pending_tool_action: false,
+                    pending_tool_action: working_context.pending_governed_action.is_some(),
                     explicit_user_action: false,
                     slash_command: false,
                     ui_action: false,
@@ -1672,9 +3016,11 @@ pub fn apply_orchestrator_policy(
                         .planner_failure_reason
                         .clone()
                         .or_else(|| Some("discourse_planner_needs_tool".to_string())),
-                    tool_affinity: needs_tool_affinity_from_confidence(
-                        attempt.diagnostic.planner_confidence,
-                    ),
+                    tool_affinity: if working_context.pending_governed_action.is_some() {
+                        ToolAffinitySignal::PendingToolContinuation
+                    } else {
+                        needs_tool_affinity_from_confidence(attempt.diagnostic.planner_confidence)
+                    },
                 }) {
                     NeedsToolPolicyDecision::Accept { .. } => {
                         OrchestratorPolicyAction::AcceptDecision
@@ -1753,6 +3099,78 @@ pub fn apply_needs_tool_policy(input: &NeedsToolPolicyInput) -> NeedsToolPolicyD
     }
 }
 
+fn apply_planner_safety_to_diagnostic(
+    diagnostic: &mut AssistantOrchestratorDiagnostic,
+    safety: &PlannerSafetyMetadata,
+) {
+    diagnostic.planner_intent_kind = safety.intent_kind.map(|value| value.as_str().to_string());
+    diagnostic.planner_capability_family = safety
+        .capability_family
+        .map(|value| value.as_str().to_string());
+    diagnostic.planner_requires_tool_arbitration = safety.requires_tool_arbitration;
+    diagnostic.planner_requires_memory_lookup = safety.requires_memory_lookup;
+    diagnostic.planner_requires_governed_action = safety.requires_governed_action;
+    diagnostic.planner_requires_context_boundary = safety.requires_context_boundary;
+    diagnostic.planner_safe_to_bypass_tools = safety.safe_to_bypass_tools;
+}
+
+fn normal_chat_diagnostic_reason(
+    diagnostic: &AssistantOrchestratorDiagnostic,
+    policy: &OrchestratorPolicyAction,
+) -> &'static str {
+    if matches!(policy, OrchestratorPolicyAction::AcceptDecision) {
+        return NormalChatArbitrationReason::SafeToBypassTools.as_str();
+    }
+    if policy
+        .fallback_reason()
+        .is_some_and(|reason| reason == &OrchestratorFallbackReason::NormalChatLowConfidence)
+    {
+        return NormalChatArbitrationReason::LowConfidence.as_str();
+    }
+    if diagnostic.planner_intent_kind.is_none()
+        || diagnostic.planner_capability_family.is_none()
+        || diagnostic.planner_requires_tool_arbitration.is_none()
+        || diagnostic.planner_requires_memory_lookup.is_none()
+        || diagnostic.planner_requires_governed_action.is_none()
+        || diagnostic.planner_requires_context_boundary.is_none()
+        || diagnostic.planner_safe_to_bypass_tools.is_none()
+    {
+        return NormalChatArbitrationReason::MissingSafetyFields.as_str();
+    }
+    if diagnostic.planner_intent_kind.as_deref() == Some("unknown") {
+        return NormalChatArbitrationReason::UnknownIntentKind.as_str();
+    }
+    if diagnostic.planner_capability_family.as_deref() == Some("unknown") {
+        return NormalChatArbitrationReason::UnknownCapabilityFamily.as_str();
+    }
+    if diagnostic.planner_capability_family.as_deref() != Some("none") {
+        return NormalChatArbitrationReason::CapabilityRequiresTools.as_str();
+    }
+    if diagnostic.planner_requires_tool_arbitration == Some(true) {
+        return NormalChatArbitrationReason::RequiresToolArbitration.as_str();
+    }
+    if diagnostic.planner_requires_memory_lookup == Some(true) {
+        return NormalChatArbitrationReason::RequiresMemoryLookup.as_str();
+    }
+    if diagnostic.planner_requires_governed_action == Some(true) {
+        return NormalChatArbitrationReason::RequiresGovernedAction.as_str();
+    }
+    if diagnostic.planner_requires_context_boundary == Some(true) {
+        return NormalChatArbitrationReason::RequiresContextBoundary.as_str();
+    }
+    if diagnostic.planner_safe_to_bypass_tools != Some(true) {
+        return NormalChatArbitrationReason::UnsafeToBypassTools.as_str();
+    }
+    if diagnostic
+        .context_ref
+        .as_deref()
+        .is_some_and(|value| normalize_route(value) != "none")
+    {
+        return NormalChatArbitrationReason::ContextReference.as_str();
+    }
+    NormalChatArbitrationReason::UnsafeToBypassTools.as_str()
+}
+
 pub fn apply_policy_to_diagnostic(
     diagnostic: &mut AssistantOrchestratorDiagnostic,
     policy: &OrchestratorPolicyAction,
@@ -1814,6 +3232,24 @@ pub fn apply_policy_to_diagnostic(
                 .to_string(),
         );
     }
+    if diagnostic.selected_route.as_deref() == Some("normal_chat") {
+        let accepted_directly = matches!(policy, OrchestratorPolicyAction::AcceptDecision);
+        diagnostic.normal_chat_policy_action = Some(
+            if accepted_directly {
+                NormalChatArbitrationAction::AcceptDirectNormalChat
+            } else {
+                NormalChatArbitrationAction::VerifyWithToolRouter
+            }
+            .as_str()
+            .to_string(),
+        );
+        diagnostic.normal_chat_policy_reason =
+            Some(normal_chat_diagnostic_reason(diagnostic, policy).to_string());
+        diagnostic.normal_chat_direct_confidence_threshold =
+            Some(NORMAL_CHAT_DIRECT_CONFIDENCE_THRESHOLD);
+        diagnostic.normal_chat_accepted_directly = Some(accepted_directly);
+        diagnostic.normal_chat_bypassed_tool_router = Some(accepted_directly);
+    }
     diagnostic.accepted_decision = matches!(policy, OrchestratorPolicyAction::AcceptDecision);
     diagnostic.planner_empty =
         diagnostic.planner_failure_reason.as_deref() == Some("empty_model_content");
@@ -1854,6 +3290,10 @@ pub fn apply_policy_to_diagnostic(
             && diagnostic.needs_tool_accepted == Some(true)
         {
             "accepted_needs_tool_high_confidence".to_string()
+        } else if diagnostic.selected_route.as_deref() == Some("normal_chat")
+            && diagnostic.normal_chat_policy_action.as_deref() == Some("verify_with_tool_router")
+        {
+            "normal_chat_arbitration".to_string()
         } else {
             diagnostic
                 .fallback_reason
@@ -1919,7 +3359,64 @@ fn fallback_context_answer(
         plan.strategy.as_str(),
         "context_boundary" | "normal_chat_with_context" | "general_context_boundary"
     );
-    let answer = if boundary_mode {
+    let context_continuation_mode = plan.strategy == "context_continuation";
+    let summary = fallback_context_summary(tool_result, language);
+    let mut status = if boundary_mode {
+        "boundary_answer".to_string()
+    } else if context_continuation_mode {
+        "insufficient_context".to_string()
+    } else {
+        "partial".to_string()
+    };
+    let mut support = if boundary_mode || context_continuation_mode {
+        "not_in_context".to_string()
+    } else {
+        "supported_by_context".to_string()
+    };
+    let answer = if context_continuation_mode {
+        let user_message = plan.focus.as_deref().unwrap_or_default();
+        match score_context_evidence_support(user_message, tool_result) {
+            ContextEvidenceSupport::Supported { matched_terms } => {
+                status = "answered".to_string();
+                support = "supported_by_context".to_string();
+                let topic = format_context_terms_for_answer(&matched_terms);
+                if matches!(language, AstraUserLanguage::English) {
+                    format!(
+                        "Yes. The evidence from the last session supports a reference to {topic}. In particular, the session covered: {summary}"
+                    )
+                } else {
+                    format!(
+                        "Si, nelle evidenze dell'ultima sessione risulta un riferimento a {topic}. In particolare, la sessione trattava: {summary}"
+                    )
+                }
+            }
+            ContextEvidenceSupport::NotSupported { checked_terms } => {
+                status = "answered".to_string();
+                support = "not_in_context".to_string();
+                let topic = format_context_terms_for_answer(&checked_terms);
+                if matches!(language, AstraUserLanguage::English) {
+                    format!(
+                        "No. The evidence from the last session does not show a reference to {topic}. The session was instead about: {summary}"
+                    )
+                } else {
+                    format!(
+                        "No, nelle evidenze dell'ultima sessione non risulta un riferimento a {topic}. La sessione parlava invece di: {summary}"
+                    )
+                }
+            }
+            ContextEvidenceSupport::Ambiguous { .. } => {
+                if matches!(language, AstraUserLanguage::English) {
+                    format!(
+                        "The available transcript evidence does not directly establish that part. From the session evidence, the discussion was about: {summary}. I can separate transcript evidence from general knowledge if you want to continue from there."
+                    )
+                } else {
+                    format!(
+                        "Nel transcript disponibile non emerge direttamente questa parte. Dalle evidenze risulta che la sessione parlava di: {summary}. Posso separare le evidenze dalla conoscenza generale se vuoi proseguire da li."
+                    )
+                }
+            }
+        }
+    } else if boundary_mode {
         let focus = plan
             .focus
             .as_deref()
@@ -1928,12 +3425,12 @@ fn fallback_context_answer(
         if matches!(language, AstraUserLanguage::English) {
             format!(
                 "The available transcript recap does not directly establish an answer to {focus}. From the prior context, the session was about: {}. I can answer from general knowledge, but that would be separate from the recording evidence.",
-                tool_result.answer_summary
+                summary
             )
         } else {
             format!(
                 "Nel recap disponibile non ho evidenze dirette per rispondere con certezza a {focus}. Dal contesto precedente, la sessione parlava di: {}. Posso darti una spiegazione generale, distinguendola dalle evidenze della registrazione.",
-                tool_result.answer_summary
+                summary
             )
         }
     } else if matches!(
@@ -1945,63 +3442,122 @@ fn fallback_context_answer(
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("questa affermazione");
-        let focus_supported = plan.focus.as_ref().is_some_and(|focus| {
-            let needle = focus.to_lowercase();
-            let haystack = format!(
-                "{} {} {}",
-                tool_result.answer_summary,
-                tool_result.key_topics.join(" "),
-                tool_result.active_entities.join(" ")
-            )
-            .to_lowercase();
-            !needle.trim().is_empty() && haystack.contains(needle.trim())
-        });
-        match (language, focus_supported) {
-            (AstraUserLanguage::English, true) => format!(
-                "Yes. Based on the previous recap from {}, the reference to {focus} is supported: {}",
-                tool_result.source_label, tool_result.answer_summary
-            ),
-            (AstraUserLanguage::English, false) => format!(
-                "No. Based on the previous recap from {}, it was not about {focus}. It was about: {}",
-                tool_result.source_label, tool_result.answer_summary
-            ),
-            (_, true) => format!(
-                "Si. In base al recap di {}, il riferimento a {focus} risulta supportato: {}",
-                tool_result.source_label, tool_result.answer_summary
-            ),
-            (_, false) => format!(
-                "No, in base al recap di {}, non si parlava di {focus}. Si parlava di: {}",
-                tool_result.source_label, tool_result.answer_summary
-            ),
+        match score_context_evidence_support(focus, tool_result) {
+            ContextEvidenceSupport::Supported { .. } => {
+                status = "answered".to_string();
+                support = "supported_by_context".to_string();
+                if matches!(language, AstraUserLanguage::English) {
+                    format!(
+                        "Yes. Based on the previous recap from {}, the reference to {focus} is supported: {summary}",
+                        tool_result.source_label
+                    )
+                } else {
+                    format!(
+                        "Si. In base al recap di {}, il riferimento a {focus} risulta supportato: {summary}",
+                        tool_result.source_label
+                    )
+                }
+            }
+            ContextEvidenceSupport::NotSupported { .. } => {
+                status = "answered".to_string();
+                support = "not_in_context".to_string();
+                if matches!(language, AstraUserLanguage::English) {
+                    format!(
+                        "No. Based on the previous recap from {}, it was not about {focus}. It was about: {summary}",
+                        tool_result.source_label
+                    )
+                } else {
+                    format!(
+                        "No, in base al recap di {}, non si parlava di {focus}. Si parlava di: {summary}",
+                        tool_result.source_label
+                    )
+                }
+            }
+            ContextEvidenceSupport::Ambiguous { .. } => {
+                status = "insufficient_context".to_string();
+                support = "not_in_context".to_string();
+                if matches!(language, AstraUserLanguage::English) {
+                    format!(
+                        "The previous recap is not specific enough to verify {focus} deterministically. The session was about: {summary}"
+                    )
+                } else {
+                    format!(
+                        "Il recap precedente non e abbastanza specifico per verificare {focus} in modo deterministico. La sessione parlava di: {summary}"
+                    )
+                }
+            }
         }
     } else if matches!(language, AstraUserLanguage::English) {
         format!(
             "Based on the previous recap from {}: {}",
-            tool_result.source_label, tool_result.answer_summary
+            tool_result.source_label, summary
         )
     } else {
         format!(
             "In base al recap di {}: {}",
-            tool_result.source_label, tool_result.answer_summary
+            tool_result.source_label, summary
         )
     };
     ContextAnswerOutput {
         answer,
         language,
-        status: if boundary_mode {
-            "boundary_answer".to_string()
-        } else {
-            "partial".to_string()
-        },
-        support: if boundary_mode {
-            "not_in_context".to_string()
-        } else {
-            "supported_by_context".to_string()
-        },
+        status,
+        support,
         used_context_refs: vec!["last_tool_result".to_string()],
         confidence: 0.62,
-        warnings: vec!["context_answer_synthesizer_fallback".to_string()],
+        warnings: Vec::new(),
         sanitized_internal_context_refs: false,
+    }
+}
+
+fn fallback_context_summary(tool_result: &ToolResultFrame, language: AstraUserLanguage) -> String {
+    let summary = sanitize_tool_result_answer_summary(&tool_result.answer_summary);
+    if !summary.trim().is_empty() {
+        return context_broker::bounded_text(&summary, 420);
+    }
+    let topics = tool_result
+        .key_topics
+        .iter()
+        .take(5)
+        .map(|topic| context_broker::bounded_text(topic, 80))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if !topics.trim().is_empty() {
+        return topics;
+    }
+    if matches!(language, AstraUserLanguage::English) {
+        "the bounded summary from the previous session".to_string()
+    } else {
+        "il riepilogo sintetico disponibile della sessione".to_string()
+    }
+}
+
+fn format_context_terms_for_answer(terms: &[String]) -> String {
+    let terms = terms
+        .iter()
+        .take(3)
+        .map(|term| capitalize_context_term(term))
+        .collect::<Vec<_>>();
+    match terms.as_slice() {
+        [] => "questo tema".to_string(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} e {second}"),
+        [first, middle @ .., last] => format!(
+            "{}, e {last}",
+            [first.as_str()]
+                .into_iter()
+                .chain(middle.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn capitalize_context_term(term: &str) -> String {
+    let mut chars = term.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -2035,6 +3591,17 @@ fn context_answer_diagnostic(
         used_context_boundary_fallback: false,
         normal_chat_context_injected: false,
         normal_chat_bypassed_tool_router: None,
+        normal_chat_policy_action: None,
+        normal_chat_policy_reason: None,
+        normal_chat_direct_confidence_threshold: None,
+        normal_chat_accepted_directly: None,
+        planner_intent_kind: None,
+        planner_capability_family: None,
+        planner_requires_tool_arbitration: None,
+        planner_requires_memory_lookup: None,
+        planner_requires_governed_action: None,
+        planner_requires_context_boundary: None,
+        planner_safe_to_bypass_tools: None,
         tool_router_invoked_reason: None,
         needs_tool_policy_action: None,
         needs_tool_policy_reason: None,
@@ -2050,6 +3617,11 @@ fn context_answer_diagnostic(
         context_turn_age: salience_turn_age_for_diagnostic(working_context),
         context_stale: salience_stale_for_diagnostic(working_context),
         context_decay_action: None,
+        context_continuation_policy_action: None,
+        context_continuation_policy_reason: None,
+        context_answer_first_attempted: Some(false),
+        context_answer_fallback_used: Some(false),
+        context_answer_empty_model_content: Some(false),
         expected_language: Some(expected_language.code().to_string()),
         output_language: None,
         language_mismatch: None,
@@ -2189,59 +3761,89 @@ mod tests {
         tool_affinity_risk: Option<bool>,
         failure_reason: Option<&str>,
     ) -> OrchestratorPlanAttempt {
-        OrchestratorPlanAttempt {
-            diagnostic: AssistantOrchestratorDiagnostic {
-                request_id: None,
-                stage: "context_planner".to_string(),
-                planner_stage: "discourse_planner".to_string(),
-                working_context_present: true,
-                last_tool_result_present: true,
-                selected_route: Some(decision_route_label(&decision).to_string()),
-                context_ref: decision_context_ref(&decision).map(str::to_string),
-                planner_model: Some("test-model".to_string()),
-                planner_duration_ms: Some(1),
-                planner_failure_reason: failure_reason.map(str::to_string),
-                planner_confidence: confidence,
-                policy_action: None,
-                fallback_policy: None,
-                fallback_reason: None,
-                planner_empty: failure_reason == Some("empty_model_content"),
-                used_context_boundary_fallback: false,
-                normal_chat_context_injected: matches!(
-                    decision,
-                    ConversationOrchestratorDecision::NormalChatWithContext(_)
-                ),
-                normal_chat_bypassed_tool_router: None,
-                tool_router_invoked_reason: None,
-                needs_tool_policy_action: None,
-                needs_tool_policy_reason: None,
-                needs_tool_confidence_threshold: None,
-                needs_tool_accepted: None,
-                tool_affinity_source: None,
-                accepted_decision: false,
-                prompt_char_count: 1200,
-                prompt_budget_exceeded: false,
-                used_full_router: matches!(
-                    decision,
-                    ConversationOrchestratorDecision::ToolCall(_)
-                        | ConversationOrchestratorDecision::DeferToToolRouter(_)
-                ),
-                tool_affinity_risk,
-                context_salience_score: Some(1.0),
-                context_turn_age: Some(0),
-                context_stale: Some(false),
-                context_decay_action: None,
-                expected_language: None,
-                output_language: None,
-                language_mismatch: None,
-                language_retry_attempted: None,
-                language_retry_succeeded: None,
-                budget_compaction_applied: Some(false),
-                user_facing_context_label: None,
-                sanitized_internal_context_refs: false,
-                tool_manifest_count: 0,
-                metadata_only: true,
+        let planner_safety = match &decision {
+            ConversationOrchestratorDecision::NormalChat(plan) => PlannerSafetyMetadata {
+                intent_kind: plan.intent_kind,
+                capability_family: plan.capability_family,
+                requires_tool_arbitration: plan.requires_tool_arbitration,
+                requires_memory_lookup: plan.requires_memory_lookup,
+                requires_governed_action: plan.requires_governed_action,
+                requires_context_boundary: plan.requires_context_boundary,
+                safe_to_bypass_tools: plan.safe_to_bypass_tools,
             },
+            _ => PlannerSafetyMetadata::default(),
+        };
+        let mut diagnostic = AssistantOrchestratorDiagnostic {
+            request_id: None,
+            stage: "context_planner".to_string(),
+            planner_stage: "discourse_planner".to_string(),
+            working_context_present: true,
+            last_tool_result_present: true,
+            selected_route: Some(decision_route_label(&decision).to_string()),
+            context_ref: decision_context_ref(&decision).map(str::to_string),
+            planner_model: Some("test-model".to_string()),
+            planner_duration_ms: Some(1),
+            planner_failure_reason: failure_reason.map(str::to_string),
+            planner_confidence: confidence,
+            policy_action: None,
+            fallback_policy: None,
+            fallback_reason: None,
+            planner_empty: failure_reason == Some("empty_model_content"),
+            used_context_boundary_fallback: false,
+            normal_chat_context_injected: matches!(
+                decision,
+                ConversationOrchestratorDecision::NormalChatWithContext(_)
+            ),
+            normal_chat_bypassed_tool_router: None,
+            normal_chat_policy_action: None,
+            normal_chat_policy_reason: None,
+            normal_chat_direct_confidence_threshold: None,
+            normal_chat_accepted_directly: None,
+            planner_intent_kind: None,
+            planner_capability_family: None,
+            planner_requires_tool_arbitration: None,
+            planner_requires_memory_lookup: None,
+            planner_requires_governed_action: None,
+            planner_requires_context_boundary: None,
+            planner_safe_to_bypass_tools: None,
+            tool_router_invoked_reason: None,
+            needs_tool_policy_action: None,
+            needs_tool_policy_reason: None,
+            needs_tool_confidence_threshold: None,
+            needs_tool_accepted: None,
+            tool_affinity_source: None,
+            accepted_decision: false,
+            prompt_char_count: 1200,
+            prompt_budget_exceeded: false,
+            used_full_router: matches!(
+                decision,
+                ConversationOrchestratorDecision::ToolCall(_)
+                    | ConversationOrchestratorDecision::DeferToToolRouter(_)
+            ),
+            tool_affinity_risk,
+            context_salience_score: Some(1.0),
+            context_turn_age: Some(0),
+            context_stale: Some(false),
+            context_decay_action: None,
+            context_continuation_policy_action: None,
+            context_continuation_policy_reason: None,
+            context_answer_first_attempted: None,
+            context_answer_fallback_used: None,
+            context_answer_empty_model_content: None,
+            expected_language: None,
+            output_language: None,
+            language_mismatch: None,
+            language_retry_attempted: None,
+            language_retry_succeeded: None,
+            budget_compaction_applied: Some(false),
+            user_facing_context_label: None,
+            sanitized_internal_context_refs: false,
+            tool_manifest_count: 0,
+            metadata_only: true,
+        };
+        apply_planner_safety_to_diagnostic(&mut diagnostic, &planner_safety);
+        OrchestratorPlanAttempt {
+            diagnostic,
             decision,
         }
     }
@@ -2252,6 +3854,36 @@ mod tests {
             focus: Some("Marte".to_string()),
             context_ref: "last_tool_result".to_string(),
             reason_code: "claim_check_against_last_answer".to_string(),
+            confidence,
+        }
+    }
+
+    fn safe_normal_chat_plan(confidence: f32) -> NormalChatPlan {
+        NormalChatPlan {
+            intent_kind: Some(PlannerIntentKind::OrdinaryQuestion),
+            capability_family: Some(PlannerCapabilityFamily::None),
+            requires_tool_arbitration: Some(false),
+            requires_memory_lookup: Some(false),
+            requires_governed_action: Some(false),
+            requires_context_boundary: Some(false),
+            safe_to_bypass_tools: Some(true),
+            context_ref: Some("none".to_string()),
+            reason_code: "ordinary_chat".to_string(),
+            confidence,
+        }
+    }
+
+    fn unsafe_normal_chat_plan(confidence: f32) -> NormalChatPlan {
+        NormalChatPlan {
+            intent_kind: None,
+            capability_family: None,
+            requires_tool_arbitration: None,
+            requires_memory_lookup: None,
+            requires_governed_action: None,
+            requires_context_boundary: None,
+            safe_to_bypass_tools: None,
+            context_ref: Some("none".to_string()),
+            reason_code: "unsafe_or_legacy_normal_chat".to_string(),
             confidence,
         }
     }
@@ -2366,10 +3998,9 @@ mod tests {
     fn policy_normal_chat_below_threshold_falls_back_to_full_router() {
         let frame = WorkingContextFrame::default();
         let attempt = attempt_for(
-            ConversationOrchestratorDecision::NormalChat(NormalChatPlan {
-                reason_code: "ordinary_chat".to_string(),
-                confidence: MIN_NORMAL_CHAT_CONFIDENCE - 0.01,
-            }),
+            ConversationOrchestratorDecision::NormalChat(safe_normal_chat_plan(
+                MIN_NORMAL_CHAT_CONFIDENCE - 0.01,
+            )),
             Some(MIN_NORMAL_CHAT_CONFIDENCE - 0.01),
             None,
             None,
@@ -2387,10 +4018,9 @@ mod tests {
     fn policy_normal_chat_above_threshold_is_accepted() {
         let frame = WorkingContextFrame::default();
         let attempt = attempt_for(
-            ConversationOrchestratorDecision::NormalChat(NormalChatPlan {
-                reason_code: "ordinary_chat".to_string(),
-                confidence: MIN_NORMAL_CHAT_CONFIDENCE,
-            }),
+            ConversationOrchestratorDecision::NormalChat(safe_normal_chat_plan(
+                MIN_NORMAL_CHAT_CONFIDENCE,
+            )),
             Some(MIN_NORMAL_CHAT_CONFIDENCE),
             Some(false),
             None,
@@ -2400,6 +4030,195 @@ mod tests {
             apply_orchestrator_policy(&attempt, &frame),
             OrchestratorPolicyAction::AcceptDecision
         );
+    }
+
+    #[test]
+    fn safe_normal_chat_diagnostic_marks_direct_acceptance() {
+        let frame = WorkingContextFrame::default();
+        let mut attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(safe_normal_chat_plan(0.94)),
+            Some(0.94),
+            Some(false),
+            None,
+        );
+        attempt.diagnostic.request_id = Some("request-safe-normal-chat".to_string());
+
+        let policy = apply_orchestrator_policy(&attempt, &frame);
+        apply_policy_to_diagnostic(&mut attempt.diagnostic, &policy);
+
+        assert_eq!(policy, OrchestratorPolicyAction::AcceptDecision);
+        assert_eq!(
+            attempt.diagnostic.normal_chat_policy_action.as_deref(),
+            Some("accept_direct_normal_chat")
+        );
+        assert_eq!(
+            attempt.diagnostic.normal_chat_policy_reason.as_deref(),
+            Some("safe_to_bypass_tools")
+        );
+        assert_eq!(attempt.diagnostic.normal_chat_accepted_directly, Some(true));
+        assert!(!attempt.diagnostic.used_full_router);
+        assert_eq!(
+            attempt.diagnostic.planner_intent_kind.as_deref(),
+            Some("ordinary_question")
+        );
+        assert_eq!(
+            attempt.diagnostic.planner_capability_family.as_deref(),
+            Some("none")
+        );
+        assert_eq!(attempt.diagnostic.planner_safe_to_bypass_tools, Some(true));
+        assert!(attempt.diagnostic.request_id.is_some());
+        assert!(attempt.diagnostic.metadata_only);
+    }
+
+    #[test]
+    fn normal_chat_missing_safety_fields_verifies_with_tool_router() {
+        let frame = WorkingContextFrame::default();
+        let mut attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(unsafe_normal_chat_plan(0.95)),
+            Some(0.95),
+            Some(false),
+            None,
+        );
+
+        let policy = apply_orchestrator_policy(&attempt, &frame);
+        apply_policy_to_diagnostic(&mut attempt.diagnostic, &policy);
+
+        assert!(matches!(
+            policy,
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
+        assert_eq!(
+            attempt.diagnostic.normal_chat_policy_action.as_deref(),
+            Some("verify_with_tool_router")
+        );
+        assert_eq!(
+            attempt.diagnostic.normal_chat_policy_reason.as_deref(),
+            Some("missing_safety_fields")
+        );
+        assert_eq!(
+            attempt.diagnostic.tool_router_invoked_reason.as_deref(),
+            Some("normal_chat_arbitration")
+        );
+        assert!(attempt.diagnostic.used_full_router);
+    }
+
+    #[test]
+    fn normal_chat_safe_to_bypass_none_verifies_with_tool_router() {
+        let frame = WorkingContextFrame::default();
+        let mut plan = safe_normal_chat_plan(0.95);
+        plan.safe_to_bypass_tools = None;
+        let attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(plan),
+            Some(0.95),
+            Some(false),
+            None,
+        );
+
+        assert!(matches!(
+            apply_orchestrator_policy(&attempt, &frame),
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
+    }
+
+    #[test]
+    fn normal_chat_unknown_capability_verifies_with_tool_router() {
+        let frame = WorkingContextFrame::default();
+        let mut plan = safe_normal_chat_plan(0.95);
+        plan.capability_family = Some(PlannerCapabilityFamily::Unknown);
+        let attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(plan),
+            Some(0.95),
+            Some(false),
+            None,
+        );
+
+        assert!(matches!(
+            apply_orchestrator_policy(&attempt, &frame),
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
+    }
+
+    #[test]
+    fn normal_chat_requires_governed_action_verifies_with_tool_router() {
+        let frame = WorkingContextFrame::default();
+        let mut plan = safe_normal_chat_plan(0.95);
+        plan.intent_kind = Some(PlannerIntentKind::GovernedAction);
+        plan.requires_governed_action = Some(true);
+        plan.safe_to_bypass_tools = Some(false);
+        let mut attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(plan),
+            Some(0.95),
+            Some(false),
+            None,
+        );
+
+        let policy = apply_orchestrator_policy(&attempt, &frame);
+        apply_policy_to_diagnostic(&mut attempt.diagnostic, &policy);
+
+        assert!(matches!(
+            policy,
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
+        assert_eq!(
+            attempt.diagnostic.normal_chat_policy_action.as_deref(),
+            Some("verify_with_tool_router")
+        );
+        assert_eq!(
+            attempt.diagnostic.planner_requires_governed_action,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn normal_chat_requires_memory_lookup_verifies_with_tool_router() {
+        let frame = WorkingContextFrame::default();
+        let mut plan = safe_normal_chat_plan(0.95);
+        plan.intent_kind = Some(PlannerIntentKind::SessionMemoryQuery);
+        plan.capability_family = Some(PlannerCapabilityFamily::SessionMemory);
+        plan.requires_memory_lookup = Some(true);
+        plan.safe_to_bypass_tools = Some(false);
+        let attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(plan),
+            Some(0.95),
+            Some(false),
+            None,
+        );
+
+        assert!(matches!(
+            apply_orchestrator_policy(&attempt, &frame),
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
+    }
+
+    #[test]
+    fn normal_chat_work_session_capability_verifies_with_tool_router() {
+        let frame = WorkingContextFrame::default();
+        let mut plan = safe_normal_chat_plan(0.95);
+        plan.capability_family = Some(PlannerCapabilityFamily::WorkSession);
+        plan.safe_to_bypass_tools = Some(false);
+        let attempt = attempt_for(
+            ConversationOrchestratorDecision::NormalChat(plan),
+            Some(0.95),
+            Some(false),
+            None,
+        );
+
+        assert!(matches!(
+            apply_orchestrator_policy(&attempt, &frame),
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
     }
 
     #[test]
@@ -2441,13 +4260,17 @@ mod tests {
     }
 
     #[test]
-    fn planner_empty_with_last_tool_result_uses_contextual_chat_fallback() {
+    fn planner_empty_with_last_tool_result_presence_check_uses_context_answer_first() {
         let frame = earth_frame();
-        let decision = planner_failure_fallback(&frame, "empty_model_content");
+        let decision = planner_failure_fallback(
+            &frame,
+            "empty_model_content",
+            Some("quindi si parlava della luna?"),
+        );
 
         assert!(matches!(
             decision,
-            ConversationOrchestratorDecision::NormalChatWithContext(_)
+            ConversationOrchestratorDecision::AnswerFromContext(_)
         ));
         assert!(!matches!(
             decision,
@@ -2456,9 +4279,120 @@ mod tests {
     }
 
     #[test]
+    fn planner_empty_with_last_tool_result_general_question_uses_normal_chat_with_context() {
+        let frame = earth_frame();
+        let decision = planner_failure_fallback(
+            &frame,
+            "empty_model_content",
+            Some("ma la terra come si e formata?"),
+        );
+
+        assert!(matches!(
+            decision,
+            ConversationOrchestratorDecision::NormalChatWithContext(_)
+        ));
+    }
+
+    #[test]
+    fn planner_empty_with_last_tool_result_boundary_question_uses_normal_chat_with_context() {
+        let frame = earth_frame();
+        let decision = planner_failure_fallback(
+            &frame,
+            "empty_model_content",
+            Some("prima degli impatti cosa c'era?"),
+        );
+
+        assert!(matches!(
+            decision,
+            ConversationOrchestratorDecision::NormalChatWithContext(_)
+        ));
+    }
+
+    #[test]
+    fn context_attachment_distinguishes_presence_from_general_topic_overlap() {
+        let frame = earth_frame();
+        assert_eq!(
+            classify_context_attachment("parlava della terra la registrazione?", &frame),
+            ContextAttachmentKind::TopicPresenceCheck
+        );
+        assert_eq!(
+            classify_context_attachment("ma la terra come si e formata?", &frame),
+            ContextAttachmentKind::BoundaryGeneralKnowledge
+        );
+    }
+
+    #[test]
+    fn planner_empty_with_governed_action_defers_to_tool_router() {
+        let frame = earth_frame();
+        let decision = planner_failure_fallback(
+            &frame,
+            "empty_model_content",
+            Some("iniziamo una nuova sessione di registrazione"),
+        );
+
+        assert!(matches!(
+            decision,
+            ConversationOrchestratorDecision::DeferToToolRouter(_)
+        ));
+    }
+
+    #[test]
+    fn context_policy_downgrades_answer_from_context_general_question() {
+        let frame = earth_frame();
+        let decision = ConversationOrchestratorDecision::AnswerFromContext(ContextAnswerPlan {
+            strategy: "context_continuation".to_string(),
+            focus: Some("ma la terra come si e formata?".to_string()),
+            context_ref: "last_tool_result".to_string(),
+            reason_code: "model_selected_context".to_string(),
+            confidence: 0.91,
+        });
+
+        let policy = apply_context_continuation_policy(
+            &decision,
+            &frame,
+            None,
+            Some(0.91),
+            Some("ma la terra come si e formata?"),
+        )
+        .expect("context policy");
+
+        assert_eq!(
+            policy.action,
+            ContextContinuationPolicyAction::UseNormalChatWithContext
+        );
+        assert_eq!(
+            policy.reason,
+            ContextContinuationPolicyReason::PlannerFailureBoundaryGeneralKnowledge
+        );
+    }
+
+    #[test]
+    fn context_continuation_policy_promotes_zero_confidence_contextual_chat() {
+        let frame = earth_frame();
+        let decision =
+            ConversationOrchestratorDecision::NormalChatWithContext(ContextualChatPlan {
+                context_ref: "last_tool_result".to_string(),
+                reason_code: "planner_empty_contextual_followup".to_string(),
+                confidence: 0.0,
+            });
+
+        let policy = apply_context_continuation_policy(&decision, &frame, None, Some(0.0), Some("quindi si parlava della terra?"))
+            .expect("context policy");
+
+        assert_eq!(
+            policy.action,
+            ContextContinuationPolicyAction::UseContextAnswerFirst
+        );
+        assert_eq!(
+            policy.reason,
+            ContextContinuationPolicyReason::LowConfidenceContextualChat
+        );
+    }
+
+    #[test]
     fn planner_empty_without_last_tool_result_defers_to_full_router() {
         let frame = WorkingContextFrame::default();
-        let decision = planner_failure_fallback(&frame, "empty_model_content");
+        let decision = planner_failure_fallback(&frame, "empty_model_content", None);
         let mut attempt = attempt_for(decision, None, None, Some("empty_model_content"));
         attempt.diagnostic.working_context_present = frame.has_working_context();
         attempt.diagnostic.last_tool_result_present = frame.last_tool_result.is_some();
@@ -2565,10 +4499,7 @@ mod tests {
     fn latest_session_low_confidence_normal_chat_cannot_skip_full_router() {
         let frame = WorkingContextFrame::default();
         let mut attempt = attempt_for(
-            ConversationOrchestratorDecision::NormalChat(NormalChatPlan {
-                reason_code: "low_confidence_data_access".to_string(),
-                confidence: 0.64,
-            }),
+            ConversationOrchestratorDecision::NormalChat(safe_normal_chat_plan(0.64)),
             Some(0.64),
             None,
             None,
@@ -2620,10 +4551,7 @@ mod tests {
     fn orchestrator_policy_diagnostic_fields_are_metadata_only() {
         let frame = WorkingContextFrame::default();
         let mut attempt = attempt_for(
-            ConversationOrchestratorDecision::NormalChat(NormalChatPlan {
-                reason_code: "ordinary_chat".to_string(),
-                confidence: 0.42,
-            }),
+            ConversationOrchestratorDecision::NormalChat(safe_normal_chat_plan(0.42)),
             Some(0.42),
             Some(true),
             None,
@@ -2646,6 +4574,10 @@ mod tests {
         assert!(serialized.get("context_turn_age").is_some());
         assert!(serialized.get("context_stale").is_some());
         assert!(serialized.get("needs_tool_policy_action").is_some());
+        assert!(serialized
+            .get("context_continuation_policy_action")
+            .is_some());
+        assert!(serialized.get("context_answer_fallback_used").is_some());
         assert!(serialized.get("user_message").is_none());
         assert!(serialized.get("raw_prompt").is_none());
         assert!(serialized.get("raw_model_output").is_none());
@@ -2807,13 +4739,23 @@ mod tests {
         assert_eq!(frame.salience.salience_score, 1.0);
         assert!(!frame.salience.stale);
 
-        frame.update_from_context_answer("quindi?", "Risposta dal contesto precedente.");
+        frame.update_from_context_answer(
+            "quindi si parlava della terra?",
+            "Risposta dal contesto precedente.",
+        );
         assert!(frame.salience.salience_score >= 0.85);
         assert_eq!(frame.salience.normal_chat_turns_since_update, 0);
 
-        frame.update_from_normal_chat("chi sei?", "Sono Astra.");
+        frame.update_from_context_answer(
+            "ma la terra come si e formata?",
+            "Risposta generale con contesto precedente.",
+        );
         assert!(frame.salience.salience_score < 1.0);
         assert_eq!(frame.salience.normal_chat_turns_since_update, 1);
+
+        frame.update_from_normal_chat("chi sei?", "Sono Astra.");
+        assert!(frame.salience.salience_score < 0.85);
+        assert_eq!(frame.salience.normal_chat_turns_since_update, 2);
     }
 
     #[test]
@@ -2870,6 +4812,76 @@ mod tests {
     }
 
     #[test]
+    fn planner_safety_fields_parse_into_typed_metadata() {
+        let frame = WorkingContextFrame::default();
+        let parsed = parse_context_planner_output(
+            r#"{
+              "route": "normal_chat",
+              "intent_kind": "ordinary_question",
+              "capability_family": "none",
+              "requires_tool_arbitration": false,
+              "requires_memory_lookup": false,
+              "requires_governed_action": false,
+              "requires_context_boundary": false,
+              "safe_to_bypass_tools": true,
+              "context_ref": "none",
+              "confidence": 0.94,
+              "reason_code": "ordinary_question",
+              "answer_plan": {"strategy": "none", "focus": null}
+            }"#,
+            &frame,
+        );
+
+        assert_eq!(
+            parsed.planner_safety.intent_kind,
+            Some(PlannerIntentKind::OrdinaryQuestion)
+        );
+        assert_eq!(
+            parsed.planner_safety.capability_family,
+            Some(PlannerCapabilityFamily::None)
+        );
+        assert_eq!(parsed.planner_safety.safe_to_bypass_tools, Some(true));
+        match parsed.decision.expect("normal chat decision") {
+            ConversationOrchestratorDecision::NormalChat(plan) => {
+                assert_eq!(plan.intent_kind, Some(PlannerIntentKind::OrdinaryQuestion));
+                assert_eq!(plan.capability_family, Some(PlannerCapabilityFamily::None));
+                assert_eq!(plan.safe_to_bypass_tools, Some(true));
+            }
+            other => panic!("expected normal chat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_normal_chat_schema_is_not_directly_safe() {
+        let frame = WorkingContextFrame::default();
+        let parsed = parse_context_planner_output(
+            r#"{
+              "route": "normal_chat",
+              "confidence": 0.95,
+              "reason_code": "legacy_schema"
+            }"#,
+            &frame,
+        );
+        let decision = parsed.decision.expect("normal chat decision");
+        let mut attempt = attempt_for(decision, parsed.planner_confidence, Some(false), None);
+        apply_planner_safety_to_diagnostic(&mut attempt.diagnostic, &parsed.planner_safety);
+
+        let policy = apply_orchestrator_policy(&attempt, &frame);
+        apply_policy_to_diagnostic(&mut attempt.diagnostic, &policy);
+
+        assert!(matches!(
+            policy,
+            OrchestratorPolicyAction::UseFullToolRouter {
+                reason: OrchestratorFallbackReason::NormalChatUnsafeToBypassTools
+            }
+        ));
+        assert_eq!(
+            attempt.diagnostic.normal_chat_policy_action.as_deref(),
+            Some("verify_with_tool_router")
+        );
+    }
+
+    #[test]
     fn ordinary_normal_chat_is_not_hijacked_by_context() {
         let frame = earth_frame();
         let parsed = parse_context_planner_output(
@@ -2897,6 +4909,45 @@ mod tests {
     }
 
     #[test]
+    fn production_routing_has_no_banned_phrase_checks() {
+        let files = [
+            (
+                "conversation_orchestrator.rs",
+                include_str!("conversation_orchestrator.rs"),
+            ),
+            ("context_broker.rs", include_str!("context_broker.rs")),
+            (
+                "assistant_tool_router.rs",
+                include_str!("assistant_tool_router.rs"),
+            ),
+            ("work_session_chat.rs", include_str!("work_session_chat.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+        ];
+        let banned_patterns = [
+            ".contains(\"registrazione\")",
+            ".contains(\"sessione\")",
+            ".contains(\"recap\")",
+            ".contains(\"trascrizione\")",
+            ".contains(\"iniziamo\")",
+            ".contains(\"luna\")",
+            ".contains(\"terra\")",
+            ".contains(\"sole\")",
+            ".contains(\"marte\")",
+            "contains_any(",
+        ];
+
+        for (file_name, contents) in files {
+            let production = contents.split("#[cfg(test)]").next().unwrap_or(contents);
+            for pattern in banned_patterns {
+                assert!(
+                    !production.contains(pattern),
+                    "{file_name} contains banned routing pattern {pattern}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn context_answer_mars_followup_returns_grounded_no() {
         let frame = earth_frame();
         let tool = frame.last_tool_result.as_ref().expect("tool result");
@@ -2915,6 +4966,126 @@ mod tests {
         assert!(rendered.contains("Terra primordiale"));
         assert!(rendered.contains("Marte"));
         assert!(!rendered.contains("last_tool_result"));
+    }
+
+    #[test]
+    fn extract_context_query_terms_keeps_meaningful_topic_only() {
+        assert_eq!(
+            extract_context_query_terms("quindi si parlava della luna?"),
+            vec!["luna"]
+        );
+        assert_eq!(
+            extract_context_query_terms("parlava della terra?"),
+            vec!["terra"]
+        );
+    }
+
+    #[test]
+    fn fallback_context_answer_topic_supported_returns_yes() {
+        let frame = earth_frame();
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let plan = context_continuation_plan(
+            "planner_empty_with_salient_tool_result",
+            Some("parlava della terra?"),
+        );
+
+        let output = fallback_context_answer(tool, &plan, AstraUserLanguage::Italian);
+
+        assert_eq!(output.status, "answered");
+        assert_eq!(output.support, "supported_by_context");
+        assert!(output.answer.starts_with("Si,"));
+        assert!(output.answer.contains("Terra"));
+        assert!(output.answer.contains("oceano di magma"));
+    }
+
+    #[test]
+    fn fallback_context_answer_topic_not_supported_luna_returns_no() {
+        let frame = earth_frame();
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let plan = context_continuation_plan(
+            "planner_empty_with_salient_tool_result",
+            Some("quindi si parlava della luna?"),
+        );
+
+        let output = fallback_context_answer(tool, &plan, AstraUserLanguage::Italian);
+
+        assert_eq!(output.status, "answered");
+        assert_eq!(output.support, "not_in_context");
+        assert!(output.answer.starts_with("No,"));
+        assert!(output.answer.contains("Luna"));
+        assert!(output.answer.contains("Terra primordiale"));
+    }
+
+    #[test]
+    fn fallback_context_answer_topic_not_supported_sole_returns_no() {
+        let frame = earth_frame();
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let plan = context_continuation_plan(
+            "planner_empty_with_salient_tool_result",
+            Some("quindi si parlava del sole?"),
+        );
+
+        let output = fallback_context_answer(tool, &plan, AstraUserLanguage::Italian);
+
+        assert!(output.answer.starts_with("No,"));
+        assert!(output.answer.contains("Sole"));
+        assert!(output.answer.contains("Terra primordiale"));
+    }
+
+    #[test]
+    fn fallback_context_answer_ambiguous_open_boundary_question_does_not_false_no() {
+        let frame = earth_frame();
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let plan = context_continuation_plan(
+            "planner_empty_with_salient_tool_result",
+            Some("prima degli impatti cosa c'era?"),
+        );
+
+        let output = fallback_context_answer(tool, &plan, AstraUserLanguage::Italian);
+
+        assert_eq!(output.status, "insufficient_context");
+        assert_eq!(output.support, "not_in_context");
+        assert!(!output.answer.starts_with("No,"));
+        assert!(output.answer.contains("Nel transcript disponibile"));
+        assert!(output.answer.contains("Terra primordiale"));
+    }
+
+    #[test]
+    fn fallback_context_answer_does_not_emit_internal_warning() {
+        let frame = earth_frame();
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let plan = context_continuation_plan(
+            "planner_empty_with_salient_tool_result",
+            Some("quindi si parlava della luna?"),
+        );
+
+        let output = fallback_context_answer(tool, &plan, AstraUserLanguage::Italian);
+        let rendered = render_context_answer(tool, &output);
+
+        assert!(output.warnings.is_empty());
+        assert!(!rendered.contains("context_answer_synthesizer_fallback"));
+    }
+
+    #[test]
+    fn tool_result_summary_sanitizer_removes_stt_completeness() {
+        let cleaned = sanitize_tool_result_answer_summary(
+            "Fonte: ultima sessione archiviata\nSTT completeness: incomplete_drain_timeout\nLa sessione parlava della Terra primordiale.",
+        );
+
+        assert!(!cleaned.contains("STT completeness"));
+        assert!(!cleaned.contains("Fonte:"));
+        assert!(cleaned.contains("Terra primordiale"));
+    }
+
+    #[test]
+    fn tool_result_summary_sanitizer_removes_evidence_ids() {
+        let cleaned = sanitize_tool_result_answer_summary(
+            "La sessione parlava della Terra. Evidenze: segment:dc9e21f2-0000-0000-0000-000000000000 9d403d4c-0000-0000-0000-000000000000",
+        );
+
+        assert!(!cleaned.contains("segment:"));
+        assert!(!cleaned.contains("9d403d4c-0000-0000-0000-000000000000"));
+        assert!(cleaned.contains("Terra"));
     }
 
     #[test]
@@ -3095,6 +5266,27 @@ mod tests {
     }
 
     #[test]
+    fn context_answer_empty_model_content_uses_deterministic_tool_result_fallback() {
+        let frame = earth_frame();
+        let tool = frame.last_tool_result.as_ref().expect("tool result");
+        let plan = context_continuation_plan(
+            "planner_empty_with_salient_tool_result",
+            Some("quindi si parlava della luna?"),
+        );
+
+        let output = parse_context_answer_output("")
+            .unwrap_or_else(|| fallback_context_answer(tool, &plan, AstraUserLanguage::Italian));
+        let rendered = render_context_answer(tool, &output);
+
+        assert_eq!(output.status, "answered");
+        assert!(rendered.contains("Fonte: ultima sessione archiviata"));
+        assert!(rendered.contains("non risulta un riferimento a Luna"));
+        assert!(rendered.contains("Terra primordiale"));
+        assert!(!rendered.contains("chat normale"));
+        assert!(!rendered.contains("context_answer_synthesizer_fallback"));
+    }
+
+    #[test]
     fn sanitizer_removes_internal_context_ref_lines() {
         let mut output = ContextAnswerOutput {
             answer: "No, si parlava della Terra.\nContesto usato: last_tool_result.".to_string(),
@@ -3174,4 +5366,73 @@ mod tests {
         assert!(serialized.get("raw_model_output").is_none());
         assert!(serialized.get("answer").is_none());
     }
+    #[test]
+    fn tool_bound_intelligent_transcript_recap_does_not_use_last_context() {
+        let frame = earth_frame();
+        assert_eq!(
+            classify_context_attachment(
+                "sull'attuale ultima sessione registrata mi generi un intelligent transcript recap",
+                &frame,
+            ),
+            ContextAttachmentKind::ToolBoundRequest
+        );
+        let decision = planner_failure_fallback(
+            &frame,
+            "empty_model_content",
+            Some("sull'attuale ultima sessione registrata mi generi un intelligent transcript recap"),
+        );
+        assert!(matches!(
+            decision,
+            ConversationOrchestratorDecision::DeferToToolRouter(_)
+        ));
+    }
+
+    #[test]
+    fn context_policy_defers_tool_bound_contextual_chat_to_router() {
+        let frame = earth_frame();
+        let decision = ConversationOrchestratorDecision::NormalChatWithContext(ContextualChatPlan {
+            context_ref: "last_tool_result".to_string(),
+            reason_code: "model_selected_contextual_chat".to_string(),
+            confidence: 0.91,
+        });
+        let policy = apply_context_continuation_policy(
+            &decision,
+            &frame,
+            None,
+            Some(0.91),
+            Some("mi generi un intelligent transcript recap dell'attuale sessione?"),
+        )
+        .expect("context policy");
+        assert_eq!(policy.action, ContextContinuationPolicyAction::DeferToToolRouter);
+        assert_eq!(
+            policy.reason,
+            ContextContinuationPolicyReason::PlannerSelectedToolBoundRequest
+        );
+    }
+
+    #[test]
+    fn planner_refuse_with_governed_action_safety_verifies_with_tool_router() {
+        let frame = earth_frame();
+        let mut attempt = attempt_for(
+            ConversationOrchestratorDecision::Refuse(RefusalPlan {
+                reason_code: "governed_action".to_string(),
+                message: "refuse".to_string(),
+                confidence: 1.0,
+            }),
+            Some(1.0),
+            None,
+            None,
+        );
+        attempt.diagnostic.planner_intent_kind = Some("governed_action".to_string());
+        attempt.diagnostic.planner_capability_family = Some("work_session".to_string());
+        attempt.diagnostic.planner_requires_governed_action = Some(true);
+        attempt.diagnostic.planner_safe_to_bypass_tools = Some(false);
+
+        assert!(matches!(
+            apply_orchestrator_policy(&attempt, &frame),
+            OrchestratorPolicyAction::UseFullToolRouter { .. }
+        ));
+    }
+
+
 }

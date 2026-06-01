@@ -12,7 +12,7 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const DEFAULT_SEGMENT_DURATION_MS: u64 = 15_000;
+pub const DEFAULT_SEGMENT_DURATION_MS: u64 = 8_000;
 pub const DEFAULT_MAX_SEGMENT_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
