@@ -8,10 +8,12 @@ type AssistantHeaderProps = {
     activeModel: string;
     isPinned: boolean;
     isDesktopPanelOpen: boolean;
+    isMemoryGraphOpen: boolean;
     onClose: () => void;
     onMinimize: () => void;
     onTogglePin: () => void;
     onToggleDesktopPanel: () => void;
+    onToggleMemoryGraph: () => void;
     startDrag: (e: React.MouseEvent) => void;
     statusLabel: string;
 };
@@ -20,9 +22,11 @@ export function AssistantHeader({
     activeModel,
     isPinned,
     isDesktopPanelOpen,
+    isMemoryGraphOpen,
     onClose,
     onMinimize,
     onToggleDesktopPanel,
+    onToggleMemoryGraph,
     onTogglePin,
     startDrag,
     statusLabel,
@@ -36,8 +40,11 @@ export function AssistantHeader({
                 </div>
 
                 <div className="flex">
-                    <Button variant={isDesktopPanelOpen ? "primary" : "text"} radius="full" size="xs" title={`Desktop agent panel: ${isDesktopPanelOpen ? "Open" : "Closed"}`} onClick={onToggleDesktopPanel}>
+                    <Button variant={isMemoryGraphOpen ? "primary" : "text"} radius="full" size="xs" title={`Cognitive Memory Graph: ${isMemoryGraphOpen ? "Open" : "Closed"}`} onClick={onToggleMemoryGraph}>
                         <LuBrain />
+                    </Button>
+                    <Button variant={isDesktopPanelOpen ? "primary" : "text"} radius="full" size="xs" title={`Desktop agent panel: ${isDesktopPanelOpen ? "Open" : "Closed"}`} onClick={onToggleDesktopPanel}>
+                        <span style={{ fontSize: 10, fontWeight: 900, letterSpacing: "0.02em" }}>DA</span>
                     </Button>
                     <Button variant="text" radius="full" size="xs" title={isPinned ? "Rimuovi fissaggio" : "Fissa la finestra sempre on top"} onClick={onTogglePin}>
                         {isPinned ? <LuMonitorOff /> : <LuMonitor />}

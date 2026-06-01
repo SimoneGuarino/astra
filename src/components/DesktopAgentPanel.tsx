@@ -405,6 +405,7 @@ export function DesktopAgentPanel({ isOpen, onClose, initialView = "overview" }:
                 <MeetingDebugPanel capabilities={capabilities} />
             ) : null}
 
+
             {view === "approvals" ? (
                 <div className="desktop-agent-section">
                     {approvals.length === 0 ? (

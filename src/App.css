@@ -1634,3 +1634,2714 @@ input {
         justify-content: flex-start;
     }
 }
+
+.memory-graph-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 0;
+}
+
+.memory-graph-toolbar,
+.memory-graph-search,
+.memory-graph-stats article,
+.memory-graph-card,
+.memory-graph-canvas-card {
+    border: 1px solid rgba(83, 104, 170, 0.14);
+    background: rgba(255, 255, 255, 0.74);
+    box-shadow: 0 10px 30px rgba(26, 43, 96, 0.07);
+    border-radius: 18px;
+}
+
+.memory-graph-toolbar {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+    padding: 14px;
+}
+
+.memory-graph-toolbar h3,
+.memory-graph-card h4 {
+    margin: 0;
+    color: rgba(24, 34, 72, 0.92);
+}
+
+.memory-graph-subtitle {
+    margin: 4px 0 0;
+    color: rgba(53, 67, 110, 0.72);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.memory-graph-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.memory-graph-button {
+    border: 1px solid rgba(67, 89, 161, 0.2);
+    background: rgba(246, 248, 255, 0.94);
+    color: rgba(40, 58, 126, 0.96);
+    border-radius: 999px;
+    padding: 7px 12px;
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+}
+
+.memory-graph-button:disabled {
+    opacity: 0.58;
+    cursor: wait;
+}
+
+.memory-graph-stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.memory-graph-stats article {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.memory-graph-stats span {
+    color: rgba(71, 82, 125, 0.66);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.memory-graph-stats strong {
+    color: rgba(25, 38, 88, 0.94);
+    font-size: 18px;
+}
+
+.memory-graph-search {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 10px;
+}
+
+.memory-graph-search input {
+    min-width: 0;
+    border: 1px solid rgba(83, 104, 170, 0.14);
+    background: rgba(255, 255, 255, 0.9);
+    border-radius: 999px;
+    padding: 8px 12px;
+    color: rgba(25, 34, 68, 0.92);
+    outline: none;
+}
+
+.memory-graph-content {
+    display: grid;
+    grid-template-columns: minmax(0, 2.25fr) minmax(300px, 0.72fr);
+    gap: 12px;
+    min-height: 0;
+}
+
+.memory-graph-canvas-card {
+    min-height: 620px;
+    padding: 8px;
+    overflow: hidden;
+}
+
+.memory-graph-canvas {
+    width: 100%;
+    min-height: 610px;
+    display: block;
+    border-radius: 16px;
+    background:
+        radial-gradient(circle at 48% 48%, rgba(97, 123, 255, 0.12), transparent 38%),
+        linear-gradient(135deg, rgba(247, 249, 255, 0.9), rgba(255, 255, 255, 0.72));
+}
+
+.memory-graph-edge {
+    stroke: rgba(70, 89, 150, 0.2);
+    transition: stroke 180ms ease, stroke-width 180ms ease, opacity 180ms ease;
+}
+
+.memory-graph-edge--active {
+    stroke: rgba(77, 118, 255, 0.82);
+    stroke-dasharray: 8 5;
+    animation: memoryElectricFlow 1.05s linear infinite;
+}
+
+.memory-graph-node-group {
+    cursor: grab;
+    touch-action: none;
+}
+
+.memory-graph-node-group:active {
+    cursor: grabbing;
+}
+
+.memory-graph-node {
+    fill: rgba(102, 128, 219, 0.72);
+    stroke: rgba(255, 255, 255, 0.92);
+    stroke-width: 2;
+    transition: fill 180ms ease, stroke 180ms ease;
+}
+
+.memory-graph-node--summary { fill: rgba(85, 129, 255, 0.82); }
+.memory-graph-node--work_session { fill: rgba(74, 161, 124, 0.82); }
+.memory-graph-node--transcript_segment { fill: rgba(123, 101, 215, 0.72); }
+.memory-graph-node--tool_use { fill: rgba(230, 157, 77, 0.82); }
+.memory-graph-node--error { fill: rgba(221, 94, 105, 0.82); }
+.memory-graph-node--fix { fill: rgba(59, 174, 159, 0.82); }
+.memory-graph-node--user_preference { fill: rgba(212, 111, 214, 0.78); }
+.memory-graph-node--procedure { fill: rgba(78, 151, 219, 0.78); }
+
+.memory-graph-node--active {
+    fill: rgba(69, 112, 255, 0.98);
+    stroke: rgba(188, 217, 255, 0.96);
+}
+
+.memory-graph-node--selected {
+    stroke: rgba(32, 47, 112, 0.96);
+    stroke-width: 3;
+}
+
+.memory-graph-node-halo {
+    fill: rgba(86, 138, 255, 0.16);
+    stroke: rgba(105, 161, 255, 0.36);
+    stroke-width: 1.4;
+    pointer-events: none;
+}
+
+.memory-graph-node-label {
+    fill: rgba(31, 42, 82, 0.78);
+    font-size: 9px;
+    font-weight: 800;
+    pointer-events: none;
+}
+
+.memory-graph-inspector {
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-right: 4px;
+}
+
+.memory-graph-card {
+    padding: 12px;
+    color: rgba(34, 45, 85, 0.88);
+}
+
+.memory-graph-card p {
+    margin: 7px 0 0;
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.memory-graph-card--activation {
+    border-color: rgba(79, 126, 255, 0.26);
+    background: linear-gradient(135deg, rgba(244, 248, 255, 0.96), rgba(255, 255, 255, 0.78));
+}
+
+.memory-graph-node-header {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    justify-content: space-between;
+}
+
+.memory-graph-node-header span {
+    flex: 0 0 auto;
+    border: 1px solid rgba(73, 96, 161, 0.16);
+    border-radius: 999px;
+    padding: 3px 7px;
+    color: rgba(47, 64, 124, 0.82);
+    font-size: 10px;
+    font-weight: 800;
+    background: rgba(246, 248, 255, 0.88);
+}
+
+.memory-graph-meta-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 5px;
+    margin-top: 10px;
+}
+
+.memory-graph-meta-grid span {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid rgba(76, 93, 150, 0.08);
+    padding-bottom: 5px;
+    font-size: 12px;
+}
+
+.memory-graph-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 10px;
+}
+
+.memory-graph-tags span {
+    border-radius: 999px;
+    background: rgba(239, 243, 255, 0.9);
+    color: rgba(48, 66, 133, 0.82);
+    padding: 3px 7px;
+    font-size: 10px;
+    font-weight: 800;
+}
+
+.memory-graph-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    margin-top: 10px;
+}
+
+.memory-graph-list button,
+.memory-graph-timeline-item {
+    text-align: left;
+    border: 1px solid rgba(82, 101, 166, 0.12);
+    background: rgba(250, 252, 255, 0.88);
+    color: rgba(34, 45, 85, 0.9);
+    border-radius: 12px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.memory-graph-list button {
+    cursor: pointer;
+}
+
+.memory-graph-list strong {
+    font-size: 12px;
+}
+
+.memory-graph-list span {
+    color: rgba(67, 78, 121, 0.68);
+    font-size: 11px;
+}
+
+@keyframes memoryPulse {
+    0% { opacity: 0.78; transform: scale(0.88); }
+    70% { opacity: 0.1; transform: scale(1.22); }
+    100% { opacity: 0; transform: scale(1.3); }
+}
+
+@keyframes memoryElectricFlow {
+    0% { stroke-dashoffset: 0; opacity: 0.64; }
+    50% { opacity: 1; }
+    100% { stroke-dashoffset: -26; opacity: 0.64; }
+}
+
+@media (max-width: 760px) {
+    .memory-graph-toolbar,
+    .memory-graph-content {
+        grid-template-columns: 1fr;
+    }
+
+    .memory-graph-toolbar {
+        flex-direction: column;
+    }
+
+    .memory-graph-stats {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .memory-graph-search {
+        grid-template-columns: 1fr;
+    }
+}
+
+.memory-graph-card--skills {
+  border-color: rgba(91, 120, 255, 0.28);
+  background: linear-gradient(180deg, rgba(247, 249, 255, 0.92), rgba(255, 255, 255, 0.86));
+}
+
+.memory-graph-button--full {
+  width: 100%;
+  justify-content: center;
+  margin: 8px 0;
+}
+
+.memory-skill-list {
+  gap: 10px;
+}
+
+.memory-skill-item {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid rgba(91, 120, 255, 0.2);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.memory-skill-item strong {
+  color: #1e2b5c;
+  font-size: 13px;
+}
+
+.memory-skill-item span,
+.memory-skill-item p {
+  color: #586486;
+  font-size: 12px;
+  margin: 0;
+}
+
+.memory-skill-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.memory-skill-actions button {
+  border: 1px solid rgba(91, 120, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(246, 248, 255, 0.92);
+  color: #2942a8;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 8px;
+}
+
+.memory-skill-actions button:hover {
+  border-color: rgba(91, 120, 255, 0.55);
+  box-shadow: 0 8px 18px rgba(64, 95, 214, 0.12);
+}
+
+/* AstraOS v0.5.12 — brain-first Memory Graph vault view */
+.memory-graph-toolbar--compact {
+  align-items: center;
+}
+
+.memory-graph-stats--compact {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.memory-graph-content--brain-first {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.memory-graph-canvas-card--primary {
+  min-height: 720px;
+  padding: 0;
+  overflow: hidden;
+  background: linear-gradient(180deg, rgba(17, 20, 31, 0.96), rgba(10, 12, 18, 0.94));
+  border-color: rgba(126, 150, 255, 0.18);
+  box-shadow: 0 22px 60px rgba(15, 23, 42, 0.24);
+}
+
+.memory-graph-canvas-shell {
+  position: relative;
+  min-height: 720px;
+  height: clamp(720px, 68vh, 980px);
+  overflow: hidden;
+  border-radius: 18px;
+}
+
+.memory-graph-canvas-controls {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.memory-graph-canvas-controls span {
+  margin-right: auto;
+  border: 1px solid rgba(169, 185, 255, 0.18);
+  background: rgba(11, 14, 22, 0.68);
+  color: rgba(232, 238, 255, 0.82);
+  border-radius: 999px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 800;
+  backdrop-filter: blur(12px);
+}
+
+.memory-graph-canvas-controls button {
+  pointer-events: auto;
+  border: 1px solid rgba(169, 185, 255, 0.22);
+  background: rgba(20, 25, 38, 0.78);
+  color: rgba(243, 247, 255, 0.92);
+  border-radius: 999px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 900;
+  cursor: pointer;
+  backdrop-filter: blur(12px);
+}
+
+.memory-graph-canvas-controls button:hover {
+  background: rgba(62, 83, 164, 0.86);
+}
+
+.memory-graph-canvas--brain {
+  width: 100%;
+  height: 100%;
+  min-height: 720px;
+  display: block;
+  cursor: grab;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(86, 110, 255, 0.22), transparent 34%),
+    radial-gradient(circle at 25% 22%, rgba(115, 82, 255, 0.12), transparent 24%),
+    linear-gradient(135deg, rgba(17, 20, 31, 0.98), rgba(8, 10, 15, 0.96));
+  touch-action: none;
+}
+
+.memory-graph-canvas--brain:active {
+  cursor: grabbing;
+}
+
+.memory-graph-background {
+  fill: transparent;
+}
+
+.memory-graph-canvas--brain .memory-graph-edge {
+  stroke: rgba(172, 181, 208, 0.23);
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  transition: stroke 180ms ease, opacity 180ms ease;
+}
+
+.memory-graph-canvas--brain .memory-graph-edge--active {
+  stroke: rgba(102, 255, 181, 0.92);
+  stroke-dasharray: 10 7;
+  animation: memoryElectricFlow 0.95s linear infinite;
+  filter: drop-shadow(0 0 6px rgba(83, 255, 177, 0.42));
+}
+
+.memory-graph-canvas--brain .memory-graph-node-group {
+  cursor: grab;
+  touch-action: none;
+}
+
+.memory-graph-canvas--brain .memory-graph-node-group:active {
+  cursor: grabbing;
+}
+
+.memory-graph-canvas--brain .memory-graph-node {
+  fill: url(#memoryNodeDepth);
+  stroke: rgba(230, 236, 255, 0.72);
+  stroke-width: 1.8;
+  vector-effect: non-scaling-stroke;
+  transition: filter 180ms ease, stroke 180ms ease, opacity 180ms ease;
+}
+
+.memory-graph-canvas--brain .memory-graph-node--conversation_turn { fill: rgba(126, 150, 255, 0.72); }
+.memory-graph-canvas--brain .memory-graph-node--summary { fill: rgba(112, 149, 255, 0.86); }
+.memory-graph-canvas--brain .memory-graph-node--work_session { fill: rgba(72, 194, 145, 0.82); }
+.memory-graph-canvas--brain .memory-graph-node--transcript_segment { fill: rgba(135, 111, 219, 0.68); }
+.memory-graph-canvas--brain .memory-graph-node--tool_use { fill: rgba(239, 163, 78, 0.82); }
+.memory-graph-canvas--brain .memory-graph-node--concept { fill: rgba(178, 190, 214, 0.78); }
+.memory-graph-canvas--brain .memory-graph-node--entity { fill: rgba(145, 168, 242, 0.82); }
+.memory-graph-canvas--brain .memory-graph-node--error { fill: rgba(231, 91, 108, 0.82); }
+.memory-graph-canvas--brain .memory-graph-node--fix { fill: rgba(71, 208, 188, 0.84); }
+.memory-graph-canvas--brain .memory-graph-node--user_preference { fill: rgba(220, 120, 224, 0.86); }
+.memory-graph-canvas--brain .memory-graph-node--procedure,
+.memory-graph-canvas--brain .memory-graph-node--workflow,
+.memory-graph-canvas--brain .memory-graph-node--code_pattern { fill: rgba(95, 171, 239, 0.86); }
+.memory-graph-canvas--brain .memory-graph-node--research_topic,
+.memory-graph-canvas--brain .memory-graph-node--research_finding,
+.memory-graph-canvas--brain .memory-graph-node--claim { fill: rgba(95, 210, 156, 0.82); }
+
+.memory-graph-canvas--brain .memory-graph-node--important {
+  stroke: rgba(250, 253, 255, 0.92);
+}
+
+.memory-graph-canvas--brain .memory-graph-node--active {
+  fill: rgba(80, 255, 173, 0.98);
+  stroke: rgba(228, 255, 242, 0.96);
+}
+
+.memory-graph-canvas--brain .memory-graph-node--selected {
+  stroke: rgba(255, 255, 255, 0.98);
+  stroke-width: 3;
+  filter: drop-shadow(0 0 12px rgba(120, 170, 255, 0.7));
+}
+
+.memory-graph-canvas--brain .memory-graph-node-halo {
+  fill: rgba(80, 255, 173, 0.12);
+  stroke: rgba(95, 255, 184, 0.34);
+  stroke-width: 1.2;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.memory-graph-canvas--brain .memory-graph-node-label {
+  fill: rgba(238, 242, 255, 0.78);
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  paint-order: stroke;
+  stroke: rgba(8, 10, 15, 0.72);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+  opacity: 0.52;
+  pointer-events: none;
+  user-select: none;
+}
+
+.memory-graph-canvas--brain .memory-graph-node-label--visible {
+  opacity: 0.95;
+}
+
+.memory-graph-inspector--grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(240px, 1fr));
+  gap: 10px;
+  max-height: none;
+  overflow: visible;
+  padding-right: 0;
+}
+
+.memory-graph-inspector--grid .memory-graph-card--node-inspector {
+  grid-column: span 2;
+}
+
+.memory-graph-inspector--grid .memory-graph-card--skills {
+  grid-column: span 2;
+}
+
+@media (max-width: 1100px) {
+  .memory-graph-stats--compact {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .memory-graph-inspector--grid {
+    grid-template-columns: 1fr;
+  }
+
+  .memory-graph-inspector--grid .memory-graph-card--node-inspector,
+  .memory-graph-inspector--grid .memory-graph-card--skills {
+    grid-column: auto;
+  }
+}
+
+/* AstraOS v0.5.17 — dedicated cognitive memory surface */
+.astra-memory-stage {
+  position: absolute;
+  inset: 44px 0 0 0;
+  z-index: 8;
+  min-height: 0;
+  overflow: hidden;
+  background: #050813;
+}
+
+.memory-graph-panel--immersive {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  display: block;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  background: #0b0e16;
+}
+
+.memory-graph-panel--immersive .memory-graph-toolbar {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  z-index: 6;
+  align-items: center;
+  padding: 12px 14px;
+  border-color: rgba(184, 197, 255, 0.18);
+  background: rgba(12, 15, 24, 0.62);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.26);
+  backdrop-filter: blur(18px);
+}
+
+.memory-graph-panel--immersive .desktop-agent-muted,
+.memory-graph-panel--immersive .memory-graph-toolbar h3,
+.memory-graph-panel--immersive .memory-graph-subtitle {
+  color: rgba(239, 243, 255, 0.88);
+}
+
+.memory-graph-panel--immersive .memory-graph-subtitle {
+  max-width: 860px;
+  color: rgba(218, 226, 255, 0.7);
+}
+
+.memory-graph-button--icon {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.memory-graph-panel--immersive .memory-graph-button {
+  border-color: rgba(186, 199, 255, 0.24);
+  background: rgba(29, 36, 59, 0.76);
+  color: rgba(245, 248, 255, 0.94);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+.memory-graph-panel--immersive .memory-graph-stats {
+  position: absolute;
+  top: 102px;
+  left: 14px;
+  z-index: 5;
+  width: min(700px, calc(100vw - 440px));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  pointer-events: none;
+}
+
+.memory-graph-panel--immersive .memory-graph-stats article {
+  border-color: rgba(184, 197, 255, 0.14);
+  background: rgba(13, 17, 29, 0.52);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(14px);
+}
+
+.memory-graph-panel--immersive .memory-graph-stats span {
+  color: rgba(206, 217, 255, 0.62);
+}
+
+.memory-graph-panel--immersive .memory-graph-stats strong {
+  color: rgba(245, 249, 255, 0.94);
+}
+
+.memory-graph-panel--immersive .memory-graph-search {
+  position: absolute;
+  top: 102px;
+  right: 24px;
+  z-index: 6;
+  width: min(460px, 42vw);
+  border-color: rgba(184, 197, 255, 0.16);
+  background: rgba(13, 17, 29, 0.58);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(16px);
+}
+
+.memory-graph-panel--immersive .memory-graph-search input {
+  border-color: rgba(184, 197, 255, 0.18);
+  background: rgba(248, 250, 255, 0.94);
+}
+
+.memory-graph-panel--immersive .memory-graph-content,
+.memory-graph-panel--immersive .memory-graph-content--brain-first {
+  position: absolute;
+  inset: 0;
+  display: block;
+  min-height: 0;
+  gap: 0;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-card,
+.memory-graph-panel--immersive .memory-graph-canvas-card--primary {
+  position: absolute;
+  inset: 0;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  box-shadow: none;
+  background: #0b0e16;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-shell {
+  min-height: 0;
+  height: 100%;
+  border-radius: 0;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain {
+  min-height: 0;
+  height: 100%;
+  background:
+    radial-gradient(circle at 50% 48%, rgba(93, 116, 255, 0.25), transparent 31%),
+    radial-gradient(circle at 26% 22%, rgba(128, 88, 255, 0.13), transparent 22%),
+    radial-gradient(circle at 70% 64%, rgba(64, 255, 179, 0.08), transparent 24%),
+    linear-gradient(135deg, rgba(17, 20, 31, 0.99), rgba(8, 10, 15, 0.98));
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-controls {
+  top: 176px;
+  left: 18px;
+  right: auto;
+  width: auto;
+}
+
+.memory-graph-panel--immersive .memory-graph-inspector,
+.memory-graph-panel--immersive .memory-graph-inspector--grid {
+  position: absolute;
+  top: 176px;
+  right: 24px;
+  bottom: 24px;
+  z-index: 5;
+  width: min(380px, 36vw);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: none;
+  overflow: auto;
+  padding: 0 6px 0 0;
+  pointer-events: auto;
+}
+
+.memory-graph-panel--immersive .memory-graph-card {
+  border-color: rgba(184, 197, 255, 0.16);
+  background: rgba(13, 17, 29, 0.62);
+  color: rgba(234, 240, 255, 0.9);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(16px);
+}
+
+.memory-graph-panel--immersive .memory-graph-card h4,
+.memory-graph-panel--immersive .memory-graph-node-header h4 {
+  color: rgba(248, 250, 255, 0.95);
+}
+
+.memory-graph-panel--immersive .memory-graph-card p,
+.memory-graph-panel--immersive .memory-graph-list span,
+.memory-graph-panel--immersive .memory-skill-item span,
+.memory-graph-panel--immersive .memory-skill-item p {
+  color: rgba(213, 223, 255, 0.72);
+}
+
+.memory-graph-panel--immersive .memory-graph-node-header span,
+.memory-graph-panel--immersive .memory-graph-tags span,
+.memory-graph-panel--immersive .memory-skill-item,
+.memory-graph-panel--immersive .memory-graph-list button,
+.memory-graph-panel--immersive .memory-graph-timeline-item {
+  border-color: rgba(184, 197, 255, 0.16);
+  background: rgba(22, 27, 44, 0.68);
+  color: rgba(236, 241, 255, 0.86);
+}
+
+.memory-graph-panel--immersive .memory-graph-meta-grid span {
+  border-bottom-color: rgba(184, 197, 255, 0.12);
+}
+
+@media (max-width: 980px) {
+  .memory-graph-panel--immersive .memory-graph-toolbar {
+    left: 10px;
+    right: 10px;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-stats {
+    display: none;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-search {
+    top: 156px;
+    left: 10px;
+    right: 10px;
+    width: auto;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-canvas-controls {
+    top: 220px;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-inspector,
+  .memory-graph-panel--immersive .memory-graph-inspector--grid {
+    top: auto;
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    width: auto;
+    max-height: 34vh;
+  }
+}
+
+/* v0.5.18 — Dedicated brain graph surface hardening */
+.memory-graph-panel--immersive {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: #050813;
+  color: rgba(238, 243, 255, 0.94);
+}
+
+.memory-graph-panel--immersive .memory-graph-hud {
+  position: absolute;
+  z-index: 16;
+  top: 16px;
+  left: 18px;
+  right: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  max-width: min(620px, calc(100vw - 172px));
+  padding: 12px 14px;
+  border: 1px solid rgba(147, 168, 255, 0.20);
+  border-radius: 22px;
+  background: rgba(7, 10, 22, 0.62);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.30);
+  backdrop-filter: blur(22px);
+}
+
+.memory-graph-hud-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.memory-graph-hud-title span {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: rgba(174, 190, 235, 0.78);
+}
+
+.memory-graph-hud-title strong {
+  font-size: 15px;
+  color: rgba(245, 248, 255, 0.96);
+  white-space: nowrap;
+}
+
+.memory-graph-hud-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-graph-icon-button {
+  width: 38px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid rgba(151, 170, 255, 0.22);
+  background: rgba(14, 20, 40, 0.74);
+  color: rgba(236, 242, 255, 0.92);
+  cursor: pointer;
+  transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+}
+
+.memory-graph-icon-button:hover,
+.memory-graph-icon-button--active {
+  transform: translateY(-1px);
+  border-color: rgba(104, 231, 185, 0.50);
+  background: rgba(38, 63, 84, 0.76);
+  box-shadow: 0 0 24px rgba(87, 231, 183, 0.15);
+}
+
+.memory-graph-icon-button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.memory-graph-panel--immersive .memory-graph-status-hud {
+  position: absolute;
+  z-index: 12;
+  top: auto;
+  bottom: 18px;
+  left: 18px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: min(520px, calc(100vw - 280px));
+  pointer-events: none;
+}
+
+.memory-graph-status-hud span {
+  padding: 6px 9px;
+  border: 1px solid rgba(145, 165, 255, 0.16);
+  border-radius: 999px;
+  background: rgba(9, 12, 26, 0.46);
+  color: rgba(198, 210, 241, 0.72);
+  font-size: 11px;
+  font-weight: 700;
+  backdrop-filter: blur(14px);
+}
+
+.memory-graph-panel--immersive .memory-graph-search-overlay {
+  position: absolute;
+  z-index: 18;
+  top: 76px;
+  left: 18px;
+  width: min(720px, calc(100vw - 36px));
+  display: flex;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid rgba(156, 177, 255, 0.20);
+  border-radius: 24px;
+  background: rgba(7, 10, 22, 0.76);
+  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.32);
+  backdrop-filter: blur(24px);
+}
+
+.memory-graph-search-overlay input {
+  flex: 1;
+  min-width: 0;
+  height: 42px;
+  border: 1px solid rgba(152, 171, 255, 0.18);
+  border-radius: 999px;
+  padding: 0 16px;
+  outline: none;
+  color: rgba(244, 247, 255, 0.96);
+  background: rgba(232, 237, 248, 0.08);
+}
+
+.memory-graph-search-overlay input::placeholder {
+  color: rgba(208, 217, 240, 0.54);
+}
+
+.memory-graph-panel--immersive .memory-graph-content,
+.memory-graph-panel--immersive .memory-graph-content--brain-first,
+.memory-graph-content--full-surface {
+  position: absolute;
+  inset: 0;
+  display: block;
+  padding: 0;
+  margin: 0;
+  overflow: hidden;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-card,
+.memory-graph-panel--immersive .memory-graph-canvas-card--primary,
+.memory-graph-canvas-card--full-surface {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  overflow: hidden;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-shell {
+  position: absolute;
+  inset: 0;
+  min-height: 100vh;
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain {
+  width: 100%;
+  height: 100%;
+  min-height: 100vh;
+  background: #050813;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain:active {
+  cursor: grabbing;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-controls {
+  position: absolute;
+  z-index: 15;
+  right: 18px;
+  bottom: 18px;
+  top: auto;
+  left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid rgba(147, 168, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(7, 10, 22, 0.62);
+  backdrop-filter: blur(18px);
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-controls span {
+  display: none;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-controls button {
+  min-width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid rgba(154, 174, 255, 0.18);
+  background: rgba(18, 25, 48, 0.78);
+  color: rgba(239, 244, 255, 0.92);
+  font-weight: 800;
+}
+
+.memory-graph-panel--immersive .memory-graph-utility-dock {
+  display: none;
+}
+
+.memory-graph-node-drawer {
+  position: absolute;
+  z-index: 19;
+  top: 92px;
+  right: 18px;
+  width: min(390px, calc(100vw - 36px));
+  max-height: calc(100vh - 130px);
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid rgba(153, 175, 255, 0.22);
+  border-radius: 24px;
+  background: rgba(8, 12, 25, 0.78);
+  box-shadow: 0 26px 90px rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(24px);
+}
+
+.memory-graph-drawer-close {
+  position: sticky;
+  top: 0;
+  margin-left: auto;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  border: 1px solid rgba(154, 174, 255, 0.20);
+  background: rgba(16, 22, 42, 0.82);
+  color: rgba(240, 244, 255, 0.92);
+  cursor: pointer;
+}
+
+.memory-graph-search-results-overlay {
+  position: absolute;
+  z-index: 18;
+  top: 136px;
+  left: 18px;
+  width: min(560px, calc(100vw - 36px));
+  max-height: 52vh;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid rgba(153, 175, 255, 0.18);
+  border-radius: 22px;
+  background: rgba(8, 12, 25, 0.76);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(22px);
+}
+
+.memory-graph-panel--immersive .memory-graph-card {
+  background: rgba(11, 16, 31, 0.72);
+  border-color: rgba(153, 175, 255, 0.20);
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label {
+  opacity: 0.92;
+  fill: rgba(235, 241, 255, 0.95);
+  stroke: rgba(3, 6, 14, 0.92);
+  stroke-width: 3px;
+  paint-order: stroke fill;
+  font-weight: 780;
+  letter-spacing: 0.01em;
+  pointer-events: none;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.95);
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label--selected {
+  fill: #ffffff;
+  font-weight: 900;
+}
+
+.memory-graph-panel--immersive .memory-graph-label-anchor {
+  pointer-events: none;
+  user-select: none;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label-shadow {
+  fill: none;
+  stroke: rgba(0, 0, 0, 0.98);
+  stroke-width: 5px;
+  stroke-linejoin: round;
+  opacity: 0.94;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label {
+  font-size: 11px;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-group {
+  cursor: grab;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-group:active {
+  cursor: grabbing;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node {
+  stroke-width: 2px;
+}
+
+.memory-graph-error-overlay {
+  position: absolute;
+  z-index: 30;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(760px, calc(100vw - 40px));
+}
+
+@media (max-width: 760px) {
+  .memory-graph-panel--immersive .memory-graph-hud {
+    left: 10px;
+    top: 10px;
+    max-width: calc(100vw - 20px);
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-status-hud {
+    top: 112px;
+    left: 12px;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-search-overlay {
+    top: 108px;
+    left: 10px;
+    width: calc(100vw - 20px);
+  }
+
+  .memory-graph-node-drawer {
+    left: 10px;
+    right: 10px;
+    width: auto;
+    top: 140px;
+  }
+}
+
+/* AstraOS v0.5.20 — Memory Graph shell/chrome and status HUD hardening
+   Purpose: keep the native/top overlay controls visible and prevent status chips
+   from stretching over the vault graph. The Memory Graph is bounded inside
+   .astra-memory-stage instead of covering the whole window with fixed viewport. */
+.overlay-topbar {
+  position: relative;
+  z-index: 40;
+}
+
+.astra-memory-stage {
+  position: absolute;
+  inset: 48px 0 0 0;
+  z-index: 8;
+  min-height: 0;
+  overflow: hidden;
+  background: #050813;
+}
+
+.memory-graph-panel--immersive {
+  position: absolute !important;
+  inset: 0 !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  overflow: hidden !important;
+  background: #050813 !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-shell,
+.memory-graph-panel--immersive .memory-graph-canvas--brain {
+  min-height: 0 !important;
+  height: 100% !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain {
+  background: #050813 !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-stats {
+  display: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-status-hud {
+  position: absolute !important;
+  z-index: 14 !important;
+  top: auto !important;
+  right: auto !important;
+  bottom: 14px !important;
+  left: 18px !important;
+  width: auto !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: 72px !important;
+  max-width: min(560px, calc(100% - 250px)) !important;
+  display: flex !important;
+  flex-direction: row !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  align-content: flex-start !important;
+  justify-content: flex-start !important;
+  gap: 6px !important;
+  overflow: hidden !important;
+  pointer-events: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-status-hud span,
+.memory-graph-status-hud span {
+  width: auto !important;
+  min-width: 0 !important;
+  max-width: 180px !important;
+  height: 24px !important;
+  min-height: 24px !important;
+  max-height: 24px !important;
+  flex: 0 0 auto !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 0 9px !important;
+  line-height: 1 !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  border-radius: 999px !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-hud {
+  top: 16px !important;
+  left: 18px !important;
+  max-width: min(620px, calc(100% - 160px)) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-search-overlay {
+  top: 76px !important;
+  left: 18px !important;
+  width: min(720px, calc(100% - 36px)) !important;
+}
+
+@media (max-width: 760px) {
+  .astra-memory-stage {
+    inset: 48px 0 0 0;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-status-hud {
+    display: none !important;
+  }
+
+  .memory-graph-panel--immersive .memory-graph-hud {
+    left: 10px !important;
+    top: 10px !important;
+    max-width: calc(100% - 20px) !important;
+  }
+}
+
+/* AstraOS v0.5.21 — Memory Graph light surface
+   Purpose: remove the dark-mode treatment from the dedicated Cognitive Memory
+   Graph while keeping the rest of Astra's UI unchanged. This is intentionally
+   scoped to the immersive memory surface only. */
+.astra-memory-stage {
+  background: linear-gradient(180deg, #f8faff 0%, #f2f5fb 100%) !important;
+}
+
+.memory-graph-panel--immersive {
+  background: linear-gradient(180deg, #f8faff 0%, #f2f5fb 100%) !important;
+  color: #17203a !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas-card,
+.memory-graph-panel--immersive .memory-graph-canvas-card--primary,
+.memory-graph-canvas-card--full-surface {
+  background: transparent !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain {
+  background:
+    linear-gradient(rgba(95, 120, 190, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(95, 120, 190, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, #f9fbff 0%, #eef3fb 100%) !important;
+  background-size: 40px 40px, 40px 40px, auto !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-hud,
+.memory-graph-panel--immersive .memory-graph-search-overlay,
+.memory-graph-node-drawer,
+.memory-graph-search-results-overlay,
+.memory-graph-panel--immersive .memory-graph-card,
+.memory-graph-panel--immersive .memory-graph-canvas-controls {
+  border-color: rgba(126, 146, 195, 0.24) !important;
+  background: rgba(255, 255, 255, 0.78) !important;
+  color: #18213d !important;
+  box-shadow: 0 18px 60px rgba(73, 91, 132, 0.16) !important;
+  backdrop-filter: blur(18px) saturate(1.15) !important;
+}
+
+.memory-graph-hud-title span,
+.memory-graph-panel--immersive .desktop-agent-muted {
+  color: rgba(58, 78, 122, 0.76) !important;
+}
+
+.memory-graph-hud-title strong,
+.memory-graph-panel--immersive .memory-graph-card h4,
+.memory-graph-panel--immersive .memory-graph-node-header h4 {
+  color: #17203a !important;
+}
+
+.memory-graph-icon-button,
+.memory-graph-panel--immersive .memory-graph-canvas-controls button,
+.memory-graph-drawer-close,
+.memory-graph-panel--immersive .memory-graph-button {
+  border-color: rgba(113, 134, 190, 0.28) !important;
+  background: rgba(247, 250, 255, 0.92) !important;
+  color: #20305f !important;
+  box-shadow: 0 8px 24px rgba(77, 97, 150, 0.12) !important;
+}
+
+.memory-graph-icon-button:hover,
+.memory-graph-icon-button--active,
+.memory-graph-panel--immersive .memory-graph-canvas-controls button:hover {
+  border-color: rgba(56, 128, 216, 0.42) !important;
+  background: rgba(235, 243, 255, 0.96) !important;
+  box-shadow: 0 10px 28px rgba(77, 119, 210, 0.18) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-search-overlay input {
+  border-color: rgba(117, 137, 190, 0.25) !important;
+  background: rgba(255, 255, 255, 0.98) !important;
+  color: #18213d !important;
+}
+
+.memory-graph-search-overlay input::placeholder {
+  color: rgba(74, 91, 132, 0.55) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-status-hud span,
+.memory-graph-status-hud span,
+.memory-graph-panel--immersive .memory-graph-node-header span,
+.memory-graph-panel--immersive .memory-graph-tags span,
+.memory-graph-panel--immersive .memory-skill-item,
+.memory-graph-panel--immersive .memory-graph-list button,
+.memory-graph-panel--immersive .memory-graph-timeline-item {
+  border-color: rgba(116, 139, 198, 0.22) !important;
+  background: rgba(255, 255, 255, 0.72) !important;
+  color: rgba(38, 52, 91, 0.86) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-card p,
+.memory-graph-panel--immersive .memory-graph-list span,
+.memory-graph-panel--immersive .memory-skill-item span,
+.memory-graph-panel--immersive .memory-skill-item p {
+  color: rgba(43, 59, 99, 0.72) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-edge {
+  stroke: rgba(88, 111, 165, 0.30) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-edge--active {
+  stroke: rgba(44, 132, 224, 0.78) !important;
+  filter: drop-shadow(0 0 6px rgba(44, 132, 224, 0.34));
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node {
+  stroke: rgba(255, 255, 255, 0.92) !important;
+  filter: drop-shadow(0 6px 14px rgba(61, 83, 143, 0.18));
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-halo {
+  stroke: rgba(49, 132, 224, 0.38) !important;
+  fill: rgba(49, 132, 224, 0.10) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label,
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label--selected {
+  fill: #18213d !important;
+  stroke: rgba(255, 255, 255, 0.96) !important;
+  stroke-width: 4px !important;
+  paint-order: stroke fill !important;
+  text-shadow: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label-shadow {
+  stroke: rgba(255, 255, 255, 0.96) !important;
+  opacity: 0.98 !important;
+}
+
+.memory-graph-error-overlay {
+  color: #17203a !important;
+}
+
+/* AstraOS v0.5.22 — Memory Graph label readability hardening
+   Labels were rendered in graph/viewBox units, so on a large SVG vault they became
+   unreadable even at high zoom. This keeps labels screen-stable, adds a subtle
+   readable plate, and raises font sizes only inside the dedicated Memory Graph. */
+.memory-graph-panel--immersive .memory-graph-label-anchor {
+  pointer-events: none !important;
+  user-select: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label-plate {
+  fill: rgba(255, 255, 255, 0.86) !important;
+  stroke: rgba(116, 139, 198, 0.24) !important;
+  stroke-width: 1px !important;
+  filter: drop-shadow(0 6px 14px rgba(75, 91, 130, 0.12));
+  pointer-events: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-label-anchor--prominent .memory-graph-node-label-plate {
+  fill: rgba(255, 255, 255, 0.94) !important;
+  stroke: rgba(64, 119, 220, 0.28) !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label,
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label--selected {
+  fill: #101936 !important;
+  stroke: rgba(255, 255, 255, 0.98) !important;
+  stroke-width: 5px !important;
+  paint-order: stroke fill !important;
+  font-size: 18px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0.005em !important;
+  opacity: 1 !important;
+  text-shadow: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label-shadow {
+  fill: none !important;
+  stroke: rgba(255, 255, 255, 0.99) !important;
+  stroke-width: 7px !important;
+  stroke-linejoin: round !important;
+  opacity: 1 !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-label-anchor--prominent .memory-graph-node-label,
+.memory-graph-panel--immersive .memory-graph-label-anchor--prominent .memory-graph-node-label--selected {
+  font-size: 20px !important;
+  font-weight: 900 !important;
+}
+
+
+/* AstraOS v0.5.23 — Memory Graph true screen-space labels
+   The SVG viewBox is much larger than the displayed viewport; previous labels were
+   still measured in graph units, so they rendered at 3-5px on screen. The React
+   layer now compensates for viewBox-to-screen scaling. These styles define the
+   intended final screen typography. */
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label,
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label--selected {
+  fill: #111a35 !important;
+  stroke: rgba(255, 255, 255, 0.98) !important;
+  stroke-width: 3px !important;
+  paint-order: stroke fill !important;
+  font-size: 13px !important;
+  font-weight: 850 !important;
+  letter-spacing: 0 !important;
+  opacity: 1 !important;
+  text-shadow: none !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-label-anchor--prominent .memory-graph-node-label,
+.memory-graph-panel--immersive .memory-graph-label-anchor--prominent .memory-graph-node-label--selected {
+  font-size: 15px !important;
+  font-weight: 900 !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label-shadow {
+  fill: none !important;
+  stroke: rgba(255, 255, 255, 0.99) !important;
+  stroke-width: 5px !important;
+  stroke-linejoin: round !important;
+  opacity: 1 !important;
+}
+
+.memory-graph-panel--immersive .memory-graph-canvas--brain .memory-graph-node-label-plate {
+  fill: rgba(255, 255, 255, 0.92) !important;
+  stroke: rgba(116, 139, 198, 0.28) !important;
+  stroke-width: 1px !important;
+  filter: drop-shadow(0 6px 14px rgba(75, 91, 130, 0.14));
+}
+
+/* v0.5.24 - HTML label overlay: labels are rendered in screen-space so they stay
+   readable without covering graph nodes or inheriting SVG viewBox scaling. */
+.memory-graph-canvas-shell {
+  position: relative;
+}
+
+.memory-graph-html-label-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 4;
+}
+
+.memory-graph-html-label {
+  position: absolute;
+  transform: translate(-50%, 18px);
+  max-width: 190px;
+  padding: 3px 7px 4px;
+  border: 1px solid rgba(147, 167, 219, 0.38);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.86);
+  box-shadow: 0 6px 18px rgba(30, 48, 92, 0.12), 0 1px 2px rgba(13, 20, 38, 0.08);
+  color: #0f1f3f;
+  font-size: 11.5px;
+  line-height: 1.15;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;
+  opacity: 0.94;
+  user-select: none;
+}
+
+.memory-graph-html-label--important,
+.memory-graph-html-label--active,
+.memory-graph-html-label--selected {
+  font-size: 12.5px;
+  max-width: 250px;
+  padding: 4px 9px 5px;
+  opacity: 1;
+  border-color: rgba(91, 128, 255, 0.48);
+  box-shadow: 0 10px 26px rgba(30, 70, 160, 0.18), 0 1px 3px rgba(13, 20, 38, 0.1);
+}
+
+.memory-graph-html-label--active {
+  background: rgba(236, 255, 248, 0.95);
+  border-color: rgba(64, 203, 156, 0.48);
+  color: #0b3e33;
+}
+
+.memory-graph-html-label--selected {
+  background: rgba(255, 255, 255, 0.98);
+  border-color: rgba(42, 80, 196, 0.65);
+  color: #11265a;
+}
+
+.memory-graph-canvas--brain .memory-graph-label-anchor,
+.memory-graph-canvas--brain .memory-graph-node-label,
+.memory-graph-canvas--brain .memory-graph-node-label-plate,
+.memory-graph-canvas--brain .memory-graph-node-label-shadow {
+  display: none !important;
+}
+
+
+/* AstraOS v0.5.27 — Memory Graph label toggle reliability fix.
+   Keep label state controlled by React, make the toolbar action visually explicit,
+   and ensure hidden labels cannot leave an unrecoverable stale CSS/localStorage state. */
+.memory-graph-label-toggle {
+  position: relative;
+  gap: 2px;
+  min-width: 42px !important;
+  padding-inline: 8px !important;
+}
+
+.memory-graph-label-toggle-glyph {
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+.memory-graph-label-toggle-state {
+  width: 12px;
+  height: 12px;
+  opacity: 0.78;
+}
+
+.memory-graph-canvas-shell--labels-hidden .memory-graph-html-label-layer {
+  display: none !important;
+}
+
+.memory-graph-canvas-shell--labels-visible .memory-graph-html-label-layer {
+  display: block !important;
+}
+
+/* AstraOS v0.5.28 — Memory Graph SVG label fallback/recovery.
+   HTML labels were readable but could disappear or desync depending on projection state.
+   SVG labels are now rendered inside the same transformed graph layer and are compensated
+   in graph units so they remain screen-readable while staying locked to nodes. */
+.memory-graph-html-label-layer {
+  display: none !important;
+}
+
+.memory-graph-svg-label {
+  pointer-events: none;
+  opacity: 0.96;
+}
+
+.memory-graph-svg-label-plate {
+  fill: rgba(255, 255, 255, 0.92);
+  stroke: rgba(137, 158, 215, 0.42);
+  stroke-width: 1.2px;
+  filter: drop-shadow(0 6px 16px rgba(43, 65, 112, 0.14));
+}
+
+.memory-graph-svg-label-text {
+  fill: #0d1d3c;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.72);
+  stroke-width: 2.2px;
+}
+
+.memory-graph-svg-label--active .memory-graph-svg-label-plate {
+  fill: rgba(236, 255, 247, 0.96);
+  stroke: rgba(64, 203, 156, 0.58);
+}
+
+.memory-graph-svg-label--selected .memory-graph-svg-label-plate,
+.memory-graph-svg-label--important .memory-graph-svg-label-plate {
+  fill: rgba(255, 255, 255, 0.98);
+  stroke: rgba(42, 80, 196, 0.64);
+}
+
+.memory-graph-canvas-shell--labels-hidden .memory-graph-svg-label {
+  display: none !important;
+}
+
+.memory-graph-canvas-shell--labels-visible .memory-graph-svg-label {
+  display: inline !important;
+}
+
+/* AstraOS v0.5.28 — Memory Graph SVG label fallback/recovery.
+   HTML labels were readable but could disappear or desync depending on projection state.
+   SVG labels are now rendered inside the same transformed graph layer and are compensated
+   in graph units so they remain screen-readable while staying locked to nodes. */
+.memory-graph-html-label-layer {
+  display: none !important;
+}
+
+.memory-graph-svg-label {
+  pointer-events: none;
+  opacity: 0.96;
+}
+
+.memory-graph-svg-label-plate {
+  fill: rgba(255, 255, 255, 0.92);
+  stroke: rgba(137, 158, 215, 0.42);
+  stroke-width: 1.2px;
+  filter: drop-shadow(0 6px 16px rgba(43, 65, 112, 0.14));
+}
+
+.memory-graph-svg-label-text {
+  fill: #0d1d3c;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  paint-order: stroke;
+  stroke: rgba(255, 255, 255, 0.72);
+  stroke-width: 2.2px;
+}
+
+.memory-graph-svg-label--active .memory-graph-svg-label-plate {
+  fill: rgba(236, 255, 247, 0.96);
+  stroke: rgba(64, 203, 156, 0.58);
+}
+
+.memory-graph-svg-label--selected .memory-graph-svg-label-plate,
+.memory-graph-svg-label--important .memory-graph-svg-label-plate {
+  fill: rgba(255, 255, 255, 0.98);
+  stroke: rgba(42, 80, 196, 0.64);
+}
+
+.memory-graph-canvas-shell--labels-hidden .memory-graph-svg-label {
+  display: none !important;
+}
+
+.memory-graph-canvas-shell--labels-visible .memory-graph-svg-label {
+  display: inline !important;
+}
+
+.memory-graph-toolbar-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+/* AstraOS v0.5.32 — Memory Quality Dashboard.
+   Enterprise-grade observability for the Brain RAG: quality is measured, not guessed. */
+.memory-quality-status-pill {
+  border-color: rgba(68, 96, 160, 0.20) !important;
+  background: rgba(255, 255, 255, 0.72) !important;
+  color: #20365e !important;
+}
+
+.memory-quality-status-pill--healthy {
+  border-color: rgba(42, 163, 108, 0.30) !important;
+  background: rgba(226, 252, 239, 0.86) !important;
+  color: #0b6a43 !important;
+}
+
+.memory-quality-status-pill--degraded {
+  border-color: rgba(202, 144, 42, 0.34) !important;
+  background: rgba(255, 246, 218, 0.90) !important;
+  color: #815509 !important;
+}
+
+.memory-quality-status-pill--needs_attention,
+.memory-quality-status-pill--unavailable {
+  border-color: rgba(210, 72, 88, 0.34) !important;
+  background: rgba(255, 232, 236, 0.90) !important;
+  color: #8d1c2c !important;
+}
+
+.memory-quality-dashboard-overlay {
+  position: absolute;
+  z-index: 18;
+  top: 78px;
+  left: 18px;
+  width: min(420px, calc(100vw - 36px));
+  max-height: calc(100vh - 116px);
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(129, 151, 205, 0.24);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.90);
+  box-shadow: 0 24px 80px rgba(50, 70, 116, 0.20);
+  color: #162646;
+  backdrop-filter: blur(18px);
+}
+
+.memory-quality-dashboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.memory-quality-dashboard-header span {
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(30, 48, 83, 0.62);
+}
+
+.memory-quality-dashboard-header strong {
+  font-size: 28px;
+  line-height: 1;
+  color: #10224c;
+}
+
+.memory-quality-dashboard-overlay > p {
+  margin: 0 0 12px;
+  color: rgba(20, 35, 65, 0.72);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.memory-quality-dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px 14px;
+  padding: 12px;
+  border: 1px solid rgba(130, 152, 205, 0.18);
+  border-radius: 18px;
+  background: rgba(244, 247, 253, 0.72);
+}
+
+.memory-quality-dashboard-grid span,
+.memory-quality-dashboard-section span {
+  color: rgba(29, 47, 80, 0.62);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.memory-quality-dashboard-grid strong {
+  color: #122653;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.memory-quality-dashboard-section {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(130, 152, 205, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.66);
+}
+
+.memory-quality-dashboard-section p {
+  margin: 8px 0 0;
+  color: rgba(20, 35, 65, 0.76);
+  font-size: 12px;
+  line-height: 1.42;
+}
+
+/* AstraOS v0.5.34 — Memory Graph layout controls and presets.
+   UI-only control surface for Obsidian-like graph tuning. The graph remains
+   advisory and never affects memory governance, RAG execution or tool policy. */
+.memory-graph-controls-overlay {
+  position: absolute;
+  top: 154px;
+  left: 18px;
+  width: min(360px, calc(100vw - 36px));
+  max-height: calc(100vh - 220px);
+  overflow: auto;
+  z-index: 52;
+  padding: 16px;
+  border: 1px solid rgba(127, 149, 205, 0.26);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 24px 70px rgba(35, 55, 96, 0.16), 0 4px 16px rgba(35, 55, 96, 0.08);
+  backdrop-filter: blur(18px);
+  color: #17284f;
+}
+
+.memory-graph-controls-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.memory-graph-controls-header span,
+.memory-graph-control-group > span,
+.memory-graph-slider-row > span {
+  display: block;
+  color: #66759e;
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.memory-graph-controls-header strong {
+  display: block;
+  margin-top: 3px;
+  font-size: 16px;
+  color: #17284f;
+}
+
+.memory-graph-controls-header button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid rgba(127, 149, 205, 0.32);
+  border-radius: 999px;
+  background: rgba(246, 249, 255, 0.88);
+  color: #34446f;
+  cursor: pointer;
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.memory-graph-control-group {
+  margin-top: 14px;
+}
+
+.memory-graph-preset-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.memory-graph-preset-grid--labels {
+  gap: 7px;
+}
+
+.memory-graph-control-chip {
+  border: 1px solid rgba(127, 149, 205, 0.3);
+  border-radius: 999px;
+  padding: 8px 11px;
+  background: rgba(247, 250, 255, 0.88);
+  color: #31436d;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+
+.memory-graph-control-chip:hover {
+  transform: translateY(-1px);
+  border-color: rgba(70, 111, 225, 0.46);
+}
+
+.memory-graph-control-chip--active {
+  background: rgba(230, 239, 255, 0.96);
+  border-color: rgba(60, 101, 220, 0.58);
+  color: #1a3c95;
+  box-shadow: 0 8px 22px rgba(48, 91, 205, 0.12);
+}
+
+.memory-graph-slider-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 46px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.memory-graph-slider-row input[type="range"] {
+  width: 100%;
+  accent-color: #4677ed;
+}
+
+.memory-graph-slider-row strong {
+  color: #22345f;
+  font-size: 12px;
+  font-weight: 900;
+  text-align: right;
+}
+
+.memory-graph-panel--immersive .memory-graph-controls-overlay {
+  top: 154px;
+}
+
+@media (max-width: 760px) {
+  .memory-graph-controls-overlay {
+    top: 136px;
+    left: 12px;
+    right: 12px;
+    width: auto;
+  }
+
+  .memory-graph-slider-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .memory-graph-slider-row strong {
+    text-align: left;
+  }
+}
+
+/* AstraOS v0.5.35 — Local/Global Memory Graph controls. */
+.memory-graph-kind-filter-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 8px;
+  max-height: 150px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.memory-graph-kind-filter-grid .memory-graph-control-chip {
+  font-size: 11px;
+  padding: 7px 9px;
+}
+
+/* AstraOS v0.5.36 — Memory Graph performance hardening.
+   Lightweight telemetry and runtime controls stay visual-only. They do not alter
+   Memory Graph storage, RAG, governance, approval, audit, or tool execution. */
+.memory-graph-performance-badge {
+  position: absolute;
+  right: 18px;
+  top: 18px;
+  z-index: 6;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(131, 154, 216, 0.32);
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow: 0 10px 26px rgba(52, 72, 118, 0.12);
+  color: #213154;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  pointer-events: none;
+  backdrop-filter: blur(10px);
+}
+
+.memory-graph-performance-badge span {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  padding: 2px 5px;
+  border-radius: 999px;
+  background: rgba(236, 241, 255, 0.78);
+  border: 1px solid rgba(139, 162, 222, 0.24);
+  white-space: nowrap;
+}
+
+.memory-graph-performance-badge--degraded span:first-child {
+  background: rgba(255, 244, 215, 0.9);
+  border-color: rgba(218, 166, 58, 0.32);
+  color: #76530e;
+}
+
+.memory-graph-canvas-controls button[title*="layout"] {
+  min-width: 34px;
+  font-weight: 900;
+}
+
+.memory-graph-canvas-shell--labels-hidden .memory-graph-performance-badge {
+  opacity: 0.92;
+}
+
+/* AstraOS v0.5.41 — Memory node governance actions */
+.memory-node-governance-panel {
+  margin: 14px 0;
+  padding: 12px;
+  border: 1px solid rgba(76, 96, 130, 0.16);
+  border-radius: 16px;
+  background: rgba(255, 255, 255, 0.74);
+  box-shadow: 0 10px 28px rgba(28, 39, 68, 0.08);
+}
+
+.memory-node-governance-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.memory-node-governance-header div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.memory-node-governance-header strong {
+  color: #172033;
+  font-size: 0.88rem;
+  letter-spacing: 0.01em;
+}
+
+.memory-node-governance-header span,
+.memory-node-governance-message {
+  color: rgba(31, 44, 70, 0.62);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.memory-node-governance-badge {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(40, 99, 255, 0.1);
+  color: #3155c8 !important;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.memory-node-governance-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.memory-node-governance-action {
+  min-height: 34px;
+  border: 1px solid rgba(65, 82, 116, 0.18);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.88);
+  color: #22304a;
+  font-size: 0.72rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+}
+
+.memory-node-governance-action:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(43, 58, 93, 0.12);
+}
+
+.memory-node-governance-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.54;
+}
+
+.memory-node-governance-action--positive {
+  border-color: rgba(31, 154, 104, 0.28);
+  color: #14754f;
+}
+
+.memory-node-governance-action--warning {
+  border-color: rgba(194, 132, 26, 0.34);
+  color: #8a5b09;
+}
+
+.memory-node-governance-action--danger {
+  border-color: rgba(206, 57, 76, 0.32);
+  color: #a72339;
+}
+
+.memory-node-governance-action--active {
+  background: rgba(47, 101, 255, 0.1);
+  border-color: rgba(47, 101, 255, 0.36);
+  color: #2549b4;
+}
+
+.memory-node-salience-control {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+  color: rgba(25, 37, 58, 0.72);
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
+.memory-node-salience-control input {
+  width: 100%;
+  accent-color: #4f6fff;
+}
+
+.memory-node-governance-message {
+  margin: 10px 0 0;
+}
+
+.memory-node-content-details {
+  margin: 10px 0;
+  border-radius: 12px;
+  background: rgba(244, 247, 252, 0.82);
+  border: 1px solid rgba(75, 92, 124, 0.12);
+  padding: 8px 10px;
+}
+
+.memory-node-content-details summary {
+  cursor: pointer;
+  color: #263852;
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.memory-node-content-details p {
+  margin: 8px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: rgba(27, 39, 61, 0.72);
+  font-size: 0.72rem;
+}
+
+.memory-merge-overlay {
+  position: absolute;
+  top: 86px;
+  right: 24px;
+  z-index: 45;
+  width: min(520px, calc(100% - 48px));
+  max-height: min(620px, calc(100% - 128px));
+  overflow: auto;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 24px 80px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(16px);
+  padding: 14px;
+  color: #172033;
+}
+
+.memory-merge-overlay-header,
+.memory-merge-overlay-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.memory-merge-overlay-header strong {
+  display: block;
+  font-size: 0.92rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memory-merge-overlay-header span,
+.memory-merge-overlay-actions span {
+  display: block;
+  color: rgba(15, 23, 42, 0.62);
+  font-size: 0.78rem;
+}
+
+.memory-merge-overlay button {
+  border: 1px solid rgba(15, 23, 42, 0.16);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #172033;
+  cursor: pointer;
+  font-size: 0.76rem;
+  font-weight: 700;
+  padding: 7px 10px;
+}
+
+.memory-merge-overlay button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.memory-merge-candidate-list {
+  display: grid;
+  gap: 10px;
+}
+
+.memory-merge-candidate {
+  display: grid;
+  grid-template-columns: 52px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 14px;
+  background: rgba(248, 250, 252, 0.88);
+  padding: 10px;
+}
+
+.memory-merge-candidate-score {
+  display: grid;
+  place-items: center;
+  min-width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: #eef4ff;
+  color: #2055b8;
+  font-size: 0.76rem;
+  font-weight: 800;
+}
+
+.memory-merge-candidate-body {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.memory-merge-candidate-body strong,
+.memory-merge-candidate-body span,
+.memory-merge-candidate-body small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memory-merge-candidate-body strong {
+  color: #111827;
+  font-size: 0.86rem;
+}
+
+.memory-merge-candidate-body span {
+  color: #334155;
+  font-size: 0.78rem;
+}
+
+.memory-merge-candidate-body small {
+  color: rgba(15, 23, 42, 0.58);
+  font-size: 0.72rem;
+}
+
+/* AstraOS v0.5.44 — Memory Autopilot HUD simplification */
+.memory-graph-hud--autopilot {
+  max-width: min(760px, calc(100vw - 172px)) !important;
+}
+
+.memory-graph-hud-title small {
+  display: block;
+  max-width: 280px;
+  margin-top: 3px;
+  color: rgba(67, 86, 132, 0.72);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.memory-graph-icon-button--primary {
+  border-color: rgba(55, 108, 255, 0.36) !important;
+  background: linear-gradient(135deg, rgba(62, 118, 255, 0.98), rgba(91, 229, 178, 0.92)) !important;
+  color: #ffffff !important;
+  box-shadow: 0 12px 30px rgba(68, 118, 255, 0.24) !important;
+}
+
+.memory-graph-toolbar-mini-label {
+  margin-left: 3px;
+  font-size: 8px;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+}
+
+@media (max-width: 760px) {
+  .memory-graph-hud-title small {
+    max-width: 160px;
+  }
+}
+
+/* AstraOS v0.5.45 — Memory Autopilot Review Queue */
+.memory-graph-review-button {
+  position: relative;
+}
+
+.memory-graph-review-badge {
+  position: absolute;
+  top: -5px;
+  right: -4px;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 4px;
+  border: 1px solid rgba(255, 255, 255, 0.88);
+  border-radius: 999px;
+  background: #f97316;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 900;
+  line-height: 1;
+  box-shadow: 0 6px 14px rgba(249, 115, 22, 0.28);
+}
+
+.memory-autopilot-review-overlay {
+  width: min(620px, calc(100% - 48px));
+}
+
+.memory-review-section {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.memory-review-section + .memory-review-section {
+  padding-top: 14px;
+  border-top: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+.memory-review-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.memory-review-section-title strong {
+  color: #172033;
+  font-size: 0.82rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memory-review-section-title span {
+  min-width: 26px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(42, 92, 204, 0.09);
+  color: #244f9d;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.memory-quality-repair-plan {
+  gap: 0.55rem;
+}
+
+.memory-quality-repair-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0.3rem 0 0.4rem;
+}
+
+.memory-quality-repair-summary strong,
+.memory-quality-repair-summary small {
+  display: block;
+  text-align: center;
+}
+
+.memory-quality-repair-summary strong {
+  padding: 0.45rem 0.5rem 0 0.5rem;
+  border: 1px solid rgba(121, 143, 186, 0.22);
+  border-bottom: 0;
+  border-radius: 0.85rem 0.85rem 0 0;
+  background: rgba(255, 255, 255, 0.72);
+  color: #183064;
+  font-size: 0.92rem;
+}
+
+.memory-quality-repair-summary small {
+  padding: 0 0.5rem 0.45rem 0.5rem;
+  border: 1px solid rgba(121, 143, 186, 0.22);
+  border-top: 0;
+  border-radius: 0 0 0.85rem 0.85rem;
+  background: rgba(255, 255, 255, 0.72);
+  color: #647293;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memory-quality-repair-actions {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.memory-quality-repair-action {
+  border: 1px solid rgba(120, 146, 205, 0.22);
+  border-radius: 0.9rem;
+  padding: 0.62rem 0.68rem;
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 10px 22px rgba(57, 79, 125, 0.07);
+}
+
+.memory-quality-repair-action div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.65rem;
+  align-items: baseline;
+}
+
+.memory-quality-repair-action strong {
+  color: #1a2b5c;
+  font-size: 0.78rem;
+}
+
+.memory-quality-repair-action span {
+  color: #607196;
+  font-size: 0.66rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.memory-quality-repair-action p {
+  margin: 0.32rem 0 0;
+  color: #53627f;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.memory-quality-repair-action--high,
+.memory-quality-repair-action--critical {
+  border-color: rgba(65, 112, 214, 0.34);
+  background: linear-gradient(135deg, rgba(232, 240, 255, 0.94), rgba(255, 255, 255, 0.78));
+}
+
+/* AstraOS v0.5.55 — Governed Memory/RAG Control Center */
+.memory-rag-control-center {
+  gap: 0.75rem;
+  border-color: rgba(54, 99, 255, 0.18) !important;
+  background:
+    radial-gradient(circle at top left, rgba(79, 124, 255, 0.12), transparent 34%),
+    rgba(255, 255, 255, 0.9) !important;
+}
+
+.memory-rag-control-center__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.memory-rag-control-center__header h4 {
+  margin: 0;
+}
+
+.memory-rag-control-center__header p,
+.memory-rag-control-center__status,
+.memory-rag-planned-actions p,
+.memory-rag-active-jobs p {
+  margin: 0.25rem 0 0;
+  color: rgba(31, 43, 74, 0.68);
+  font-size: 0.76rem;
+  line-height: 1.35;
+}
+
+.memory-rag-status-pill {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid rgba(74, 102, 166, 0.18);
+  border-radius: 999px;
+  background: rgba(246, 248, 255, 0.9);
+  color: #24416f;
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.memory-rag-status-pill--closeout_ready,
+.memory-rag-status-pill--enterprise_ready,
+.memory-rag-status-pill--healthy {
+  border-color: rgba(16, 185, 129, 0.26);
+  background: rgba(209, 250, 229, 0.78);
+  color: #047857;
+}
+
+.memory-rag-status-pill--needs_maintenance,
+.memory-rag-status-pill--ready_with_warnings,
+.memory-rag-status-pill--backpressured {
+  border-color: rgba(245, 158, 11, 0.28);
+  background: rgba(254, 243, 199, 0.82);
+  color: #92400e;
+}
+
+.memory-rag-status-pill--blocked,
+.memory-rag-status-pill--saturated,
+.memory-rag-status-pill--degraded {
+  border-color: rgba(239, 68, 68, 0.28);
+  background: rgba(254, 226, 226, 0.82);
+  color: #b91c1c;
+}
+
+.memory-rag-control-center__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.memory-rag-metric {
+  padding: 0.55rem 0.5rem;
+  border: 1px solid rgba(121, 143, 186, 0.18);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.72);
+  text-align: center;
+}
+
+.memory-rag-metric strong,
+.memory-rag-metric span {
+  display: block;
+}
+
+.memory-rag-metric strong {
+  color: #17366f;
+  font-size: 0.88rem;
+  font-weight: 950;
+}
+
+.memory-rag-metric span {
+  margin-top: 0.18rem;
+  color: rgba(31, 43, 74, 0.56);
+  font-size: 0.62rem;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.memory-rag-control-center__actions {
+  display: grid;
+  grid-template-columns: 1.4fr 0.8fr 0.9fr;
+  gap: 0.45rem;
+}
+
+.memory-rag-control-center__actions button {
+  min-height: 2.15rem;
+  border: 1px solid rgba(74, 102, 166, 0.18);
+  border-radius: 0.8rem;
+  background: rgba(255, 255, 255, 0.84);
+  color: #183064;
+  font-size: 0.72rem;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.memory-rag-control-center__actions button:first-child {
+  border-color: rgba(55, 108, 255, 0.28);
+  background: linear-gradient(135deg, rgba(62, 118, 255, 0.94), rgba(91, 229, 178, 0.86));
+  color: #fff;
+}
+
+.memory-rag-control-center__actions button:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+}
+
+.memory-rag-control-center__alerts,
+.memory-rag-gate-grid,
+.memory-rag-planned-actions,
+.memory-rag-active-jobs {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.memory-rag-alert,
+.memory-rag-gate,
+.memory-rag-planned-actions,
+.memory-rag-active-jobs {
+  padding: 0.55rem 0.65rem;
+  border: 1px solid rgba(121, 143, 186, 0.18);
+  border-radius: 0.85rem;
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.memory-rag-alert strong,
+.memory-rag-alert span,
+.memory-rag-gate strong,
+.memory-rag-gate span,
+.memory-rag-gate small,
+.memory-rag-planned-actions strong,
+.memory-rag-active-jobs strong {
+  display: block;
+}
+
+.memory-rag-alert strong,
+.memory-rag-gate strong,
+.memory-rag-planned-actions strong,
+.memory-rag-active-jobs strong {
+  color: #172033;
+  font-size: 0.74rem;
+  font-weight: 950;
+}
+
+.memory-rag-alert span,
+.memory-rag-gate small {
+  margin-top: 0.2rem;
+  color: rgba(31, 43, 74, 0.62);
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.memory-rag-gate-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.memory-rag-gate span {
+  width: fit-content;
+  margin-top: 0.25rem;
+  padding: 0.15rem 0.42rem;
+  border-radius: 999px;
+  background: rgba(42, 92, 204, 0.08);
+  color: #244f9d;
+  font-size: 0.62rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.memory-rag-alert--block,
+.memory-rag-gate--block {
+  border-color: rgba(239, 68, 68, 0.24);
+  background: rgba(254, 226, 226, 0.55);
+}
+
+.memory-rag-alert--warn,
+.memory-rag-gate--warn {
+  border-color: rgba(245, 158, 11, 0.24);
+  background: rgba(254, 243, 199, 0.55);
+}
+
+@media (max-width: 880px) {
+  .memory-rag-control-center__metrics,
+  .memory-rag-gate-grid,
+  .memory-rag-control-center__actions {
+    grid-template-columns: 1fr;
+  }
+}

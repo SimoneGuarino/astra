@@ -6,6 +6,7 @@ import { AssistantChat } from "./components/AssistantChat";
 import { AssistantHeader } from "./components/AssistantHeader";
 import { AssistantInputBar } from "./components/AssistantInputBar";
 import { DesktopAgentPanel, type DesktopAgentPanelViewKey } from "./components/DesktopAgentPanel";
+import { MemoryGraphPanel } from "./features/memory";
 import { WorkSessionStatusStrip } from "./components/WorkSessionStatusStrip";
 import AstraOrb from "./components/AstraOrb";
 import { useAssistantSession } from "./hooks/useAssistantSession";
@@ -20,6 +21,7 @@ type IntroPhase = "logo" | "splitText" | "main";
 function App() {
     const session = useAssistantSession();
     const [isDesktopPanelOpen, setIsDesktopPanelOpen] = useState(false);
+    const [isMemoryGraphOpen, setIsMemoryGraphOpen] = useState(false);
     const [desktopPanelInitialView, setDesktopPanelInitialView] =
         useState<DesktopAgentPanelViewKey>("overview");
 
@@ -199,11 +201,16 @@ function App() {
                         activeModel={session.activeModel}
                         isPinned={windowControls.isPinned}
                         isDesktopPanelOpen={isDesktopPanelOpen}
+                        isMemoryGraphOpen={isMemoryGraphOpen}
                         onClose={windowControls.close}
                         onMinimize={windowControls.minimize}
                         onToggleDesktopPanel={() => {
                             setDesktopPanelInitialView("overview");
                             setIsDesktopPanelOpen((current) => !current);
+                        }}
+                        onToggleMemoryGraph={() => {
+                            setIsMemoryGraphOpen((current) => !current);
+                            setIsDesktopPanelOpen(false);
                         }}
                         onTogglePin={windowControls.togglePin}
                         startDrag={windowControls.startDrag}
@@ -260,47 +267,55 @@ function App() {
                     </div>
                 )}
 
-                <div
-                    ref={orbWrapRef}
-                    style={{
-                        width: "100%",
-                        height: "300px",
-                        position: "relative",
-                    }}
-                >
-                    <section
-                        className="orb-stage relative"
-                        style={{ width: "100%", height: "300px", position: "relative" }}
-                    >
-                        <AstraOrb
-                            status={session.status}
-                            hoverIntensity={0.1}
-                            rotateOnHover
-                            forceHoverState={false}
-                            backgroundColor="#ffffff"
-                        />
+                {isMemoryGraphOpen ? (
+                    <section className="astra-memory-stage" aria-label="Astra cognitive memory vault">
+                        <MemoryGraphPanel mode="immersive" onClose={() => setIsMemoryGraphOpen(false)} />
                     </section>
-                </div>
+                ) : (
+                    <>
+                        <div
+                            ref={orbWrapRef}
+                            style={{
+                                width: "100%",
+                                height: "300px",
+                                position: "relative",
+                            }}
+                        >
+                            <section
+                                className="orb-stage relative"
+                                style={{ width: "100%", height: "300px", position: "relative" }}
+                            >
+                                <AstraOrb
+                                    status={session.status}
+                                    hoverIntensity={0.1}
+                                    rotateOnHover
+                                    forceHoverState={false}
+                                    backgroundColor="#ffffff"
+                                />
+                            </section>
+                        </div>
 
-                <div ref={chatWrapRef} className="h-full chat-area overflow-auto" style={{ flex: 1, minHeight: 0 }}>
-                    <AssistantChat messages={session.messages} chatRef={chatWrapRef} />
-                </div>
+                        <div ref={chatWrapRef} className="h-full chat-area overflow-auto" style={{ flex: 1, minHeight: 0 }}>
+                            <AssistantChat messages={session.messages} chatRef={chatWrapRef} />
+                        </div>
 
-                <WorkSessionStatusStrip onOpenDetails={() => openDesktopPanel("meeting")} />
+                        <WorkSessionStatusStrip onOpenDetails={() => openDesktopPanel("meeting")} />
 
-                <div ref={inputWrapRef}>
-                    <AssistantInputBar
-                        autoSubmitVoice={session.autoSubmitVoice}
-                        inputValue={session.inputValue}
-                        isLoading={session.isLoading}
-                        lastVoiceTranscript={session.lastVoiceTranscript}
-                        onSubmit={() => session.submitMessage()}
-                        setAutoSubmitVoice={session.setAutoSubmitVoice}
-                        setInputValue={session.setInputValue}
-                        voiceInput={session.voiceInput}
-                        voiceSession={session.voiceSession}
-                    />
-                </div>
+                        <div ref={inputWrapRef}>
+                            <AssistantInputBar
+                                autoSubmitVoice={session.autoSubmitVoice}
+                                inputValue={session.inputValue}
+                                isLoading={session.isLoading}
+                                lastVoiceTranscript={session.lastVoiceTranscript}
+                                onSubmit={() => session.submitMessage()}
+                                setAutoSubmitVoice={session.setAutoSubmitVoice}
+                                setInputValue={session.setInputValue}
+                                voiceInput={session.voiceInput}
+                                voiceSession={session.voiceSession}
+                            />
+                        </div>
+                    </>
+                )}
 
                 <DesktopAgentPanel
                     initialView={desktopPanelInitialView}
