@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDesktopAgent } from "../hooks/useDesktopAgent";
 import { MeetingDebugPanel } from "./MeetingDebugPanel";
+import { ThinkingGovernancePanel } from "./ThinkingGovernancePanel";
 import type {
     CapabilityManifest,
     DesktopAuditEvent,
@@ -12,6 +13,7 @@ import type {
     ScreenObservationStatus,
     ToolDescriptor,
 } from "../types/desktopAgent";
+import type { AssistantThinkingTraceState } from "../types/assistant";
 import { Button } from "../ui/buttons/Button";
 import Switch from "../ui/input/Switch";
 
@@ -26,11 +28,12 @@ type DesktopAgentPanelProps = {
     isOpen: boolean;
     onClose: () => void;
     initialView?: DesktopAgentPanelViewKey;
+    thinkingTrace?: AssistantThinkingTraceState | null;
 };
 
-export type DesktopAgentPanelViewKey = "overview" | "approvals" | "audit" | "screen" | "meeting";
+export type DesktopAgentPanelViewKey = "overview" | "thinking" | "approvals" | "audit" | "screen" | "meeting";
 
-export function DesktopAgentPanel({ isOpen, onClose, initialView = "overview" }: DesktopAgentPanelProps) {
+export function DesktopAgentPanel({ isOpen, onClose, initialView = "overview", thinkingTrace = null }: DesktopAgentPanelProps) {
     const agent = useDesktopAgent();
     const [view, setView] = useState<DesktopAgentPanelViewKey>(initialView);
     const [tools, setTools] = useState<ToolDescriptor[]>([]);
@@ -205,7 +208,7 @@ export function DesktopAgentPanel({ isOpen, onClose, initialView = "overview" }:
             </div>
 
             <div className="desktop-agent-tabs">
-                {(["overview", "screen", "meeting", "approvals", "audit"] as DesktopAgentPanelViewKey[]).map((key) => (
+                {(["overview", "thinking", "screen", "meeting", "approvals", "audit"] as DesktopAgentPanelViewKey[]).map((key) => (
                     <button
                         key={key}
                         className={`desktop-agent-tab ${view === key ? "active" : ""}`}
@@ -337,6 +340,11 @@ export function DesktopAgentPanel({ isOpen, onClose, initialView = "overview" }:
                         </div>
                     </section>
                 </div>
+            ) : null}
+
+
+            {view === "thinking" ? (
+                <ThinkingGovernancePanel trace={thinkingTrace} />
             ) : null}
 
 

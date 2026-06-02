@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState, type ReactNode } from "react";
-import type { AssistantActivityState, ChatMessage } from "../types/assistant";
+import type { ChatMessage } from "../types/assistant";
+import { AssistantThinkingTrace } from "./AssistantThinkingTrace";
 
 type AssistantChatProps = {
     messages: ChatMessage[];
@@ -21,7 +22,7 @@ export function AssistantChat({ messages, chatRef }: AssistantChatProps) {
                     {message.content ? (
                         <MessageContent content={message.content} />
                     ) : message.role === "assistant" ? (
-                        <AssistantActivityPreview
+                        <AssistantThinkingTrace
                             activity={message.activity}
                             isExpanded={expandedActivityMessageId === message.id}
                             onToggleExpanded={() =>
@@ -36,54 +37,6 @@ export function AssistantChat({ messages, chatRef }: AssistantChatProps) {
                 </div>
             ))}
         </>
-    );
-}
-
-function AssistantActivityPreview({
-    activity,
-    isExpanded,
-    onToggleExpanded,
-}: {
-    activity?: AssistantActivityState | null;
-    isExpanded: boolean;
-    onToggleExpanded: () => void;
-}) {
-    const current = activity?.current;
-    const steps = activity?.steps ?? [];
-
-    return (
-        <div className="assistant-thinking-card">
-            <div className="assistant-thinking-pulse" aria-hidden="true" />
-            <div className="assistant-thinking-main">
-                <div className="assistant-thinking-eyebrow">Astra sta lavorando</div>
-                <div className="assistant-thinking-title">
-                    {current?.title ?? "Preparazione risposta"}
-                </div>
-                <div className="assistant-thinking-detail">
-                    {current?.detail ?? "Sto preparando contesto, memoria e risposta governata."}
-                </div>
-                {steps.length > 0 ? (
-                    <button type="button" className="assistant-thinking-expand" onClick={onToggleExpanded}>
-                        {isExpanded ? "Nascondi dettagli" : `Espandi passaggi (${steps.length})`}
-                    </button>
-                ) : null}
-                {isExpanded ? (
-                    <div className="assistant-thinking-details-panel">
-                        {steps.map((step, index) => (
-                            <div className="assistant-thinking-step" key={step.id}>
-                                <span className="assistant-thinking-step-index">{index + 1}</span>
-                                <div>
-                                    <div className="assistant-thinking-step-title">{step.title}</div>
-                                    {step.detail ? (
-                                        <div className="assistant-thinking-step-detail">{step.detail}</div>
-                                    ) : null}
-                                </div>
-                            </div>
-                        ))}
-                    </div>
-                ) : null}
-            </div>
-        </div>
     );
 }
 

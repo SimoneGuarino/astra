@@ -19,7 +19,60 @@ export type AssistantActivityStep = {
 export type AssistantActivityState = {
     current?: AssistantActivityStep | null;
     steps: AssistantActivityStep[];
+    thinkingTrace?: AssistantThinkingTraceState | null;
     expanded?: boolean;
+};
+
+export type AssistantThinkingTraceStep = {
+    phase: string;
+    title: string;
+    detail?: string | null;
+    confidence?: number | null;
+};
+
+export type AssistantThinkingTraceState = {
+    request_id?: string | null;
+    intent_summary?: string | null;
+    route?: string | null;
+    confidence?: number | null;
+    planner_source?: string | null;
+    duration_ms?: number | null;
+    steps: AssistantThinkingTraceStep[];
+    warnings?: string[];
+    metadata?: Record<string, unknown> | null;
+};
+
+export type AssistantThinkingQualityFinding = {
+    severity: "info" | "warning" | "critical" | string;
+    code: string;
+    message: string;
+    recommendation: string;
+};
+
+export type AssistantThinkingQualityState = {
+    score?: number | null;
+    grade?: "excellent" | "good" | "needs_review" | "risky" | string | null;
+    status?: "pass" | "observe" | "review" | string | null;
+    route_consistency?: number | null;
+    evidence_alignment?: number | null;
+    memory_alignment?: number | null;
+    tool_safety_alignment?: number | null;
+    deep_search_alignment?: number | null;
+    uncertainty_alignment?: number | null;
+    findings?: AssistantThinkingQualityFinding[];
+    safeguards?: string[];
+    metadata_only?: boolean;
+    raw_chain_of_thought_included?: boolean;
+};
+
+export type AssistantThinkingMemoryFeedbackState = {
+    enabled?: boolean | null;
+    planned?: boolean | null;
+    review_required?: boolean | null;
+    auto_promote?: boolean | null;
+    raw_chain_of_thought_included?: boolean | null;
+    min_score?: number | null;
+    metadata_only?: boolean | null;
 };
 
 export type ChatMessage = {
@@ -31,6 +84,7 @@ export type ChatMessage = {
 
 export type AssistantDeepSearchOptions = {
     enabled: boolean;
+    auto_when_needed?: boolean;
     seed_urls?: string[];
     enable_web_discovery?: boolean | null;
     search_providers?: string[];
@@ -72,6 +126,25 @@ export type AssistantActivityEvent = {
     detail?: string | null;
     timestamp_ms?: number | null;
     metadata?: Record<string, unknown> | null;
+};
+
+export type AssistantThinkingTraceEvent = {
+    request_id: string;
+    intent_summary?: string | null;
+    route?: string | null;
+    deep_search?: Record<string, unknown> | null;
+    tool_decision?: Record<string, unknown> | null;
+    memory_feedback?: AssistantThinkingMemoryFeedbackState | Record<string, unknown> | null;
+    thinking_quality?: AssistantThinkingQualityState | Record<string, unknown> | null;
+    memory_assessment?: Record<string, unknown> | null;
+    evidence_assessment?: Record<string, unknown> | null;
+    uncertainty?: Record<string, unknown> | null;
+    confidence?: number | null;
+    planner_source?: string | null;
+    duration_ms?: number | null;
+    steps?: AssistantThinkingTraceStep[];
+    warnings?: string[];
+    metadata_only?: boolean;
 };
 
 export type AssistantDeepSearchActivityEvent = {

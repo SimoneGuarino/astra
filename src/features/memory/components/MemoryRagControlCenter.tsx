@@ -33,6 +33,7 @@ type MemoryRagControlCenterProps = {
   onDryRun: () => void;
   onRunRecommended: () => void;
   onRunKnowledgeRefresh?: () => void;
+  onBuildKnowledgePacks?: () => void;
 };
 
 export function MemoryRagControlCenter({
@@ -46,6 +47,7 @@ export function MemoryRagControlCenter({
   onDryRun,
   onRunRecommended,
   onRunKnowledgeRefresh,
+  onBuildKnowledgePacks,
 }: MemoryRagControlCenterProps) {
   const closeoutStatus = closeout?.status ?? "unknown";
   const qualityPercent = typeof closeout?.summary?.quality_score_percent === "number"
@@ -93,6 +95,11 @@ export function MemoryRagControlCenter({
         {onRunKnowledgeRefresh ? (
           <button type="button" onClick={onRunKnowledgeRefresh} disabled={isBusy} title="Detect stale/temporal memory and run bounded deep-search refresh without manual claim review">
             Refresh stale knowledge
+          </button>
+        ) : null}
+        {onBuildKnowledgePacks ? (
+          <button type="button" onClick={onBuildKnowledgePacks} disabled={isBusy} title="Build bounded local domain-brain knowledge packs from the current Memory Graph">
+            Build domain brain
           </button>
         ) : null}
       </div>

@@ -20,6 +20,8 @@ pub struct AssistantDeepSearchOptions {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub auto_when_needed: bool,
+    #[serde(default)]
     pub seed_urls: Vec<String>,
     #[serde(default)]
     pub enable_web_discovery: Option<bool>,
@@ -89,6 +91,7 @@ impl Default for AssistantDeepSearchOptions {
     fn default() -> Self {
         Self {
             enabled: false,
+            auto_when_needed: true,
             seed_urls: Vec::new(),
             enable_web_discovery: Some(true),
             search_providers: Vec::new(),

@@ -21,6 +21,8 @@ import type {
     AssistantStatus,
     AssistantDeepSearchOptions,
     AssistantToolSynthesisDiagnostic,
+    AssistantThinkingTraceEvent,
+    AssistantThinkingTraceState,
     ChatMessage,
     RequestMetricsSnapshot,
     SpeechSegmentQueuedEvent,
@@ -45,6 +47,59 @@ const EMPTY_RESPONSE_FALLBACK =
 
 const DEEP_SEARCH_STORAGE_KEY = "astra.assistant.deepSearch.enabled";
 
+const MAX_THINKING_TRACE_STEPS = 12;
+const MAX_THINKING_TRACE_TEXT = 260;
+const FORBIDDEN_THINKING_MARKERS = [
+    "chain-of-thought",
+    "chain of thought",
+    "hidden reasoning",
+    "private reasoning",
+    "scratchpad",
+    "internal monologue",
+    "step-by-step reasoning",
+    "raw reasoning",
+    "ragionamento nascosto",
+    "pensiero nascosto",
+    "monologo interno",
+    "traccia privata",
+];
+
+function sanitizeThinkingTraceText(value: string | null | undefined, fallback: string): string {
+    const normalized = String(value ?? "").replace(/\0/g, " ").trim();
+    if (!normalized) return fallback;
+    const lower = normalized.toLowerCase();
+    if (FORBIDDEN_THINKING_MARKERS.some((marker) => lower.includes(marker))) {
+        return "Traccia sintetica governata disponibile; ragionamento interno non esposto.";
+    }
+    return normalized.length > MAX_THINKING_TRACE_TEXT
+        ? `${normalized.slice(0, MAX_THINKING_TRACE_TEXT - 1)}…`
+        : normalized;
+}
+
+function sanitizeThinkingPhase(value: string | null | undefined): string {
+    const normalized = String(value ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_+|_+$/g, "");
+
+    if (!normalized) return "thinking";
+    if (normalized.includes("intent")) return "intent";
+    if (normalized.includes("memory") || normalized.includes("rag")) return "memory";
+    if (normalized.includes("evidence") || normalized.includes("source")) return "evidence";
+    if (normalized.includes("tool")) return "tool_arbitration";
+    if (normalized.includes("routing") || normalized.includes("route")) return "routing";
+    if (normalized.includes("deep_search") || normalized.includes("research")) return "deep_search_decision";
+    if (normalized.includes("safety") || normalized.includes("policy")) return "safety";
+    if (normalized.includes("clarify")) return "clarify_required";
+    if (normalized.includes("quality")) return "quality";
+    if (normalized.includes("synthesis") || normalized.includes("answer") || normalized.includes("response")) {
+        return "synthesis";
+    }
+    if (normalized.includes("refuse")) return "refuse";
+    return "thinking";
+}
+
 export function useAssistantSession() {
     const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
     const [inputValue, setInputValue] = useState("");
@@ -60,6 +115,7 @@ export function useAssistantSession() {
         }
     });
     const [lastMetrics, setLastMetrics] = useState<RequestMetricsSnapshot | null>(null);
+    const [lastThinkingTrace, setLastThinkingTrace] = useState<AssistantThinkingTraceState | null>(null);
     const [lastVoiceMetrics, setLastVoiceMetrics] = useState<VoiceTurnMetricsSnapshot | null>(null);
     const [lastVoiceTranscript, setLastVoiceTranscript] =
         useState<VoiceSessionTranscriptEvent | null>(null);
@@ -263,6 +319,7 @@ export function useAssistantSession() {
             const deepSearchForTurn = options.deepSearch ?? deepSearchEnabled;
             const deepSearchPayload: AssistantDeepSearchOptions = {
                 enabled: deepSearchForTurn,
+                auto_when_needed: true,
                 enable_web_discovery: true,
                 include_general_web: true,
                 include_academic_sources: true,
@@ -313,10 +370,10 @@ export function useAssistantSession() {
                     current: {
                         id: `${clientRequestId}:queued`,
                         stage: deepSearchForTurn ? "deep_search_queued" : "queued",
-                        title: deepSearchForTurn ? "Preparing Deep Search" : "Preparing response",
+                        title: deepSearchForTurn ? "Preparo Deep Search" : "Avvio Thinking",
                         detail: deepSearchForTurn
-                            ? "Astra is preparing governed web and memory research."
-                            : "Astra is preparing the response pipeline.",
+                            ? "Astra sta preparando ricerca governata, memoria e sintesi."
+                            : "Astra sta preparando memoria, intent routing e traccia di ragionamento.",
                         timestamp_ms: Date.now(),
                         metadata: { local: true },
                     },
@@ -330,6 +387,7 @@ export function useAssistantSession() {
             bindRequestToAssistantMessage(clientRequestId, assistantMessageId);
 
             setMessages((prev) => [...prev, userMessage, assistantPlaceholder]);
+            setLastThinkingTrace(null);
             setInputValue("");
             setIsLoading(true);
             setStatus("thinking");
@@ -455,6 +513,7 @@ export function useAssistantSession() {
 
             setActiveModel(model);
             if (!alreadyFinished) {
+                setLastThinkingTrace(null);
                 setIsLoading(true);
                 setStatus("thinking");
             }
@@ -670,6 +729,89 @@ export function useAssistantSession() {
         [appendAssistantActivity]
     );
 
+
+    const handleThinkingTrace = useCallback(
+        (event: AssistantThinkingTraceEvent) => {
+            const assistantId =
+                assistantMessageByRequestRef.current.get(event.request_id) ??
+                (activeRequestIdRef.current === event.request_id ? activeAssistantMessageId.current : null);
+
+            const normalizedSteps = (event.steps ?? [])
+                .filter((step) => step?.title?.trim())
+                .slice(0, MAX_THINKING_TRACE_STEPS)
+                .map((step) => ({
+                    phase: sanitizeThinkingPhase(step.phase),
+                    title: sanitizeThinkingTraceText(step.title, "Thinking step"),
+                    detail: step.detail
+                        ? sanitizeThinkingTraceText(step.detail, "Dettaglio Thinking non disponibile.")
+                        : null,
+                    confidence: typeof step.confidence === "number"
+                        ? Math.max(0, Math.min(1, step.confidence))
+                        : null,
+                }));
+
+            const nextTraceState: AssistantThinkingTraceState = {
+                request_id: event.request_id,
+                intent_summary: event.intent_summary
+                    ? sanitizeThinkingTraceText(event.intent_summary, "Intent summary non disponibile.")
+                    : null,
+                route: event.route ?? null,
+                confidence: event.confidence ?? null,
+                planner_source: event.planner_source ?? null,
+                duration_ms: event.duration_ms ?? null,
+                steps: normalizedSteps,
+                warnings: (event.warnings ?? [])
+                    .slice(0, 8)
+                    .map((warning) => sanitizeThinkingTraceText(warning, "Thinking warning non disponibile.")),
+                metadata: {
+                    deep_search: event.deep_search ?? null,
+                    tool_decision: event.tool_decision ?? null,
+                    memory_feedback: event.memory_feedback ?? null,
+                    thinking_quality: event.thinking_quality ?? null,
+                    memory_assessment: event.memory_assessment ?? null,
+                    evidence_assessment: event.evidence_assessment ?? null,
+                    uncertainty: event.uncertainty ?? null,
+                    metadata_only: true,
+                },
+            };
+            setLastThinkingTrace(nextTraceState);
+            if (!assistantId) return;
+
+            setMessages((prev) =>
+                prev.map((msg) => {
+                    if (msg.id !== assistantId) return msg;
+                    const currentStep = normalizedSteps[normalizedSteps.length - 1];
+                    const currentActivity = currentStep
+                        ? {
+                              id: `${event.request_id}:thinking:${currentStep.phase}:${Date.now()}`,
+                              stage: `thinking_${currentStep.phase}`,
+                              title: currentStep.title,
+                              detail: currentStep.detail,
+                              timestamp_ms: Date.now(),
+                              metadata: {
+                                  route: event.route ?? null,
+                                  confidence: event.confidence ?? null,
+                                  planner_source: event.planner_source ?? null,
+                                  quality_score: (event.thinking_quality as { score?: unknown } | null)?.score ?? null,
+                                  metadata_only: true,
+                              },
+                          }
+                        : msg.activity?.current ?? null;
+                    return {
+                        ...msg,
+                        activity: {
+                            current: currentActivity,
+                            steps: msg.activity?.steps ?? [],
+                            thinkingTrace: nextTraceState,
+                            expanded: msg.activity?.expanded ?? false,
+                        },
+                    };
+                })
+            );
+        },
+        []
+    );
+
     const handleDeepSearchActivity = useCallback(
         (event: AssistantDeepSearchActivityEvent) => {
             const detailParts = [
@@ -751,6 +893,7 @@ export function useAssistantSession() {
         onRequestSettled: handleRequestSettled,
         onAssistantError: handleAssistantError,
         onAssistantActivity: handleAssistantActivity,
+        onThinkingTrace: handleThinkingTrace,
         onDeepSearchActivity: handleDeepSearchActivity,
         onStatus: handleStatus,
         onModel: setActiveModel,
@@ -774,6 +917,7 @@ export function useAssistantSession() {
         lastMetrics,
         lastVoiceMetrics,
         lastVoiceTranscript,
+        lastThinkingTrace,
         messages,
         setAutoSubmitVoice,
         setDeepSearchEnabled,

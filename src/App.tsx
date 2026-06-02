@@ -322,6 +322,7 @@ function App() {
                 <DesktopAgentPanel
                     initialView={desktopPanelInitialView}
                     isOpen={isDesktopPanelOpen}
+                    thinkingTrace={session.lastThinkingTrace}
                     onClose={() => setIsDesktopPanelOpen(false)}
                 />
             </section>

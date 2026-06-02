@@ -12,6 +12,7 @@ import type {
     AssistantRouterDiagnostic,
     AssistantStatus,
     AssistantToolSynthesisDiagnostic,
+    AssistantThinkingTraceEvent,
     RequestMetricsSnapshot,
     SpeechSegmentQueuedEvent,
     StreamChunkEvent,
@@ -35,6 +36,7 @@ type UseAssistantEventsParams = {
     onRequestSettled?: (event: AssistantRequestSettledEvent) => void;
     onAssistantError: (event: AssistantErrorEvent) => void;
     onAssistantActivity?: (event: AssistantActivityEvent) => void;
+    onThinkingTrace?: (event: AssistantThinkingTraceEvent) => void;
     onDeepSearchActivity?: (event: AssistantDeepSearchActivityEvent) => void;
     onStatus: (status: AssistantStatus) => void;
     onModel: (model: string) => void;
@@ -59,6 +61,7 @@ export function useAssistantEvents({
     onRequestSettled,
     onAssistantError,
     onAssistantActivity,
+    onThinkingTrace,
     onDeepSearchActivity,
     onStatus,
     onModel,
@@ -130,6 +133,12 @@ export function useAssistantEvents({
                     "assistant-activity",
                     (event) => {
                         if (!disposed) onAssistantActivity?.(event.payload);
+                    }
+                );
+                const unlistenThinkingTrace = await listen<AssistantThinkingTraceEvent>(
+                    "assistant-thinking-trace",
+                    (event) => {
+                        if (!disposed) onThinkingTrace?.(event.payload);
                     }
                 );
                 const unlistenDeepSearch = await listen<AssistantDeepSearchActivityEvent>(
@@ -209,6 +218,7 @@ export function useAssistantEvents({
                     unlistenRequestSettled,
                     unlistenError,
                     unlistenActivity,
+                    unlistenThinkingTrace,
                     unlistenDeepSearch,
                     unlistenStatus,
                     unlistenModel,
@@ -234,6 +244,7 @@ export function useAssistantEvents({
     }, [
         onAssistantError,
         onAssistantActivity,
+        onThinkingTrace,
         onDeepSearchActivity,
         onAssistantInterrupted,
         onAudioFailed,

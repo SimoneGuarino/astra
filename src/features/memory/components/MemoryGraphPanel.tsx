@@ -408,34 +408,29 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
     try {
       setError(null);
       setIsLoading(true);
-      setMemoryAutopilotStatus("Copilot is cleaning, canonicalizing and auto-merging safe memory aliases…");
+      setMemoryAutopilotStatus("Autopilot running…");
       const receipt = await memory.runMemoryAutopilot({
-        reconsolidation_limit: 16,
-        embedding_limit: 96,
+        reconsolidation_limit: 12,
+        embedding_limit: 64,
         run_skill_extraction: true,
         run_candidate_discovery: true,
         force_embeddings: false,
         run_legacy_canonical_cleanup: true,
-        canonical_cleanup_scan_limit: 1800,
-        canonical_cleanup_group_limit: 48,
+        canonical_cleanup_scan_limit: 1200,
+        canonical_cleanup_group_limit: 24,
         canonical_cleanup_dry_run: false,
-        auto_apply_safe_review_proposals: true,
-        auto_apply_review_limit: 18,
-        duplicate_auto_apply_min_score: 0.9,
-        canonical_auto_apply_min_score: 0.88,
-        reason: "memory_graph_toolbar_cognitive_copilot",
+        reason: "memory_graph_toolbar_autopilot",
       });
       const autoActions = receipt.repair_plan?.automatic_action_count ?? 0;
       const reviewActions = receipt.repair_plan?.review_action_count ?? 0;
-      const duplicateAuto = receipt.auto_applied_duplicate_merges ?? 0;
-      const canonicalAuto = receipt.auto_applied_canonical_reviews ?? 0;
       const cleanupMerged = receipt.canonical_cleanup_merged_aliases ?? 0;
+      const cleanupCreated = receipt.canonical_cleanup_created ?? 0;
       setMemoryAutopilotStatus(
-        `Copilot: quality ${Math.round(receipt.quality_score * 100)}%, ${receipt.semantic_nodes_created} semantic, ${receipt.embeddings_indexed} vectors, ${cleanupMerged + duplicateAuto} aliases normalized, ${canonicalAuto} canonical reviews auto-applied`
+        `Autopilot: quality ${Math.round(receipt.quality_score * 100)}%, ${receipt.semantic_nodes_created} semantic, ${receipt.embeddings_indexed} vectors, ${cleanupCreated} canonical / ${cleanupMerged} aliases, ${autoActions} auto / ${reviewActions} review`
       );
       const reviewCount = receipt.duplicate_candidates + receipt.canonical_review_candidates;
       setSkillStatus(
-        `Copilot completed: ${receipt.skill_candidates} skills, ${cleanupMerged + duplicateAuto} duplicate/legacy aliases handled automatically, ${receipt.duplicate_candidates} duplicate and ${receipt.canonical_review_candidates} canonical proposals remain for manual review`
+        `Autopilot completed: ${receipt.skill_candidates} skills, ${receipt.duplicate_candidates} duplicate proposals, ${receipt.canonical_review_candidates} canonical proposals, ${receipt.canonical_cleanup_deprecated_aliases ?? 0} legacy aliases deprecated`
       );
       await refresh();
       if (reviewCount > 0) {
@@ -479,6 +474,38 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
       });
       setMemoryControlCenterStatus(
         `Knowledge refresh: ${receipt.stale_candidates} stale candidates, ${receipt.refresh_runs} refresh runs, ${receipt.claims_promoted} promoted claims`
+      );
+      await refresh();
+      await refreshMemoryControlCenter();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setMemoryControlCenterStatus(message);
+      setError(message);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [memory, refresh, refreshMemoryControlCenter]);
+
+  const handleBuildKnowledgePacks = useCallback(async () => {
+    try {
+      setError(null);
+      setIsLoading(true);
+      setMemoryControlCenterStatus("Building local domain-brain packs…");
+      const receipt = await memory.buildKnowledgePacks({
+        enabled: true,
+        dry_run: false,
+        snapshot_limit: 500,
+        max_packs: 12,
+        max_nodes_per_pack: 32,
+        min_nodes_per_pack: 3,
+        min_pack_score: 0.34,
+        persist_packs: true,
+        include_unverified: false,
+        include_low_confidence: true,
+        include_source_documents: false,
+      });
+      setMemoryControlCenterStatus(
+        `Domain brain: ${receipt.packs_built} packs built, ${receipt.packs_persisted} persisted, ${receipt.created_edge_ids.length} links`
       );
       await refresh();
       await refreshMemoryControlCenter();
@@ -735,7 +762,7 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
         reviewCount={duplicateCandidates.length + canonicalReviewCandidates.length}
         graphMode={viewSettings.mode}
         autopilotStatus={memoryAutopilotStatus}
-        onRunAutopilot={() => void handleRunMemoryAutopilot()}
+        onRunAutopilot={() => void handleRunRecommendedMaintenance()}
         onToggleGraphMode={() => setViewSettings((current) => ({ ...current, mode: current.mode === "local" ? "global" : "local" }))}
         onToggleControls={() => setControlsExpanded((value) => !value)}
         onToggleQuality={() => setQualityExpanded((value) => !value)}
@@ -772,14 +799,14 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
           <div className="memory-merge-overlay-header">
             <div>
               <strong>Brain Review Queue</strong>
-              <span>Copilot auto-applies high-confidence soft merges. Remaining proposals are lower-confidence review items; no nodes are hard-deleted.</span>
+              <span>Autopilot/LLM proposes duplicate and canonical-memory candidates. You govern the final merge.</span>
             </div>
             <button type="button" onClick={() => setReviewExpanded(false)}>Close</button>
           </div>
           <div className="memory-merge-overlay-actions">
             <button type="button" onClick={() => void loadMemoryReviewQueue(false)} disabled={isLoading}>Refresh proposals</button>
-            <button type="button" onClick={() => void handleRunMemoryAutopilot()} disabled={isLoading}>Run Copilot auto-cleanup</button>
-            <button type="button" onClick={() => void handleRunRecommendedMaintenance()} disabled={isLoading} title="Queue bounded background jobs without auto-applying review proposals">Queue maintenance only</button>
+            <button type="button" onClick={() => void handleRunRecommendedMaintenance()} disabled={isLoading}>Run recommended maintenance</button>
+            <button type="button" onClick={() => void handleRunMemoryAutopilot()} disabled={isLoading} title="Advanced direct autopilot fallback; recommended maintenance remains the default governed flow">Advanced autopilot</button>
             <span>{canonicalReviewStatus || mergeStatus || "No review run yet"}</span>
           </div>
           <div className="memory-review-section">
@@ -798,9 +825,8 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
                     <span>{candidate.candidate_nodes.length} node{candidate.candidate_nodes.length === 1 ? "" : "s"} → {candidate.target_node.title}</span>
                     <small>{candidate.rationale}</small>
                     <small>{candidate.reasons.slice(0, 4).join(", ")}{candidate.shared_tags?.length ? ` · tags: ${candidate.shared_tags.slice(0, 5).join(", ")}` : ""}</small>
-                    <small className="memory-merge-governance-note">Apply = soft merge into the canonical node, add SameTopicAs evidence links, and deprecate aliases. It does not hard-delete memory.</small>
                   </div>
-                  <button type="button" onClick={() => void handleApplyCanonicalReview(candidate)} disabled={isLoading}>Apply soft merge</button>
+                  <button type="button" onClick={() => void handleApplyCanonicalReview(candidate)} disabled={isLoading}>Approve</button>
                 </article>
               ))}
             </div>
@@ -820,9 +846,8 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
                     <strong>{candidate.duplicate_node.title}</strong>
                     <span>→ {candidate.canonical_node.title}</span>
                     <small>{candidate.reasons.join(", ")}{candidate.shared_tags?.length ? ` · tags: ${candidate.shared_tags.slice(0, 4).join(", ")}` : ""}</small>
-                    <small className="memory-merge-governance-note">Apply = keep canonical target, link this node as an alias, and mark the alias deprecated. Nothing is physically removed.</small>
                   </div>
-                  <button type="button" onClick={() => void handleMergeCandidate(candidate)} disabled={isLoading}>Apply soft merge</button>
+                  <button type="button" onClick={() => void handleMergeCandidate(candidate)} disabled={isLoading}>Approve</button>
                 </article>
               ))}
             </div>
@@ -890,6 +915,7 @@ export function MemoryGraphPanel({ mode = "embedded", onClose }: MemoryGraphPane
           onDryRun={() => void handlePlanRecommendedMaintenance()}
           onRunRecommended={() => void handleRunRecommendedMaintenance()}
           onRunKnowledgeRefresh={() => void handleRunKnowledgeRefresh()}
+          onBuildKnowledgePacks={() => void handleBuildKnowledgePacks()}
         />
         <MemoryEmbeddingSummary status={embeddingStatus} receipt={embeddingReceipt} maintenanceStatus={embeddingMaintenanceStatus} />
         <MemoryActivationSummary payload={activePayload} />
@@ -996,7 +1022,7 @@ function sanitizeMemoryGraphLayoutSettings(value: Partial<MemoryGraphLayoutSetti
   return {
     preset,
     labelMode,
-    labelSize: clampNumber(Number(value?.labelSize ?? base.labelSize), 0.42, 1.2),
+    labelSize: clampNumber(Number(value?.labelSize ?? base.labelSize), 0.72, 1.65),
     repulsion: clampNumber(Number(value?.repulsion ?? base.repulsion), 0.45, 1.75),
     linkDistance: clampNumber(Number(value?.linkDistance ?? base.linkDistance), 0.55, 1.65),
     centerForce: clampNumber(Number(value?.centerForce ?? base.centerForce), 0.35, 1.9),

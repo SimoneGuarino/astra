@@ -10,6 +10,9 @@ mod audit_log;
 mod browser_agent;
 mod capability_manifest;
 mod context_broker;
+mod cognitive_learning;
+mod cognitive_quality;
+mod cognitive_thinking;
 mod contextual_learning;
 mod conversation_history;
 mod conversation_orchestrator;
@@ -61,6 +64,9 @@ use assistant_tool_router::{
 use audio_files::AudioFileRegistry;
 use chrono::{DateTime, Utc};
 use conversation_history::{ConversationHistoryManager, ConversationMessage};
+use cognitive_quality::ThinkingQualityReport;
+use cognitive_thinking::{ThinkingPlan, ThinkingRoute};
+use cognitive_learning::ThinkingMemoryFeedbackReceipt;
 use conversation_orchestrator::{
     apply_orchestrator_policy, apply_policy_to_diagnostic, build_normal_chat_with_context_preamble,
     plan_with_active_model, render_context_answer, sanitize_tool_result_answer_summary,
@@ -573,6 +579,7 @@ struct AssistantRuntime {
     working_context: Arc<Mutex<WorkingContextFrame>>,
     pending_governed_action: Arc<Mutex<Option<PendingGovernedAction>>>,
     tts_segment_fingerprints: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    thinking_plans: Arc<Mutex<HashMap<String, ThinkingPlan>>>,
     meeting_runtime: MeetingRuntime,
     llm_trace_store: LlmTraceStore,
     memory_graph: MemoryGraphStore,
@@ -612,6 +619,7 @@ impl AssistantRuntime {
             working_context: Arc::new(Mutex::new(WorkingContextFrame::default())),
             pending_governed_action: Arc::new(Mutex::new(None)),
             tts_segment_fingerprints: Arc::new(Mutex::new(HashMap::new())),
+            thinking_plans: Arc::new(Mutex::new(HashMap::new())),
             llm_trace_store: LlmTraceStore::new(project_root.clone()),
             memory_graph: MemoryGraphStore::new(memory::MemoryConfig::new(project_root.clone())),
             memory_jobs: MemoryJobQueue::new_from_env(),
@@ -1040,6 +1048,12 @@ Assistant summary:
             assistant_answer.to_string(),
         );
         self.spawn_memory_reflection(
+            request_id.clone(),
+            source.to_string(),
+            user_message.to_string(),
+            assistant_answer.to_string(),
+        );
+        self.spawn_thinking_memory_feedback(
             request_id,
             source.to_string(),
             user_message.to_string(),
@@ -1061,11 +1075,148 @@ Assistant summary:
             assistant_answer.to_string(),
         );
         self.spawn_memory_reflection(
+            request_id.clone(),
+            source.to_string(),
+            user_message.to_string(),
+            assistant_answer.to_string(),
+        );
+        self.spawn_thinking_memory_feedback(
             request_id,
             source.to_string(),
             user_message.to_string(),
             assistant_answer.to_string(),
         );
+    }
+
+    fn remember_thinking_plan(&self, plan: &ThinkingPlan) {
+        let mut plans = self
+            .thinking_plans
+            .lock()
+            .expect("thinking_plans mutex poisoned");
+        if plans.len() >= 48 {
+            if let Some(first_key) = plans.keys().next().cloned() {
+                plans.remove(&first_key);
+            }
+        }
+        plans.insert(plan.request_id.clone(), plan.clone());
+    }
+
+    fn take_thinking_plan(&self, request_id: Option<&str>) -> Option<ThinkingPlan> {
+        let request_id = request_id?.trim();
+        if request_id.is_empty() {
+            return None;
+        }
+        self.thinking_plans
+            .lock()
+            .expect("thinking_plans mutex poisoned")
+            .remove(request_id)
+    }
+
+    fn spawn_thinking_memory_feedback(
+        &self,
+        request_id: Option<String>,
+        source: String,
+        user_message: String,
+        assistant_answer: String,
+    ) {
+        if !thinking_memory_feedback_enabled() {
+            return;
+        }
+        let Some(plan) = self.take_thinking_plan(request_id.as_deref()) else {
+            return;
+        };
+        if !should_consolidate_conversation_turn(&user_message, &assistant_answer) {
+            return;
+        }
+        let store = self.memory_graph.clone();
+        let request_id_for_job = request_id.clone();
+        let source_for_job = source.clone();
+        let dedup_key = request_id
+            .as_deref()
+            .map(|value| format!("thinking_memory_feedback:{value}"));
+        let job_metadata = serde_json::json!({
+            "source": source.clone(),
+            "request_id": request_id.clone(),
+            "thinking_route": thinking_route_label(&plan.route),
+            "thinking_confidence": plan.confidence,
+            "metadata_only": true,
+        });
+        let submit_result = self.memory_jobs.submit_with_metadata(
+            MemoryJobKind::Other("thinking_memory_feedback".into()),
+            dedup_key,
+            job_metadata,
+            async move {
+                let min_score = thinking_memory_feedback_min_score();
+                match cognitive_learning::build_thinking_memory_feedback_bundle(
+                    request_id_for_job.clone(),
+                    source_for_job,
+                    user_message,
+                    assistant_answer,
+                    plan,
+                    min_score,
+                ) {
+                    Ok((bundle, preflight)) => {
+                        let durable_candidate_count = preflight.durable_candidate_count;
+                        match memory::commands::consolidate_conversation_bundle(&store, bundle) {
+                            Ok(receipt) => {
+                                let feedback_receipt = ThinkingMemoryFeedbackReceipt {
+                                    accepted: receipt.accepted,
+                                    reason: "thinking_memory_feedback_consolidated_as_review_gated_candidates".into(),
+                                    request_id: request_id_for_job.clone(),
+                                    learning_score: preflight.learning_score,
+                                    durable_candidate_count,
+                                    review_required: true,
+                                    tags: preflight.tags.clone(),
+                                    metadata: serde_json::json!({
+                                        "created_nodes": receipt.created_node_ids.len(),
+                                        "created_edges": receipt.created_edge_ids.len(),
+                                        "turn_node_id": receipt.turn_node.id,
+                                        "auto_promote": false,
+                                        "requires_brain_review": true,
+                                        "metadata_only": true,
+                                    }),
+                                };
+                                emit_thinking_memory_feedback_log(&store, &feedback_receipt);
+                                let _ = memory::commands::run_embedding_maintenance(
+                                    &store,
+                                    MemoryEmbeddingMaintenanceRequest {
+                                        limit: Some(memory_embedding_auto_index_batch_size()),
+                                        force: false,
+                                        model: None,
+                                        reason: Some("thinking_memory_feedback".into()),
+                                    },
+                                );
+                            }
+                            Err(error) => {
+                                let rejected = ThinkingMemoryFeedbackReceipt {
+                                    accepted: false,
+                                    reason: format!("thinking_memory_feedback_consolidation_failed:{error}"),
+                                    request_id: request_id_for_job.clone(),
+                                    learning_score: preflight.learning_score,
+                                    durable_candidate_count,
+                                    review_required: true,
+                                    tags: preflight.tags.clone(),
+                                    metadata: serde_json::json!({"metadata_only": true}),
+                                };
+                                emit_thinking_memory_feedback_log(&store, &rejected);
+                            }
+                        }
+                    }
+                    Err(skipped) => emit_thinking_memory_feedback_log(&store, &skipped),
+                }
+            },
+        );
+        if let Err(error) = submit_result {
+            let _ = self.memory_graph.append_memory_note(
+                "thinking_memory_feedback_job_rejected",
+                serde_json::json!({
+                    "request_id": request_id,
+                    "source": source,
+                    "error": error.to_string(),
+                    "metadata_only": true,
+                }),
+            );
+        }
     }
 
     fn spawn_memory_reflection(
@@ -1452,6 +1603,46 @@ fn memory_reflection_enabled() -> bool {
         "0" | "false" | "off" | "no"
     )
 }
+
+fn thinking_memory_feedback_enabled() -> bool {
+    !matches!(
+        std::env::var("ASTRA_THINKING_MEMORY_FEEDBACK_ENABLED")
+            .unwrap_or_else(|_| "true".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+fn thinking_memory_feedback_min_score() -> f32 {
+    std::env::var("ASTRA_THINKING_MEMORY_FEEDBACK_MIN_SCORE")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(0.58)
+        .clamp(0.25, 0.95)
+}
+
+fn emit_thinking_memory_feedback_log(
+    store: &MemoryGraphStore,
+    receipt: &ThinkingMemoryFeedbackReceipt,
+) {
+    let _ = store.append_memory_note(
+        "thinking_memory_feedback",
+        serde_json::json!({
+            "accepted": receipt.accepted,
+            "reason": receipt.reason.clone(),
+            "request_id": receipt.request_id.clone(),
+            "learning_score": receipt.learning_score,
+            "durable_candidate_count": receipt.durable_candidate_count,
+            "review_required": receipt.review_required,
+            "tags": receipt.tags.clone(),
+            "metadata": receipt.metadata.clone(),
+            "metadata_only": true,
+        }),
+    );
+}
+
 
 async fn extract_conversation_memory_bundle_with_model(
     request_id: Option<String>,
@@ -2332,6 +2523,72 @@ fn emit_assistant_activity(
     );
 }
 
+fn emit_assistant_thinking_trace(
+    window: &WebviewWindow,
+    plan: &ThinkingPlan,
+    quality: &ThinkingQualityReport,
+) {
+    let trace = plan.safe_user_trace();
+    let _ = window.emit(
+        "assistant-thinking-trace",
+        serde_json::json!({
+            "request_id": plan.request_id.clone(),
+            "intent_summary": plan.intent_summary.clone(),
+            "route": plan.route.clone(),
+            "deep_search": plan.deep_search.clone(),
+            "tool_decision": plan.tool_decision.clone(),
+            "thinking_quality": quality,
+            "memory_feedback": {
+                "enabled": thinking_memory_feedback_enabled(),
+                "min_score": thinking_memory_feedback_min_score(),
+                "review_required": true,
+                "auto_promote": false,
+                "raw_chain_of_thought_included": false,
+                "planned": true,
+                "metadata_only": true
+            },
+            "memory_assessment": plan.memory_assessment.clone(),
+            "evidence_assessment": plan.evidence_assessment.clone(),
+            "uncertainty": plan.uncertainty.clone(),
+            "confidence": plan.confidence,
+            "planner_source": plan.planner_source.clone(),
+            "duration_ms": plan.duration_ms,
+            "steps": trace.clone(),
+            "warnings": plan.warnings.clone(),
+            "metadata_only": true,
+        }),
+    );
+
+    for step in trace {
+        emit_assistant_activity(
+            window,
+            &plan.request_id,
+            &format!("thinking_{}", step.phase),
+            &step.title,
+            step.detail.as_deref().unwrap_or("Astra sta aggiornando la traccia di ragionamento governata."),
+            serde_json::json!({
+                "route": plan.route.clone(),
+                "confidence": step.confidence,
+                "planner_source": plan.planner_source.clone(),
+                "quality_score": quality.score,
+                "quality_status": quality.status.clone(),
+                "metadata_only": true,
+            }),
+        );
+    }
+}
+
+fn thinking_route_label(route: &ThinkingRoute) -> &'static str {
+    match route {
+        ThinkingRoute::DirectAnswer => "direct_answer",
+        ThinkingRoute::MemoryGroundedAnswer => "memory_grounded_answer",
+        ThinkingRoute::ToolArbitrationRequired => "tool_arbitration_required",
+        ThinkingRoute::DeepSearchRequired => "deep_search_required",
+        ThinkingRoute::ClarifyRequired => "clarify_required",
+        ThinkingRoute::Refuse => "refuse",
+    }
+}
+
 fn render_memory_context_preamble(packet: &MemoryContextPacket) -> Option<String> {
     if packet.is_empty() {
         return None;
@@ -2804,6 +3061,9 @@ async fn start_assistant_response(
 
     let request_id = client_request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let history = runtime.conversation_history.recent_messages(10);
+    let mut response_options = response_options;
+    let mut effective_deep_search_options = deep_search_options.clone();
+
     emit_assistant_activity(
         &window,
         &request_id,
@@ -2812,21 +3072,17 @@ async fn start_assistant_response(
         "Astra is preparing the governed response pipeline.",
         serde_json::json!({"source": source, "metadata_only": true}),
     );
-    let deep_search_context_preamble = run_assistant_deep_search_if_enabled(
-        &window,
-        &runtime,
-        &request_id,
-        &message,
-        &deep_search_options,
-    )
-    .await;
     emit_assistant_activity(
         &window,
         &request_id,
         "memory_retrieval",
         "Retrieving local memory",
-        "Astra is retrieving relevant Memory Graph context.",
-        serde_json::json!({"deep_search_enabled": deep_search_options.enabled, "metadata_only": true}),
+        "Astra is retrieving relevant Memory Graph context before the cognitive thinking pass.",
+        serde_json::json!({
+            "deep_search_enabled": effective_deep_search_options.enabled,
+            "deep_search_auto_when_needed": effective_deep_search_options.auto_when_needed,
+            "metadata_only": true
+        }),
     );
     let cognitive_memory_context = memory::retrieval::build_memory_context_packet_llm_integrated(
         &runtime.memory_graph,
@@ -2853,6 +3109,77 @@ async fn start_assistant_response(
     );
     let manifest = runtime.desktop_agent.capability_manifest().await;
     let assistant_context = build_assistant_context_with_work_session(&manifest, &runtime);
+
+    emit_assistant_activity(
+        &window,
+        &request_id,
+        "thinking",
+        "Thinking through request",
+        "Astra is asking governed self-questions about intent, memory, evidence, tools and uncertainty.",
+        serde_json::json!({
+            "memory_nodes": cognitive_memory_context.as_ref().map(|packet| packet.nodes.len()).unwrap_or(0),
+            "metadata_only": true
+        }),
+    );
+    let thinking_plan = cognitive_thinking::build_thinking_plan(
+        &request_id,
+        &message,
+        &history,
+        cognitive_memory_context.as_ref(),
+        &manifest,
+        &effective_deep_search_options,
+    )
+    .await;
+    let thinking_quality = cognitive_quality::evaluate_thinking_plan(&thinking_plan);
+    runtime.remember_thinking_plan(&thinking_plan);
+    emit_assistant_thinking_trace(&window, &thinking_plan, &thinking_quality);
+
+    if matches!(&thinking_quality.status, cognitive_quality::ThinkingQualityStatus::Review) {
+        emit_assistant_activity(
+            &window,
+            &request_id,
+            "thinking_quality_review",
+            "Thinking plan needs review",
+            "Astra detected route/evidence/tool alignment issues and will keep execution inside governed runtime boundaries.",
+            serde_json::json!({
+                "quality_score": thinking_quality.score,
+                "quality_grade": thinking_quality.grade,
+                "quality_status": thinking_quality.status,
+                "findings": thinking_quality.findings,
+                "metadata_only": true
+            }),
+        );
+    }
+
+    if thinking_plan.should_auto_run_deep_search(&effective_deep_search_options) {
+        effective_deep_search_options.enabled = true;
+        response_options.deep_search_enabled = true;
+        emit_assistant_activity(
+            &window,
+            &request_id,
+            "deep_search_auto_selected",
+            "Deep Search selected automatically",
+            "Astra's governed thinking pass determined that local memory is not enough for this request.",
+            serde_json::json!({
+                "thinking_route": thinking_route_label(&thinking_plan.route),
+                "deep_search_reason": thinking_plan.deep_search.reason.clone(),
+                "confidence": thinking_plan.confidence,
+                "metadata_only": true
+            }),
+        );
+    } else {
+        response_options.deep_search_enabled = effective_deep_search_options.enabled;
+    }
+
+    let deep_search_context_preamble = run_assistant_deep_search_if_enabled(
+        &window,
+        &runtime,
+        &request_id,
+        &message,
+        &effective_deep_search_options,
+    )
+    .await;
+
     let mut skip_work_session_router = false;
     let mut skip_legacy_route_message = false;
     let mut normal_chat_context_preamble: Option<String> = None;
@@ -2861,7 +3188,7 @@ async fn start_assistant_response(
         cognitive_memory_context.as_ref(),
     );
 
-    if deep_search_options.enabled {
+    if effective_deep_search_options.enabled {
         skip_work_session_router = true;
         skip_legacy_route_message = true;
         normal_chat_context_preamble = Some(render_deep_search_direct_answer_preamble(

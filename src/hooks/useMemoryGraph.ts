@@ -16,6 +16,8 @@ import type {
   MemoryEmbeddingMaintenanceRequest,
   MemoryAutopilotRequest,
   MemoryAutopilotReceipt,
+  LegacyCanonicalMemoryCleanupReceipt,
+  LegacyCanonicalMemoryCleanupRequest,
   MemoryHybridQueryRequest,
   MemoryHybridQueryResponse,
   ConversationMemoryBundle,
@@ -50,6 +52,8 @@ import type {
   DeepSearchReceipt,
   DeepSearchKnowledgeRefreshRequest,
   DeepSearchKnowledgeRefreshReceipt,
+  KnowledgePackBuildRequest,
+  KnowledgePackBuildReceipt,
 } from "../types/memory";
 
 export function useMemoryGraph() {
@@ -156,6 +160,17 @@ export function useMemoryGraph() {
   );
 
 
+  const runLegacyCanonicalMemoryCleanup = useCallback(
+    (request: LegacyCanonicalMemoryCleanupRequest = {
+      max_scan_nodes: 1200,
+      max_groups: 24,
+      dry_run: false,
+      mark_aliases_deprecated: true,
+      reason: "memory_graph_legacy_canonical_cleanup",
+    }) => invoke<LegacyCanonicalMemoryCleanupReceipt>("run_memory_legacy_canonical_cleanup", { request }),
+    []
+  );
+
   const runMemoryAutopilot = useCallback(
     (request: MemoryAutopilotRequest = {
       reconsolidation_limit: 12,
@@ -164,13 +179,9 @@ export function useMemoryGraph() {
       run_candidate_discovery: true,
       force_embeddings: false,
       run_legacy_canonical_cleanup: true,
-      canonical_cleanup_scan_limit: 1600,
-      canonical_cleanup_group_limit: 36,
+      canonical_cleanup_scan_limit: 1200,
+      canonical_cleanup_group_limit: 24,
       canonical_cleanup_dry_run: false,
-      auto_apply_safe_review_proposals: true,
-      auto_apply_review_limit: 16,
-      duplicate_auto_apply_min_score: 0.9,
-      canonical_auto_apply_min_score: 0.88,
       reason: "memory_graph_user_autopilot",
     }) => invoke<MemoryAutopilotReceipt>("run_memory_autopilot", { request }),
     []
@@ -204,6 +215,23 @@ export function useMemoryGraph() {
       max_sources_per_topic: 8,
     }) =>
       invoke<DeepSearchKnowledgeRefreshReceipt>("run_deep_search_knowledge_refresh", { request }),
+    []
+  );
+
+  const buildKnowledgePacks = useCallback(
+    (request: KnowledgePackBuildRequest = {
+      enabled: true,
+      dry_run: false,
+      snapshot_limit: 500,
+      max_packs: 12,
+      max_nodes_per_pack: 32,
+      min_nodes_per_pack: 3,
+      min_pack_score: 0.34,
+      persist_packs: true,
+      include_unverified: false,
+      include_low_confidence: true,
+      include_source_documents: false,
+    }) => invoke<KnowledgePackBuildReceipt>("build_memory_knowledge_packs", { request }),
     []
   );
 
@@ -311,10 +339,12 @@ export function useMemoryGraph() {
       getMemoryRagCloseoutSnapshot,
       queueRecommendedMemoryMaintenance,
       rebuildEmbeddingIndex,
-      runMemoryAutopilot,
+      runLegacyCanonicalMemoryCleanup,
+    runMemoryAutopilot,
       runEmbeddingMaintenance,
       runDeepSearch,
       runDeepSearchKnowledgeRefresh,
+      buildKnowledgePacks,
     }),
     [
       consolidateConversationBundle,
@@ -330,7 +360,8 @@ export function useMemoryGraph() {
       getMemoryRagIntegrityReport,
       getMemoryRagCloseoutSnapshot,
       queueRecommendedMemoryMaintenance,
-      runMemoryAutopilot,
+      runLegacyCanonicalMemoryCleanup,
+    runMemoryAutopilot,
       getRecentActivations,
       getQualityDashboard,
       getStatus,
@@ -349,6 +380,7 @@ export function useMemoryGraph() {
       runEmbeddingMaintenance,
       runDeepSearch,
       runDeepSearchKnowledgeRefresh,
+      buildKnowledgePacks,
     ]
   );
 }
