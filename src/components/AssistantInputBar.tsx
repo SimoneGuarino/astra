@@ -2,7 +2,7 @@ import type { KeyboardEventHandler } from "react";
 import type { VoiceSessionTranscriptEvent } from "../types/assistant";
 import { Button } from "../ui/buttons/Button";
 
-import { LuSend } from "react-icons/lu";
+import { LuSearch, LuSend } from "react-icons/lu";
 import { CiMicrophoneOn } from "react-icons/ci";
 
 
@@ -24,8 +24,10 @@ type AssistantInputBarProps = {
     autoSubmitVoice: boolean;
     inputValue: string;
     isLoading: boolean;
+    deepSearchEnabled: boolean;
     onSubmit: () => Promise<void>;
     setAutoSubmitVoice: (value: boolean) => void;
+    setDeepSearchEnabled: (value: boolean) => void;
     setInputValue: (value: string) => void;
     lastVoiceTranscript: VoiceSessionTranscriptEvent | null;
     voiceInput: VoiceInputControls;
@@ -36,8 +38,10 @@ export function AssistantInputBar({
     //autoSubmitVoice,
     inputValue,
     isLoading,
+    deepSearchEnabled,
     onSubmit,
     //setAutoSubmitVoice,
+    setDeepSearchEnabled,
     setInputValue,
     lastVoiceTranscript,
     //voiceInput,
@@ -74,6 +78,18 @@ export function AssistantInputBar({
                     onChange={(event) => setInputValue(event.target.value)}
                     onKeyDown={handleKeyDown}
                 />
+                <button
+                    type="button"
+                    className={`deep-search-toggle ${deepSearchEnabled ? "active" : ""}`}
+                    onClick={() => setDeepSearchEnabled(!deepSearchEnabled)}
+                    aria-pressed={deepSearchEnabled}
+                    title={deepSearchEnabled
+                        ? "Deep Search attiva: Astra proverà una ricerca governata prima di rispondere."
+                        : "Deep Search disattiva: Astra userà solo modello, tool e memoria locale."}
+                >
+                    <LuSearch />
+                    <span>Deep Search</span>
+                </button>
                 <Button variant="dark" radius="full" size="sm" onClick={onSubmit} disabled={!inputValue.trim()} loading={isLoading}>
                     {isLoading ? "Invia nuova" : <LuSend />}
                 </Button>                

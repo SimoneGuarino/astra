@@ -31,47 +31,47 @@ export const MEMORY_GRAPH_LAYOUT_PRESETS: Record<MemoryGraphLayoutPreset, Memory
   vault: {
     preset: "vault",
     labelMode: "important",
-    labelSize: 1,
-    repulsion: 1,
-    linkDistance: 1,
-    centerForce: 1,
-    clusterForce: 1,
+    labelSize: 0.76,
+    repulsion: 1.22,
+    linkDistance: 1.12,
+    centerForce: 0.72,
+    clusterForce: 1.36,
   },
   local_focus: {
     preset: "local_focus",
     labelMode: "active",
-    labelSize: 1.1,
-    repulsion: 0.78,
-    linkDistance: 0.82,
-    centerForce: 1.18,
-    clusterForce: 1.32,
+    labelSize: 0.82,
+    repulsion: 1.05,
+    linkDistance: 0.96,
+    centerForce: 0.88,
+    clusterForce: 1.48,
   },
   identity: {
     preset: "identity",
     labelMode: "all",
-    labelSize: 1.12,
-    repulsion: 0.86,
-    linkDistance: 0.88,
-    centerForce: 1.05,
-    clusterForce: 1.18,
+    labelSize: 0.84,
+    repulsion: 1.06,
+    linkDistance: 0.96,
+    centerForce: 0.86,
+    clusterForce: 1.5,
   },
   research: {
     preset: "research",
     labelMode: "important",
-    labelSize: 0.96,
-    repulsion: 1.18,
-    linkDistance: 1.16,
-    centerForce: 0.88,
-    clusterForce: 0.98,
+    labelSize: 0.72,
+    repulsion: 1.36,
+    linkDistance: 1.26,
+    centerForce: 0.68,
+    clusterForce: 1.24,
   },
   debug: {
     preset: "debug",
     labelMode: "all",
-    labelSize: 0.88,
-    repulsion: 1.28,
-    linkDistance: 1.24,
-    centerForce: 0.8,
-    clusterForce: 0.82,
+    labelSize: 0.68,
+    repulsion: 1.42,
+    linkDistance: 1.32,
+    centerForce: 0.58,
+    clusterForce: 1.08,
   },
 };
 
@@ -221,7 +221,7 @@ export function MemoryGraphControlsOverlay({
         </div>
       </div>
 
-      <MemoryGraphSlider label="Label size" value={settings.labelSize} min={0.72} max={1.65} step={0.03} onChange={(value) => update({ labelSize: value })} />
+      <MemoryGraphSlider label="Label size" value={settings.labelSize} min={0.42} max={1.2} step={0.02} onChange={(value) => update({ labelSize: value })} />
       <MemoryGraphSlider label="Node spacing" value={settings.repulsion} min={0.45} max={1.75} step={0.05} onChange={(value) => update({ repulsion: value })} />
       <MemoryGraphSlider label="Link distance" value={settings.linkDistance} min={0.55} max={1.65} step={0.05} onChange={(value) => update({ linkDistance: value })} />
       <MemoryGraphSlider label="Center force" value={settings.centerForce} min={0.35} max={1.9} step={0.05} onChange={(value) => update({ centerForce: value })} />

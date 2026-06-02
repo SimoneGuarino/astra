@@ -234,8 +234,15 @@ pub fn consolidate_conversation_bundle(
     let mut created_edge_ids = Vec::new();
 
     for (index, atom) in bundle.semantic_atoms.iter().take(MAX_SEMANTIC_ATOMS).enumerate() {
-        let title = semantic_atom_title(atom);
-        let summary = semantic_atom_summary(atom);
+        let canonical = canonicalize_semantic_atom(atom);
+        let title = canonical
+            .as_ref()
+            .map(|canonical| canonical.title.clone())
+            .unwrap_or_else(|| semantic_atom_title(atom));
+        let summary = canonical
+            .as_ref()
+            .map(|canonical| canonical.summary.clone())
+            .unwrap_or_else(|| semantic_atom_summary(atom));
         if title.trim().is_empty() || summary.trim().is_empty() {
             continue;
         }
@@ -247,18 +254,45 @@ pub fn consolidate_conversation_bundle(
             atom.predicate.as_deref().unwrap_or_default(),
             atom.object.as_deref().unwrap_or_default()
         ));
-        let tags = normalize_tags(atom.tags.clone(), &["conversation", "semantic_atom", "long_term_memory"]);
-        let is_profile_like = tags.iter().any(|tag| matches!(tag.as_str(), "user_profile" | "identity" | "name" | "profile_fact"));
+        let mut default_tags = vec!["conversation", "semantic_atom", "long_term_memory"];
+        if canonical.is_some() {
+            default_tags.push("canonical_memory");
+            default_tags.push("semantic_fact");
+        }
+        if canonical.as_ref().is_some_and(|canonical| canonical.profile_like) {
+            default_tags.push("user_profile");
+            default_tags.push("profile_fact");
+        }
+        let tags = normalize_tags(atom.tags.clone(), &default_tags);
+        let is_profile_like = canonical
+            .as_ref()
+            .is_some_and(|canonical| canonical.profile_like)
+            || tags.iter().any(|tag| matches!(tag.as_str(), "user_profile" | "profile_fact"));
+        let source = canonical
+            .as_ref()
+            .map(|canonical| canonical.source.clone())
+            .unwrap_or_else(|| format!("conversation_semantic_atom:{}:{}", bundle_hash, atom_hash));
+        let mut canonical_metadata = json!({});
+        if let Some(canonical) = canonical.as_ref() {
+            canonical_metadata = json!({
+                "canonical_source": canonical.source.clone(),
+                "canonical_subject": canonical.subject.clone(),
+                "canonical_predicate": canonical.predicate.clone(),
+                "canonical_object_hash": canonical.object_hash.clone(),
+                "canonical_profile_slot": canonical.profile_like,
+                "canonicalization": "schema_first_llm_distillation",
+            });
+        }
         let node = store.create_node_once_by_source(CreateMemoryNodeRequest {
             kind: semantic_atom_kind(atom.kind.as_deref(), &tags),
             title: cap_text(title, MAX_TITLE_CHARS),
             summary: cap_text(summary, MAX_SUMMARY_CHARS),
             content: Some(cap_text(render_semantic_atom_content(atom, &bundle), MAX_CONTENT_CHARS)),
             tags,
-            source: Some(format!("conversation_semantic_atom:{}:{}", bundle_hash, atom_hash)),
-            confidence: clamp01(atom.confidence.unwrap_or(confidence).max(if is_profile_like { 0.78 } else { 0.58 })),
+            source: Some(source),
+            confidence: clamp01(atom.confidence.unwrap_or(confidence).max(if is_profile_like { 0.82 } else { 0.58 })),
             verification_status: MemoryVerificationStatus::LlmInferred,
-            salience: if is_profile_like { 0.94 } else { 0.76 },
+            salience: if is_profile_like { 0.96 } else { 0.78 },
             metadata: json!({
                 "ingestion_source": "conversation_memory_consolidation",
                 "conversation_turn_id": turn_node.id.clone(),
@@ -269,6 +303,7 @@ pub fn consolidate_conversation_bundle(
                 "evidence_present": atom.evidence.as_ref().is_some_and(|value| !value.trim().is_empty()),
                 "llm_semantic_distillation": true,
                 "requires_user_control": is_profile_like,
+                "canonical_memory": canonical_metadata,
                 "metadata": atom.metadata.clone(),
             }),
         })?;
@@ -585,9 +620,153 @@ fn semantic_atom_summary(atom: &ConversationSemanticAtom) -> String {
     format!("{subject} {predicate} {object}.")
 }
 
+#[derive(Debug, Clone)]
+struct CanonicalSemanticAtom {
+    source: String,
+    title: String,
+    summary: String,
+    subject: String,
+    predicate: String,
+    object_hash: String,
+    profile_like: bool,
+}
+
+/// Converts LLM-distilled memory atoms into stable, source-addressable facts.
+///
+/// The goal is not to hard-code a specific recall question. Instead, durable
+/// facts are written into canonical slots so future retrieval can find one
+/// well-shaped fact rather than many raw phrasings such as "mi chiamo Simone",
+/// "io sono Simone", or "sono Simone, il tuo creatore".
+fn canonicalize_semantic_atom(atom: &ConversationSemanticAtom) -> Option<CanonicalSemanticAtom> {
+    let subject = canonical_atom_subject(atom.subject.as_deref()?);
+    let predicate = canonical_atom_predicate(atom.predicate.as_deref()?);
+    let object = atom.object.as_deref().map(str::trim).filter(|value| !value.is_empty())?;
+    if subject.is_empty() || predicate.is_empty() {
+        return None;
+    }
+
+    let object_hash = short_hash(&normalize_canonical_text(object));
+    let profile_like = subject == "user" && is_profile_memory_predicate(&predicate);
+    let source = if profile_like {
+        // Profile slots are intentionally object-independent: if the user later
+        // corrects the same slot, new evidence links to the same canonical
+        // memory instead of creating another duplicate identity/preference node.
+        format!("astra://memory/profile/user/{predicate}")
+    } else {
+        format!("astra://memory/fact/{subject}/{predicate}/{object_hash}")
+    };
+
+    let (title, summary) = if profile_like {
+        let readable_predicate = predicate.replace('_', " ");
+        match predicate.as_str() {
+            "has_name" => (
+                "User self-introduction: name".into(),
+                format!("The user introduced themselves as {object}."),
+            ),
+            "prefers" => (
+                "User profile: preference".into(),
+                format!("The user stated a durable preference: {object}."),
+            ),
+            "works_on" => (
+                "User profile: project/work context".into(),
+                format!("The user stated they are working on {object}."),
+            ),
+            "works_as" => (
+                "User profile: role".into(),
+                format!("The user stated a durable role/work identity: {object}."),
+            ),
+            "uses" => (
+                "User profile: tools or stack".into(),
+                format!("The user stated they use {object}."),
+            ),
+            "wants" => (
+                "User profile: goal".into(),
+                format!("The user stated a durable goal: {object}."),
+            ),
+            "requires" => (
+                "User profile: constraint".into(),
+                format!("The user stated a durable requirement or constraint: {object}."),
+            ),
+            _ => (
+                format!("User profile: {readable_predicate}"),
+                format!("Durable user profile fact: user {readable_predicate} {object}."),
+            ),
+        }
+    } else {
+        (
+            format!("Canonical fact: {} {}", subject.replace('_', " "), predicate.replace('_', " ")),
+            format!("{} {} {}.", subject.replace('_', " "), predicate.replace('_', " "), object),
+        )
+    };
+
+    Some(CanonicalSemanticAtom {
+        source,
+        title,
+        summary,
+        subject,
+        predicate,
+        object_hash,
+        profile_like,
+    })
+}
+
+fn canonical_atom_subject(value: &str) -> String {
+    let normalized = normalize_canonical_text(value);
+    match normalized.as_str() {
+        "i" | "me" | "my" | "myself" | "self" | "user" | "utente" | "io" | "mio" | "mia" => "user".into(),
+        "astra" | "assistant" | "assistente" => "assistant".into(),
+        _ => canonical_slug(&normalized, 72),
+    }
+}
+
+fn canonical_atom_predicate(value: &str) -> String {
+    let normalized = normalize_canonical_text(value).replace('-', "_");
+    match normalized.as_str() {
+        "name" | "is_name" | "has_name" | "called" | "is_called" | "mi_chiamo" | "si_chiama" | "preferred_name" => "has_name".into(),
+        "likes" | "like" | "prefers" | "preferisce" | "preference" | "has_preference" => "prefers".into(),
+        "works_on" | "working_on" | "sta_lavorando_su" | "lavora_su" => "works_on".into(),
+        "works_as" | "role" | "job" | "is_role" | "ruolo" => "works_as".into(),
+        "uses" | "usa" | "uses_tool" | "uses_stack" => "uses".into(),
+        "wants" | "vuole" | "goal" | "objective" => "wants".into(),
+        "requires" | "constraint" | "vincolo" | "needs" => "requires".into(),
+        _ => canonical_slug(&normalized, 72),
+    }
+}
+
+fn is_profile_memory_predicate(predicate: &str) -> bool {
+    matches!(
+        predicate,
+        "has_name" | "prefers" | "works_on" | "works_as" | "uses" | "wants" | "requires"
+    )
+}
+
+fn normalize_canonical_text(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| !ch.is_alphanumeric())
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn canonical_slug(value: &str, max_chars: usize) -> String {
+    let mut slug = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    while slug.contains("__") {
+        slug = slug.replace("__", "_");
+    }
+    slug.trim_matches('_').chars().take(max_chars).collect()
+}
+
 fn render_semantic_atom_content(atom: &ConversationSemanticAtom, bundle: &ConversationMemoryBundle) -> String {
     let mut content = String::new();
-    content.push_str("Semantic memory atom distilled from conversation.\n");
+    content.push_str("Schema-first semantic memory atom distilled from conversation.\n");
+    if let Some(summary) = atom.summary.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        content.push_str(&format!("Contextualized memory: {summary}\n"));
+    }
     if let Some(subject) = atom.subject.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         content.push_str(&format!("Subject: {subject}\n"));
     }
@@ -598,12 +777,12 @@ fn render_semantic_atom_content(atom: &ConversationSemanticAtom, bundle: &Conver
         content.push_str(&format!("Object: {object}\n"));
     }
     if let Some(evidence) = atom.evidence.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        content.push_str(&format!("Evidence: {evidence}\n"));
+        content.push_str(&format!("Evidence quote: {evidence}\n"));
     }
-    content.push_str("\nOriginal user message:\n");
-    content.push_str(&cap_text(&bundle.user_message, 4_000));
-    content.push_str("\n\nAssistant answer:\n");
-    content.push_str(&cap_text(&bundle.assistant_answer, 4_000));
+    content.push_str("\nOriginal user message is preserved only as evidence, not as the canonical memory wording.\n");
+    content.push_str(&cap_text(&bundle.user_message, 2_000));
+    content.push_str("\n\nAssistant answer evidence:\n");
+    content.push_str(&cap_text(&bundle.assistant_answer, 2_000));
     content
 }
 

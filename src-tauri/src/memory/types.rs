@@ -363,7 +363,14 @@ pub struct MemoryEmbeddingRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEmbeddingIndexStatus {
     pub backend: String,
+    /// Backwards-compatible display field. In v0.6 this mirrors `provider_kind`.
     pub provider: String,
+    /// Stable provider classification used by quality gates (for example `stable_hash_local` or `ollama_embeddings`).
+    #[serde(default)]
+    pub provider_kind: String,
+    /// Concrete embedding model name used for the latest indexed chunk.
+    #[serde(default)]
+    pub model: String,
     pub dimensions: usize,
     pub embedded_chunks: usize,
     pub total_chunks: usize,
@@ -637,6 +644,74 @@ pub struct MemoryQualityRetrievalStats {
 
 
 
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyCanonicalMemoryCleanupRequest {
+    #[serde(default)]
+    pub max_scan_nodes: Option<usize>,
+    #[serde(default)]
+    pub max_groups: Option<usize>,
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    #[serde(default)]
+    pub mark_aliases_deprecated: Option<bool>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+impl Default for LegacyCanonicalMemoryCleanupRequest {
+    fn default() -> Self {
+        Self {
+            max_scan_nodes: Some(1200),
+            max_groups: Some(24),
+            dry_run: Some(false),
+            mark_aliases_deprecated: Some(true),
+            reason: Some("memory_autopilot_legacy_canonical_cleanup".into()),
+            metadata: json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyCanonicalMemoryCleanupItem {
+    pub canonical_source: String,
+    #[serde(default)]
+    pub target_node_id: Option<String>,
+    pub created_canonical_node: bool,
+    #[serde(default)]
+    pub merged_node_ids: Vec<String>,
+    #[serde(default)]
+    pub deprecated_node_ids: Vec<String>,
+    #[serde(default)]
+    pub linked_node_ids: Vec<String>,
+    pub reason: String,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LegacyCanonicalMemoryCleanupReceipt {
+    pub accepted: bool,
+    pub reason: String,
+    pub started_at: i64,
+    pub completed_at: i64,
+    pub scanned_nodes: usize,
+    pub groups_processed: usize,
+    pub skipped_groups: usize,
+    pub canonical_nodes_created: usize,
+    pub canonical_nodes_existing: usize,
+    pub alias_nodes_merged: usize,
+    pub alias_nodes_deprecated: usize,
+    #[serde(default)]
+    pub items: Vec<LegacyCanonicalMemoryCleanupItem>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryAutopilotRequest {
     #[serde(default = "default_memory_autopilot_reconsolidation_limit")]
@@ -649,12 +724,44 @@ pub struct MemoryAutopilotRequest {
     pub run_candidate_discovery: bool,
     #[serde(default)]
     pub force_embeddings: bool,
+    #[serde(default = "default_true")]
+    pub run_legacy_canonical_cleanup: bool,
+    #[serde(default = "default_memory_autopilot_canonical_cleanup_scan_limit")]
+    pub canonical_cleanup_scan_limit: usize,
+    #[serde(default = "default_memory_autopilot_canonical_cleanup_group_limit")]
+    pub canonical_cleanup_group_limit: usize,
+    #[serde(default)]
+    pub canonical_cleanup_dry_run: bool,
+    #[serde(default)]
+    pub run_knowledge_autopilot: bool,
+    #[serde(default = "default_memory_autopilot_learning_topic_limit")]
+    pub knowledge_autopilot_topic_limit: usize,
+    #[serde(default = "default_memory_autopilot_learning_run_limit")]
+    pub knowledge_autopilot_run_limit: usize,
+    #[serde(default)]
+    pub knowledge_autopilot_dry_run: bool,
+    #[serde(default = "default_true")]
+    pub auto_apply_safe_review_proposals: bool,
+    #[serde(default = "default_memory_autopilot_auto_apply_limit")]
+    pub auto_apply_review_limit: usize,
+    #[serde(default = "default_memory_autopilot_duplicate_auto_apply_min_score")]
+    pub duplicate_auto_apply_min_score: f32,
+    #[serde(default = "default_memory_autopilot_canonical_auto_apply_min_score")]
+    pub canonical_auto_apply_min_score: f32,
     #[serde(default)]
     pub reason: Option<String>,
 }
 
 fn default_memory_autopilot_reconsolidation_limit() -> usize { 12 }
 fn default_memory_autopilot_embedding_limit() -> usize { 48 }
+fn default_memory_autopilot_learning_topic_limit() -> usize { 6 }
+fn default_memory_autopilot_learning_run_limit() -> usize { 2 }
+fn default_memory_autopilot_canonical_cleanup_scan_limit() -> usize { 1200 }
+fn default_memory_autopilot_canonical_cleanup_group_limit() -> usize { 24 }
+fn default_memory_autopilot_auto_apply_limit() -> usize { 12 }
+fn default_memory_autopilot_duplicate_auto_apply_min_score() -> f32 { 0.90 }
+fn default_memory_autopilot_canonical_auto_apply_min_score() -> f32 { 0.88 }
+fn default_true() -> bool { true }
 
 impl Default for MemoryAutopilotRequest {
     fn default() -> Self {
@@ -664,6 +771,18 @@ impl Default for MemoryAutopilotRequest {
             run_skill_extraction: true,
             run_candidate_discovery: true,
             force_embeddings: false,
+            run_legacy_canonical_cleanup: true,
+            canonical_cleanup_scan_limit: default_memory_autopilot_canonical_cleanup_scan_limit(),
+            canonical_cleanup_group_limit: default_memory_autopilot_canonical_cleanup_group_limit(),
+            canonical_cleanup_dry_run: false,
+            run_knowledge_autopilot: false,
+            knowledge_autopilot_topic_limit: default_memory_autopilot_learning_topic_limit(),
+            knowledge_autopilot_run_limit: default_memory_autopilot_learning_run_limit(),
+            knowledge_autopilot_dry_run: false,
+            auto_apply_safe_review_proposals: true,
+            auto_apply_review_limit: default_memory_autopilot_auto_apply_limit(),
+            duplicate_auto_apply_min_score: default_memory_autopilot_duplicate_auto_apply_min_score(),
+            canonical_auto_apply_min_score: default_memory_autopilot_canonical_auto_apply_min_score(),
             reason: Some("memory_autopilot".into()),
         }
     }
@@ -683,6 +802,28 @@ pub struct MemoryAutopilotReceipt {
     pub skill_candidates: usize,
     pub duplicate_candidates: usize,
     pub canonical_review_candidates: usize,
+    #[serde(default)]
+    pub auto_applied_duplicate_merges: usize,
+    #[serde(default)]
+    pub auto_applied_canonical_reviews: usize,
+    #[serde(default)]
+    pub auto_applied_deprecated_aliases: usize,
+    #[serde(default)]
+    pub canonical_cleanup_groups: usize,
+    #[serde(default)]
+    pub canonical_cleanup_created: usize,
+    #[serde(default)]
+    pub canonical_cleanup_merged_aliases: usize,
+    #[serde(default)]
+    pub canonical_cleanup_deprecated_aliases: usize,
+    #[serde(default)]
+    pub canonical_cleanup_warnings: Vec<String>,
+    #[serde(default)]
+    pub knowledge_autopilot_runs: usize,
+    #[serde(default)]
+    pub knowledge_autopilot_sources: usize,
+    #[serde(default)]
+    pub knowledge_autopilot_claims_promoted: usize,
     pub quality_score: f32,
     pub quality_status: String,
     #[serde(default)]

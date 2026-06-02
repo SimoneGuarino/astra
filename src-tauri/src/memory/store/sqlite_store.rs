@@ -636,6 +636,26 @@ impl MemoryGraphStore {
         Ok(activations)
     }
 
+    pub fn list_nodes_for_maintenance(&self, limit: usize, include_deprecated: bool) -> MemoryResult<Vec<MemoryNode>> {
+        let limit = limit.clamp(1, 5000);
+        let _guard = self.lock.lock().expect("memory graph mutex poisoned");
+        let conn = self.open_connection()?;
+        let sql = if include_deprecated {
+            "SELECT id, kind, title, summary, content, tags_json, source, confidence, verification_status, salience, created_at, updated_at, metadata_json
+             FROM memory_nodes ORDER BY updated_at DESC LIMIT ?1"
+        } else {
+            "SELECT id, kind, title, summary, content, tags_json, source, confidence, verification_status, salience, created_at, updated_at, metadata_json
+             FROM memory_nodes WHERE verification_status NOT IN ('deprecated', 'contradicted') ORDER BY updated_at DESC LIMIT ?1"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params![limit as i64], row_to_node)?;
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row?);
+        }
+        Ok(nodes)
+    }
+
     pub fn snapshot(&self, limit: usize) -> MemoryResult<MemoryGraphSnapshot> {
         let limit = limit.clamp(1, 500);
         let _guard = self.lock.lock().expect("memory graph mutex poisoned");
@@ -740,17 +760,30 @@ impl MemoryGraphStore {
             .query_row("SELECT MAX(updated_at) FROM memory_embeddings", [], |row| row.get::<_, Option<i64>>(0))
             .optional()?
             .flatten();
-        let (provider, dimensions) = conn
+        let (model, dimensions, provider_kind) = conn
             .query_row(
-                "SELECT model, dimensions FROM memory_embeddings ORDER BY updated_at DESC LIMIT 1",
+                "SELECT model, dimensions, metadata_json FROM memory_embeddings ORDER BY updated_at DESC LIMIT 1",
                 [],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)),
+                |row| {
+                    let model = row.get::<_, String>(0)?;
+                    let dimensions = row.get::<_, i64>(1)? as usize;
+                    let metadata_raw = row.get::<_, String>(2)?;
+                    let metadata = serde_json::from_str::<Value>(&metadata_raw).unwrap_or_else(|_| json!({}));
+                    let provider_kind = metadata
+                        .get("provider_kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("stable_hash_local")
+                        .to_string();
+                    Ok((model, dimensions, provider_kind))
+                },
             )
             .optional()?
-            .unwrap_or_else(|| ("stable-local-hash-v1".into(), 384));
+            .unwrap_or_else(|| ("stable-local-hash-v1".into(), 384, "stable_hash_local".into()));
         Ok(MemoryEmbeddingIndexStatus {
             backend: "sqlite_vector_cache".into(),
-            provider,
+            provider: provider_kind.clone(),
+            provider_kind: provider_kind.clone(),
+            model: model.clone(),
             dimensions,
             embedded_chunks,
             total_chunks,
@@ -759,6 +792,8 @@ impl MemoryGraphStore {
             metadata: json!({
                 "source_of_truth": "sqlite_memory_graph",
                 "vector_index_role": "advisory_retrieval_index",
+                "model": model,
+                "provider_kind": provider_kind,
                 "metadata_only": true,
             }),
         })
@@ -1540,17 +1575,30 @@ fn embedding_status_locked(conn: &Connection) -> MemoryResult<MemoryEmbeddingInd
         .query_row("SELECT MAX(updated_at) FROM memory_embeddings", [], |row| row.get::<_, Option<i64>>(0))
         .optional()?
         .flatten();
-    let (provider, dimensions) = conn
+    let (model, dimensions, provider_kind) = conn
         .query_row(
-            "SELECT model, dimensions FROM memory_embeddings ORDER BY updated_at DESC LIMIT 1",
+            "SELECT model, dimensions, metadata_json FROM memory_embeddings ORDER BY updated_at DESC LIMIT 1",
             [],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)),
+            |row| {
+                let model = row.get::<_, String>(0)?;
+                let dimensions = row.get::<_, i64>(1)? as usize;
+                let metadata_raw = row.get::<_, String>(2)?;
+                let metadata = serde_json::from_str::<Value>(&metadata_raw).unwrap_or_else(|_| json!({}));
+                let provider_kind = metadata
+                    .get("provider_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("stable_hash_local")
+                    .to_string();
+                Ok((model, dimensions, provider_kind))
+            },
         )
         .optional()?
-        .unwrap_or_else(|| ("stable-local-hash-v1".into(), 384));
+        .unwrap_or_else(|| ("stable-local-hash-v1".into(), 384, "stable_hash_local".into()));
     Ok(MemoryEmbeddingIndexStatus {
         backend: "sqlite_vector_cache".into(),
-        provider,
+        provider: provider_kind.clone(),
+        provider_kind: provider_kind.clone(),
+        model: model.clone(),
         dimensions,
         embedded_chunks,
         total_chunks,
@@ -1559,6 +1607,8 @@ fn embedding_status_locked(conn: &Connection) -> MemoryResult<MemoryEmbeddingInd
         metadata: json!({
             "source_of_truth": "sqlite_memory_graph",
             "vector_index_role": "advisory_retrieval_index",
+            "model": model,
+            "provider_kind": provider_kind,
             "metadata_only": true,
         }),
     })

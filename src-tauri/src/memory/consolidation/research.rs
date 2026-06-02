@@ -467,6 +467,12 @@ fn link_sources(
 }
 
 fn source_ref(source: &ResearchSource, index: usize) -> String {
+    if let Some(explicit_ref) = source.metadata.get("source_ref").and_then(Value::as_str) {
+        let trimmed = explicit_ref.trim();
+        if !trimmed.is_empty() {
+            return cap_text(trimmed, 96);
+        }
+    }
     source
         .uri
         .as_deref()

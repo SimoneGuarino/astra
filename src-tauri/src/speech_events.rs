@@ -4,11 +4,125 @@ use crate::vad::VadFrameSnapshot;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatStartRequest {
+    #[serde(default)]
+    pub client_request_id: Option<String>,
     pub message: String,
     #[serde(default)]
     pub input_modality: AssistantInputModality,
     #[serde(default)]
     pub audio_response: AssistantAudioResponsePolicy,
+    #[serde(default)]
+    pub deep_search: AssistantDeepSearchOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantDeepSearchOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub seed_urls: Vec<String>,
+    #[serde(default)]
+    pub enable_web_discovery: Option<bool>,
+    #[serde(default)]
+    pub search_providers: Vec<String>,
+    #[serde(default)]
+    pub include_general_web: Option<bool>,
+    #[serde(default)]
+    pub include_academic_sources: Option<bool>,
+    #[serde(default)]
+    pub document_ingestion: Option<bool>,
+    #[serde(default)]
+    pub prefer_academic_landing_pages: Option<bool>,
+    #[serde(default)]
+    pub enable_pdf_text_extraction: Option<bool>,
+    #[serde(default)]
+    pub max_discovery_results_per_provider: Option<usize>,
+    #[serde(default)]
+    pub max_discovered_sources: Option<usize>,
+    #[serde(default)]
+    pub initial_query_count: Option<usize>,
+    #[serde(default)]
+    pub autonomous_loop: Option<bool>,
+    #[serde(default)]
+    pub max_research_passes: Option<usize>,
+    #[serde(default)]
+    pub min_research_passes: Option<usize>,
+    #[serde(default)]
+    pub max_sources_per_pass: Option<usize>,
+    #[serde(default)]
+    pub min_new_information_gain: Option<f32>,
+    #[serde(default)]
+    pub min_coverage_score: Option<f32>,
+    #[serde(default)]
+    pub min_supported_claim_ratio: Option<f32>,
+    #[serde(default)]
+    pub enable_claim_graph: Option<bool>,
+    #[serde(default)]
+    pub min_independent_sources_for_claim: Option<usize>,
+    #[serde(default)]
+    pub enable_contradiction_detection: Option<bool>,
+    #[serde(default)]
+    pub enable_memory_promotion_policy: Option<bool>,
+    #[serde(default)]
+    pub auto_promote_supported_claims: Option<bool>,
+    #[serde(default)]
+    pub require_user_confirmation_for_system_verified: Option<bool>,
+    #[serde(default)]
+    pub min_promotion_confidence: Option<f32>,
+    #[serde(default)]
+    pub min_promotion_independent_sources: Option<usize>,
+    #[serde(default)]
+    pub enable_source_reliability_scoring: Option<bool>,
+    #[serde(default)]
+    pub min_reliable_source_score_for_promotion: Option<f32>,
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+    #[serde(default)]
+    pub blocked_domains: Vec<String>,
+    #[serde(default)]
+    pub max_sources: Option<usize>,
+    #[serde(default)]
+    pub require_cross_source_verification: bool,
+}
+
+impl Default for AssistantDeepSearchOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            seed_urls: Vec::new(),
+            enable_web_discovery: Some(true),
+            search_providers: Vec::new(),
+            include_general_web: Some(true),
+            include_academic_sources: Some(true),
+            document_ingestion: Some(true),
+            prefer_academic_landing_pages: Some(true),
+            enable_pdf_text_extraction: Some(true),
+            max_discovery_results_per_provider: Some(10),
+            max_discovered_sources: Some(192),
+            initial_query_count: Some(6),
+            autonomous_loop: Some(true),
+            max_research_passes: Some(5),
+            min_research_passes: Some(2),
+            max_sources_per_pass: Some(8),
+            min_new_information_gain: Some(0.08),
+            min_coverage_score: Some(0.66),
+            min_supported_claim_ratio: Some(0.55),
+            enable_claim_graph: Some(true),
+            min_independent_sources_for_claim: Some(2),
+            enable_contradiction_detection: Some(true),
+            enable_memory_promotion_policy: Some(true),
+            auto_promote_supported_claims: Some(true),
+            require_user_confirmation_for_system_verified: Some(true),
+            min_promotion_confidence: Some(0.62),
+            min_promotion_independent_sources: Some(2),
+            enable_source_reliability_scoring: Some(true),
+            min_reliable_source_score_for_promotion: Some(0.50),
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
+            max_sources: None,
+            require_cross_source_verification: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,6 +130,7 @@ pub struct StartChatResponse {
     pub request_id: String,
     pub model: String,
     pub audio_response_enabled: bool,
+    pub deep_search_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -65,6 +180,7 @@ pub struct AssistantRequestStartedEvent {
     pub source: String,
     pub user_message: Option<String>,
     pub audio_response_enabled: bool,
+    pub deep_search_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +325,7 @@ mod tests {
 
         assert_eq!(request.input_modality, AssistantInputModality::Typed);
         assert_eq!(request.audio_response, AssistantAudioResponsePolicy::Auto);
+        assert!(!request.deep_search.enabled);
         assert!(!resolve_audio_response_enabled(
             request.input_modality,
             request.audio_response,
@@ -231,6 +348,7 @@ mod tests {
             request_id: "request".to_string(),
             model: "model".to_string(),
             audio_response_enabled: false,
+            deep_search_enabled: false,
         })
         .expect("json");
 

@@ -46,6 +46,10 @@ import type {
   MemoryRagCloseoutSnapshotRequest,
   MemoryRagRecommendedMaintenanceRequest,
   MemoryRagRecommendedMaintenanceReceipt,
+  DeepSearchRequest,
+  DeepSearchReceipt,
+  DeepSearchKnowledgeRefreshRequest,
+  DeepSearchKnowledgeRefreshReceipt,
 } from "../types/memory";
 
 export function useMemoryGraph() {
@@ -159,6 +163,14 @@ export function useMemoryGraph() {
       run_skill_extraction: true,
       run_candidate_discovery: true,
       force_embeddings: false,
+      run_legacy_canonical_cleanup: true,
+      canonical_cleanup_scan_limit: 1600,
+      canonical_cleanup_group_limit: 36,
+      canonical_cleanup_dry_run: false,
+      auto_apply_safe_review_proposals: true,
+      auto_apply_review_limit: 16,
+      duplicate_auto_apply_min_score: 0.9,
+      canonical_auto_apply_min_score: 0.88,
       reason: "memory_graph_user_autopilot",
     }) => invoke<MemoryAutopilotReceipt>("run_memory_autopilot", { request }),
     []
@@ -167,6 +179,31 @@ export function useMemoryGraph() {
   const runEmbeddingMaintenance = useCallback(
     (request: MemoryEmbeddingMaintenanceRequest = { limit: 24, force: false, reason: "memory_graph_ui" }) =>
       invoke<MemoryEmbeddingMaintenanceReceipt>("run_memory_embedding_maintenance", { request }),
+    []
+  );
+
+  const runDeepSearch = useCallback(
+    (request: DeepSearchRequest) =>
+      invoke<DeepSearchReceipt>("run_memory_deep_search", { request }),
+    []
+  );
+
+  const runDeepSearchKnowledgeRefresh = useCallback(
+    (request: DeepSearchKnowledgeRefreshRequest = {
+      enabled: true,
+      dry_run: false,
+      snapshot_limit: 320,
+      max_candidates: 24,
+      stale_after_days: 45,
+      temporal_stale_after_days: 7,
+      include_low_confidence_candidates: true,
+      tag_candidates_for_refresh: true,
+      run_refresh_research: true,
+      max_refresh_topics: 8,
+      max_refresh_runs: 3,
+      max_sources_per_topic: 8,
+    }) =>
+      invoke<DeepSearchKnowledgeRefreshReceipt>("run_deep_search_knowledge_refresh", { request }),
     []
   );
 
@@ -276,6 +313,8 @@ export function useMemoryGraph() {
       rebuildEmbeddingIndex,
       runMemoryAutopilot,
       runEmbeddingMaintenance,
+      runDeepSearch,
+      runDeepSearchKnowledgeRefresh,
     }),
     [
       consolidateConversationBundle,
@@ -308,6 +347,8 @@ export function useMemoryGraph() {
       queryHybrid,
       rebuildEmbeddingIndex,
       runEmbeddingMaintenance,
+      runDeepSearch,
+      runDeepSearchKnowledgeRefresh,
     ]
   );
 }

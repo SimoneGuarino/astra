@@ -432,6 +432,43 @@ input {
     gap: 10px;
 }
 
+
+.deep-search-toggle {
+    height: 38px;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    border: 1px solid rgba(83, 101, 160, 0.22);
+    border-radius: 999px;
+    padding: 0 12px;
+    background: rgba(255, 255, 255, 0.34);
+    color: rgba(36, 44, 70, 0.72);
+    font-size: 12px;
+    font-weight: 750;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    transition: transform 140ms ease, background 140ms ease, color 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+    white-space: nowrap;
+}
+
+.deep-search-toggle:hover {
+    transform: translateY(-1px);
+    background: rgba(255, 255, 255, 0.52);
+    border-color: rgba(83, 101, 160, 0.34);
+}
+
+.deep-search-toggle.active {
+    color: rgba(19, 73, 78, 0.96);
+    background: linear-gradient(135deg, rgba(114, 246, 230, 0.34), rgba(126, 155, 255, 0.26));
+    border-color: rgba(54, 204, 216, 0.5);
+    box-shadow: 0 0 0 1px rgba(54, 204, 216, 0.08), 0 10px 26px rgba(54, 204, 216, 0.16);
+}
+
+.deep-search-toggle svg {
+    width: 15px;
+    height: 15px;
+}
+
 .chat-input {
     flex: 1;
     height: 50px;
@@ -4344,4 +4381,167 @@ input {
   .memory-rag-control-center__actions {
     grid-template-columns: 1fr;
   }
+}
+
+.assistant-thinking-card {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 12px 14px;
+    border: 1px solid rgba(18, 24, 38, 0.08);
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.82);
+    box-shadow: 0 14px 38px rgba(16, 24, 40, 0.08);
+    backdrop-filter: blur(14px);
+    color: #172033;
+}
+
+.assistant-thinking-pulse {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    margin-top: 7px;
+    background: #7c3aed;
+    box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.45);
+    animation: astra-thinking-pulse 1.45s ease-in-out infinite;
+    flex: 0 0 auto;
+}
+
+.assistant-thinking-main {
+    min-width: 0;
+    flex: 1;
+}
+
+.assistant-thinking-eyebrow {
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(23, 32, 51, 0.58);
+    font-weight: 700;
+    margin-bottom: 3px;
+}
+
+.assistant-thinking-title {
+    font-size: 0.94rem;
+    font-weight: 750;
+    color: #111827;
+}
+
+.assistant-thinking-detail {
+    margin-top: 3px;
+    font-size: 0.84rem;
+    line-height: 1.42;
+    color: rgba(17, 24, 39, 0.68);
+}
+
+.assistant-thinking-expand {
+    margin-top: 9px;
+    border: 0;
+    background: rgba(124, 58, 237, 0.08);
+    color: #5b21b6;
+    border-radius: 999px;
+    padding: 6px 10px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.assistant-thinking-expand:hover {
+    background: rgba(124, 58, 237, 0.14);
+}
+
+.assistant-thinking-details-panel {
+    margin-top: 10px;
+    display: grid;
+    gap: 8px;
+    max-height: 280px;
+    overflow: auto;
+    padding-right: 4px;
+}
+
+.assistant-thinking-step {
+    display: grid;
+    grid-template-columns: 24px 1fr;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 8px;
+    border-radius: 12px;
+    background: rgba(17, 24, 39, 0.035);
+}
+
+.assistant-thinking-step-index {
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.72rem;
+    font-weight: 800;
+    color: #4c1d95;
+    background: rgba(124, 58, 237, 0.12);
+}
+
+.assistant-thinking-step-title {
+    font-size: 0.82rem;
+    font-weight: 750;
+    color: #172033;
+}
+
+.assistant-thinking-step-detail {
+    margin-top: 2px;
+    font-size: 0.76rem;
+    line-height: 1.35;
+    color: rgba(23, 32, 51, 0.64);
+}
+
+@keyframes astra-thinking-pulse {
+    0% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.44);
+    }
+    70% {
+        transform: scale(1);
+        box-shadow: 0 0 0 9px rgba(124, 58, 237, 0);
+    }
+    100% {
+        transform: scale(0.95);
+        box-shadow: 0 0 0 0 rgba(124, 58, 237, 0);
+    }
+}
+
+/* AstraOS v0.7.13 — Cognitive memory graph readability recovery.
+   Keep graph labels compact even when the SVG viewport is zoomed out, and clarify
+   that review operations are soft governance actions, not hard deletes. */
+.memory-graph-svg-label {
+  opacity: 0.88;
+}
+
+.memory-graph-svg-label-plate {
+  fill: rgba(255, 255, 255, 0.82);
+  stroke: rgba(112, 133, 190, 0.34);
+  stroke-width: 0.8px;
+  filter: drop-shadow(0 3px 8px rgba(43, 65, 112, 0.08));
+}
+
+.memory-graph-svg-label-text {
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  stroke: rgba(255, 255, 255, 0.58);
+  stroke-width: 1.15px;
+}
+
+.memory-graph-svg-label--active .memory-graph-svg-label-plate,
+.memory-graph-svg-label--selected .memory-graph-svg-label-plate,
+.memory-graph-svg-label--important .memory-graph-svg-label-plate {
+  fill: rgba(255, 255, 255, 0.9);
+  stroke-width: 0.95px;
+}
+
+.memory-merge-governance-note {
+  display: block;
+  margin-top: 5px;
+  color: rgba(42, 57, 92, 0.68);
+  font-size: 11px;
+  line-height: 1.35;
 }

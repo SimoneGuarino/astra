@@ -50,9 +50,9 @@ export function useMemoryGraphSvgLabels({
     if (!labelsVisible) return [];
     const surface = graphSurfaceProjection(surfaceSize, viewport);
     const totalScale = Math.max(0.05, (surface?.scale ?? 0.25) * viewport.scale);
-    const fontSize = clampNumber((12.5 * layoutSettings.labelSize) / totalScale, 16, 96);
-    const height = clampNumber((20 * layoutSettings.labelSize) / totalScale, 28, 132);
-    const yOffset = clampNumber((22 * layoutSettings.labelSize) / totalScale, 32, 146);
+    const fontSize = clampNumber((10.5 * layoutSettings.labelSize) / totalScale, 10, 28);
+    const height = clampNumber((17 * layoutSettings.labelSize) / totalScale, 18, 42);
+    const yOffset = clampNumber((18 * layoutSettings.labelSize) / totalScale, 22, 52);
 
     const candidates = layout
       .map((point) => {
@@ -64,7 +64,7 @@ export function useMemoryGraphSvgLabels({
         const shouldShow = shouldShowMemoryNodeLabel(layoutSettings.labelMode, { selected, activated, important, nodeCount, viewportScale: viewport.scale });
         if (!shouldShow) return null;
 
-        const label = truncate(node.title, selected || important || activated ? 54 : 34);
+        const label = truncate(node.title, selected || important || activated ? 40 : 26);
         const width = graphLabelWidth(label, selected || important || activated) / totalScale;
         const priority = (selected ? 10000 : 0) + (activated ? 6000 : 0) + (important ? 2600 : 0) + memoryNodeVisualWeight(node) * 40;
         return {

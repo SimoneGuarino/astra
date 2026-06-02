@@ -61,7 +61,7 @@ export function MemoryGraphToolbar({
           className="memory-graph-icon-button memory-graph-icon-button--primary"
           onClick={onRunAutopilot}
           disabled={isBusy}
-          title="Run governed recommended memory/RAG maintenance"
+          title="Run Cognitive Copilot: canonical cleanup, safe soft-merge auto-apply, embeddings and memory maintenance"
         >
           <IoSparklesOutline />
         </button>

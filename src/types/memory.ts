@@ -259,6 +259,186 @@ export type MemoryActivationEventPayload = {
   source?: string;
 };
 
+export type DeepSearchRequest = {
+  topic: string;
+  objective?: string | null;
+  query?: string | null;
+  seed_urls?: string[];
+  enable_web_discovery?: boolean | null;
+  search_providers?: string[];
+  include_general_web?: boolean | null;
+  include_academic_sources?: boolean | null;
+  max_discovery_results_per_provider?: number | null;
+  max_discovered_sources?: number | null;
+  allowed_domains?: string[];
+  blocked_domains?: string[];
+  tags?: string[];
+  max_sources?: number | null;
+  min_sources_for_learning?: number | null;
+  max_bytes_per_source?: number | null;
+  timeout_ms?: number | null;
+  require_cross_source_verification?: boolean;
+  document_ingestion?: boolean | null;
+  prefer_academic_landing_pages?: boolean | null;
+  enable_pdf_text_extraction?: boolean | null;
+  autonomous_loop?: boolean | null;
+  max_research_passes?: number | null;
+  min_research_passes?: number | null;
+  max_sources_per_pass?: number | null;
+  min_new_information_gain?: number | null;
+  min_coverage_score?: number | null;
+  min_supported_claim_ratio?: number | null;
+  enable_claim_graph?: boolean | null;
+  min_independent_sources_for_claim?: number | null;
+  enable_contradiction_detection?: boolean | null;
+  enable_memory_promotion_policy?: boolean | null;
+  auto_promote_supported_claims?: boolean | null;
+  require_user_confirmation_for_system_verified?: boolean | null;
+  min_promotion_confidence?: number | null;
+  min_promotion_independent_sources?: number | null;
+  allow_http_localhost?: boolean;
+  metadata?: Record<string, unknown>;
+};
+
+
+export type DeepSearchKnowledgeRefreshRequest = {
+  enabled?: boolean;
+  dry_run?: boolean;
+  snapshot_limit?: number;
+  max_candidates?: number;
+  stale_after_days?: number;
+  temporal_stale_after_days?: number;
+  low_confidence_threshold?: number;
+  include_low_confidence_candidates?: boolean;
+  tag_candidates_for_refresh?: boolean;
+  max_tags?: number;
+  run_refresh_research?: boolean;
+  max_refresh_topics?: number;
+  max_refresh_runs?: number;
+  max_sources_per_topic?: number;
+  blocked_topics?: string[];
+  search_providers?: string[];
+  deep_search_defaults?: DeepSearchRequest | null;
+  metadata?: Record<string, unknown>;
+};
+
+export type DeepSearchKnowledgeRefreshCandidate = {
+  node: MemoryNode;
+  topic: string;
+  reason: string;
+  priority: number;
+  age_days: number;
+  temporal: boolean;
+  low_confidence: boolean;
+  metadata?: Record<string, unknown>;
+};
+
+export type DeepSearchKnowledgeRefreshReceipt = {
+  accepted: boolean;
+  reason: string;
+  started_at: number;
+  completed_at: number;
+  dry_run: boolean;
+  candidates_scanned: number;
+  stale_candidates: number;
+  tagged_for_refresh: number;
+  refresh_runs: number;
+  sources_accepted: number;
+  claims_promoted: number;
+  candidate_claims: number;
+  candidates: DeepSearchKnowledgeRefreshCandidate[];
+  autopilot?: unknown | null;
+  warnings: string[];
+  recommendations: string[];
+  metadata?: Record<string, unknown>;
+};
+
+export type DeepSearchRunSummary = {
+  id: string;
+  topic: string;
+  objective?: string | null;
+  started_at: number;
+  completed_at: number;
+  duration_ms: number;
+  sources_seen: number;
+  sources_accepted: number;
+  sources_rejected: number;
+  status: string;
+};
+
+export type DeepSearchAcceptedSource = {
+  url: string;
+  title: string;
+  content_hash: string;
+  fetched_at: number;
+  content_type?: string | null;
+  discovered_by?: string | null;
+  source_type?: string | null;
+  discovery_rank?: number | null;
+};
+
+export type DeepSearchRejectedSource = {
+  url: string;
+  reason: string;
+};
+
+export type DeepSearchConsolidationSummary = {
+  accepted: boolean;
+  reason: string;
+  topic_node: MemoryNode;
+  created_node_ids: string[];
+  created_edge_ids: string[];
+  summary?: Record<string, unknown>;
+};
+
+export type DeepSearchMemoryPromotionStage =
+  | "ephemeral_research"
+  | "candidate_memory"
+  | "llm_inferred_memory"
+  | "review_required"
+  | "blocked_contradicted";
+
+export type DeepSearchMemoryPromotionDecision = {
+  claim_cluster_id: string;
+  stage: DeepSearchMemoryPromotionStage;
+  verification_status: MemoryVerificationStatus;
+  confidence: number;
+  salience: number;
+  reason: string;
+  source_refs: string[];
+  metadata?: Record<string, unknown>;
+};
+
+export type DeepSearchPromotionReport = {
+  enabled: boolean;
+  promoted_claims: number;
+  candidate_claims: number;
+  review_required_claims: number;
+  blocked_claims: number;
+  decisions: DeepSearchMemoryPromotionDecision[];
+  warnings: string[];
+  metadata?: Record<string, unknown>;
+};
+
+export type DeepSearchReceipt = {
+  accepted: boolean;
+  reason: string;
+  run: DeepSearchRunSummary;
+  consolidated?: DeepSearchConsolidationSummary | null;
+  accepted_sources: DeepSearchAcceptedSource[];
+  rejected_sources: DeepSearchRejectedSource[];
+  extracted_claims: number;
+  extracted_findings: number;
+  warnings: string[];
+  passes?: Array<Record<string, unknown>>;
+  coverage?: Record<string, unknown>;
+  saturation?: Record<string, unknown>;
+  claim_graph?: DeepSearchClaimGraphReport | null;
+  promotion?: DeepSearchPromotionReport | null;
+  metadata?: Record<string, unknown>;
+};
+
+
 export type ResearchSource = {
   title: string;
   uri?: string | null;
@@ -470,6 +650,18 @@ export type MemoryAutopilotRequest = {
   run_skill_extraction?: boolean;
   run_candidate_discovery?: boolean;
   force_embeddings?: boolean;
+  run_legacy_canonical_cleanup?: boolean;
+  canonical_cleanup_scan_limit?: number;
+  canonical_cleanup_group_limit?: number;
+  canonical_cleanup_dry_run?: boolean;
+  run_knowledge_autopilot?: boolean;
+  knowledge_autopilot_topic_limit?: number;
+  knowledge_autopilot_run_limit?: number;
+  knowledge_autopilot_dry_run?: boolean;
+  auto_apply_safe_review_proposals?: boolean;
+  auto_apply_review_limit?: number;
+  duplicate_auto_apply_min_score?: number;
+  canonical_auto_apply_min_score?: number;
   reason?: string | null;
 };
 
@@ -486,6 +678,14 @@ export type MemoryAutopilotReceipt = {
   skill_candidates: number;
   duplicate_candidates: number;
   canonical_review_candidates: number;
+  auto_applied_duplicate_merges?: number;
+  auto_applied_canonical_reviews?: number;
+  auto_applied_deprecated_aliases?: number;
+  canonical_cleanup_groups?: number;
+  canonical_cleanup_created?: number;
+  canonical_cleanup_merged_aliases?: number;
+  canonical_cleanup_deprecated_aliases?: number;
+  canonical_cleanup_warnings?: string[];
   quality_score: number;
   quality_status: string;
   repair_plan?: MemoryHealthRepairPlan | null;

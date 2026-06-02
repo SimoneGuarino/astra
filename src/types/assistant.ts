@@ -7,16 +7,95 @@ export type AssistantStatus =
     | "speaking"
     | "settling";
 
+export type AssistantActivityStep = {
+    id: string;
+    stage: string;
+    title: string;
+    detail?: string | null;
+    timestamp_ms?: number | null;
+    metadata?: Record<string, unknown> | null;
+};
+
+export type AssistantActivityState = {
+    current?: AssistantActivityStep | null;
+    steps: AssistantActivityStep[];
+    expanded?: boolean;
+};
+
 export type ChatMessage = {
     id: string;
     role: "user" | "assistant";
     content: string;
+    activity?: AssistantActivityState | null;
+};
+
+export type AssistantDeepSearchOptions = {
+    enabled: boolean;
+    seed_urls?: string[];
+    enable_web_discovery?: boolean | null;
+    search_providers?: string[];
+    include_general_web?: boolean | null;
+    include_academic_sources?: boolean | null;
+    max_discovery_results_per_provider?: number | null;
+    max_discovered_sources?: number | null;
+    document_ingestion?: boolean | null;
+    prefer_academic_landing_pages?: boolean | null;
+    enable_pdf_text_extraction?: boolean | null;
+    autonomous_loop?: boolean | null;
+    max_research_passes?: number | null;
+    min_research_passes?: number | null;
+    max_sources_per_pass?: number | null;
+    min_new_information_gain?: number | null;
+    min_coverage_score?: number | null;
+    min_supported_claim_ratio?: number | null;
+    enable_claim_graph?: boolean | null;
+    min_independent_sources_for_claim?: number | null;
+    enable_contradiction_detection?: boolean | null;
+    enable_memory_promotion_policy?: boolean | null;
+    auto_promote_supported_claims?: boolean | null;
+    require_user_confirmation_for_system_verified?: boolean | null;
+    min_promotion_confidence?: number | null;
+    min_promotion_independent_sources?: number | null;
+    allowed_domains?: string[];
+    blocked_domains?: string[];
+    max_sources?: number | null;
+    enable_source_reliability_scoring?: boolean | null;
+    min_reliable_source_score_for_promotion?: number | null;
+    require_cross_source_verification?: boolean;
+};
+
+
+export type AssistantActivityEvent = {
+    request_id: string;
+    stage: string;
+    title: string;
+    detail?: string | null;
+    timestamp_ms?: number | null;
+    metadata?: Record<string, unknown> | null;
+};
+
+export type AssistantDeepSearchActivityEvent = {
+    request_id: string;
+    status: string;
+    accepted?: boolean;
+    sources_accepted?: number;
+    candidate_sources_discovered?: number;
+    sources_rejected?: number;
+    extracted_claims?: number;
+    extracted_findings?: number;
+    passes_executed?: number;
+    promoted_claims?: number;
+    coverage_score?: number;
+    saturation_score?: number;
+    error?: string;
+    warnings?: string[];
 };
 
 export type StartChatResponse = {
     request_id: string;
     model: string;
     audio_response_enabled: boolean;
+    deep_search_enabled: boolean;
 };
 
 export type AssistantRequestStartedEvent = {
@@ -25,6 +104,7 @@ export type AssistantRequestStartedEvent = {
     source: "typed" | "voice_session" | string;
     user_message: string | null;
     audio_response_enabled: boolean;
+    deep_search_enabled?: boolean;
 };
 
 export type AssistantRequestFinishedEvent = {

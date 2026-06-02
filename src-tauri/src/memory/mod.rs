@@ -1,6 +1,8 @@
+pub mod canonical_cleanup;
 pub mod commands;
 pub mod config;
 pub mod consolidation;
+pub mod deep_search;
 pub mod embeddings;
 pub mod errors;
 pub mod graph;
@@ -8,6 +10,8 @@ pub mod governance;
 pub mod ids;
 pub mod ingestion;
 pub mod jobs;
+pub mod knowledge_packs;
+pub mod learning;
 pub mod privacy;
 pub mod retrieval;
 pub mod skills;
@@ -16,5 +20,7 @@ pub mod types;
 pub mod verification;
 
 pub use config::MemoryConfig;
+pub use knowledge_packs::{KnowledgePackBuildReceipt, KnowledgePackBuildRequest};
+pub use learning::{DeepSearchKnowledgeAutopilotReceipt, DeepSearchKnowledgeAutopilotRequest, DeepSearchKnowledgeRefreshReceipt, DeepSearchKnowledgeRefreshRequest};
 pub use store::MemoryGraphStore;
 pub use types::*;

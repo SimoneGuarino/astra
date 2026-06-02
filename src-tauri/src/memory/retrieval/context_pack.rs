@@ -4,7 +4,7 @@ use crate::memory::{
     store::MemoryGraphStore,
     types::{
         MemoryActivation, MemoryActivationRequest, MemoryEdge, MemoryHybridQueryRequest,
-        MemoryNode,
+        MemoryNode, MemoryRelationKind,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -166,10 +166,15 @@ pub fn build_memory_context_packet(
         })
         .unwrap_or_default();
 
-    let mut nodes = response
+    let mut ranked = response
         .hits
         .into_iter()
-        .map(|hit| context_node_from_memory_node(hit.node, hit.score, hit.reasons))
+        .map(|hit| (hit.node.id.clone(), (hit.node, hit.score, hit.reasons)))
+        .collect::<HashMap<_, _>>();
+    let knowledge_pack_boost = append_knowledge_pack_retrieval_boost(store, query, &mut ranked, bounded_limit)?;
+    let mut nodes = ranked
+        .into_values()
+        .map(|(node, score, reasons)| context_node_from_memory_node(node, score, reasons))
         .collect::<Vec<_>>();
 
     // Give a small deterministic boost to nodes reached by graph propagation so
@@ -227,7 +232,9 @@ pub fn build_memory_context_packet(
             "embedding_status": response.embedding_status,
             "query_embedding_provider_kind": provider.provider_kind(),
             "query_embedding_model": provider.default_model(),
+            "self_context_memory_query": is_self_context_memory_query(query),
             "metadata_only": true,
+            "knowledge_pack_boost": knowledge_pack_boost,
         }),
     }))
 }
@@ -434,19 +441,56 @@ fn normalize_memory_probes(query: &str, probes: Vec<MemoryRetrievalProbe>) -> Ve
         weight: 1.0,
     });
 
+    // Schema-first self-context enrichment.
+    //
+    // This is intentionally NOT a hard-coded answer for questions such as
+    // "come mi chiamo?". It is a generic memory-retrieval bridge for messages
+    // that refer to the user/self profile. If the LLM retrieval planner is
+    // unavailable, Rust still asks the Memory Graph for durable profile facts,
+    // canonical semantic atoms, preferences, projects, roles and identity-like
+    // context. The final answer remains model-generated from retrieved memory.
+    if is_self_context_memory_query(query) {
+        push_memory_probe_if_new(
+            &mut output,
+            &mut seen,
+            MemoryRetrievalProbe {
+                query: "user profile durable facts identity preferences projects role name canonical memory".into(),
+                purpose: "schema_first_user_profile_memory_probe".into(),
+                weight: 1.18,
+            },
+        );
+        push_memory_probe_if_new(
+            &mut output,
+            &mut seen,
+            MemoryRetrievalProbe {
+                query: "canonical semantic fact subject user predicate object long term memory profile fact".into(),
+                purpose: "schema_first_canonical_fact_probe".into(),
+                weight: 1.10,
+            },
+        );
+    }
+
     for probe in probes {
-        let key = normalize_probe_key(&probe.query);
-        if key.is_empty() || seen.contains(&key) {
-            continue;
-        }
-        seen.insert(key);
-        output.push(probe);
-        if output.len() >= 5 {
+        push_memory_probe_if_new(&mut output, &mut seen, probe);
+        if output.len() >= 7 {
             break;
         }
     }
 
     output
+}
+
+fn push_memory_probe_if_new(
+    output: &mut Vec<MemoryRetrievalProbe>,
+    seen: &mut HashSet<String>,
+    probe: MemoryRetrievalProbe,
+) {
+    let key = normalize_probe_key(&probe.query);
+    if key.is_empty() || seen.contains(&key) {
+        return;
+    }
+    seen.insert(key);
+    output.push(probe);
 }
 
 fn normalize_probe_key(value: &str) -> String {
@@ -467,11 +511,12 @@ fn append_cognitive_working_memory_backfill(
     if !working_memory_backfill_enabled() {
         return Ok(());
     }
+    let self_context_query = is_self_context_memory_query(root_query);
     let snapshot_limit = std::env::var("ASTRA_MEMORY_WORKING_BACKFILL_SCAN_LIMIT")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| (4..=250).contains(value))
-        .unwrap_or(60);
+        .filter(|value| (4..=500).contains(value))
+        .unwrap_or(if self_context_query { 300 } else { 90 });
     let backfill_limit = std::env::var("ASTRA_MEMORY_WORKING_BACKFILL_LIMIT")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -501,11 +546,33 @@ fn append_cognitive_working_memory_backfill(
                 .filter(|token| search_text.contains(token.as_str()))
                 .count();
             score += (token_hits as f32) * 0.075;
-            if node.tags.iter().any(|tag| matches!(tag.as_str(), "user_profile" | "profile_fact" | "identity" | "name" | "long_term_memory")) {
-                score += 0.24;
+
+            let profile_signal = has_profile_memory_signal(&node, &search_text);
+            let canonical_signal = has_canonical_memory_signal(&node, &search_text);
+            if canonical_signal {
+                score += 0.28;
+            }
+            if profile_signal {
+                score += 0.34;
             }
             if matches!(node.kind.as_str(), "claim" | "user_preference" | "entity") {
                 score += 0.10;
+            }
+            if node
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("astra://memory/profile/") || source.starts_with("astra://memory/fact/"))
+            {
+                score += 0.16;
+            }
+            if self_context_query {
+                if profile_signal || canonical_signal {
+                    score += 0.55;
+                } else if node.kind == crate::memory::types::MemoryNodeKind::SourceDocument
+                    || node.tags.iter().any(|tag| matches!(tag.as_str(), "research" | "deep_search" | "research_source" | "web_evidence"))
+                {
+                    score *= 0.18;
+                }
             }
             if node.source.as_deref().unwrap_or_default().starts_with("conversation_turn:")
                 && search_text.contains("user message:")
@@ -557,6 +624,255 @@ fn normalized_recall_tokens(value: &str) -> Vec<String> {
         .filter(|token| !stop.contains(&token.as_str()))
         .take(16)
         .collect()
+}
+
+fn is_self_context_memory_query(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let tokens = normalized
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return false;
+    }
+
+    let has_self_reference = tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "io" | "me" | "mi" | "mio" | "mia" | "miei" | "mie" | "utente" | "user" | "my" | "me" | "myself" | "i"
+        )
+    });
+    let has_profile_context = tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "profilo" | "profile" | "identita" | "identità" | "identity" | "nome" | "name" | "preferenze" | "preferences" | "lavoro" | "role" | "ruolo"
+        )
+    });
+
+    has_self_reference || has_profile_context
+}
+
+fn has_profile_memory_signal(node: &MemoryNode, search_text: &str) -> bool {
+    node.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            "user_profile" | "profile_fact" | "identity" | "name" | "preference" | "user_preference" | "long_term_memory"
+        )
+    }) || node
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("astra://memory/profile/"))
+        || (search_text.contains("subject: user") && search_text.contains("predicate:"))
+}
+
+fn has_canonical_memory_signal(node: &MemoryNode, search_text: &str) -> bool {
+    node.tags.iter().any(|tag| matches!(tag.as_str(), "canonical_memory" | "semantic_fact"))
+        || node
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("astra://memory/fact/"))
+        || search_text.contains("canonical_source")
+        || search_text.contains("semantic memory atom distilled from conversation")
+}
+
+
+#[derive(Debug, Clone, Serialize)]
+struct KnowledgePackRetrievalBoostStats {
+    enabled: bool,
+    matched_packs: usize,
+    expanded_members: usize,
+    skipped_reason: Option<String>,
+}
+
+fn append_knowledge_pack_retrieval_boost(
+    store: &MemoryGraphStore,
+    root_query: &str,
+    ranked: &mut HashMap<String, (MemoryNode, f32, Vec<String>)>,
+    limit: usize,
+) -> MemoryResult<Option<KnowledgePackRetrievalBoostStats>> {
+    if !knowledge_pack_retrieval_boost_enabled() {
+        return Ok(Some(KnowledgePackRetrievalBoostStats {
+            enabled: false,
+            matched_packs: 0,
+            expanded_members: 0,
+            skipped_reason: Some("knowledge_pack_retrieval_boost_disabled".into()),
+        }));
+    }
+
+    let query_tokens = normalized_recall_tokens(root_query);
+    if query_tokens.is_empty() {
+        return Ok(Some(KnowledgePackRetrievalBoostStats {
+            enabled: true,
+            matched_packs: 0,
+            expanded_members: 0,
+            skipped_reason: Some("no_query_tokens".into()),
+        }));
+    }
+
+    let snapshot_limit = std::env::var("ASTRA_MEMORY_KNOWLEDGE_PACK_RETRIEVAL_SCAN_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (20..=500).contains(value))
+        .unwrap_or(220);
+    let snapshot = store.snapshot(snapshot_limit)?;
+    if snapshot.nodes.is_empty() {
+        return Ok(Some(KnowledgePackRetrievalBoostStats {
+            enabled: true,
+            matched_packs: 0,
+            expanded_members: 0,
+            skipped_reason: Some("empty_memory_snapshot".into()),
+        }));
+    }
+
+    let nodes_by_id = snapshot
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
+    let pack_member_edges = snapshot
+        .edges
+        .iter()
+        .filter(|edge| edge.relation == MemoryRelationKind::PartOf)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let min_pack_score = std::env::var("ASTRA_MEMORY_KNOWLEDGE_PACK_MIN_MATCH")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| (0.05..=1.2).contains(value))
+        .unwrap_or(0.18);
+    let max_packs = std::env::var("ASTRA_MEMORY_KNOWLEDGE_PACK_RETRIEVAL_PACK_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (1..=12).contains(value))
+        .unwrap_or_else(|| (limit / 3).clamp(1, 4));
+    let member_limit = std::env::var("ASTRA_MEMORY_KNOWLEDGE_PACK_MEMBER_EXPANSION_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| (1..=36).contains(value))
+        .unwrap_or_else(|| limit.clamp(4, 12));
+
+    let mut pack_matches = snapshot
+        .nodes
+        .iter()
+        .filter(|node| is_knowledge_pack_node(node))
+        .filter_map(|node| {
+            let score = score_knowledge_pack_match(node, &query_tokens);
+            if score < min_pack_score {
+                return None;
+            }
+            Some((node.clone(), score))
+        })
+        .collect::<Vec<_>>();
+    pack_matches.sort_by(|left, right| right.1.partial_cmp(&left.1).unwrap_or(std::cmp::Ordering::Equal));
+    pack_matches.truncate(max_packs);
+
+    if pack_matches.is_empty() {
+        return Ok(Some(KnowledgePackRetrievalBoostStats {
+            enabled: true,
+            matched_packs: 0,
+            expanded_members: 0,
+            skipped_reason: Some("no_matching_knowledge_pack".into()),
+        }));
+    }
+
+    let mut expanded_members = 0usize;
+    for (pack, pack_score) in &pack_matches {
+        let pack_entry = ranked.entry(pack.id.clone()).or_insert_with(|| (pack.clone(), 0.0, Vec::new()));
+        pack_entry.1 += (0.28 + *pack_score).min(0.85);
+        pack_entry.2.push("knowledge_pack_domain_anchor".into());
+        pack_entry.2.push(format!("knowledge_pack_match:{:.3}", pack_score));
+
+        let mut members = pack_member_edges
+            .iter()
+            .filter(|edge| edge.to_node_id == pack.id)
+            .filter_map(|edge| nodes_by_id.get(&edge.from_node_id).map(|node| (node.clone(), edge.clone())))
+            .collect::<Vec<_>>();
+        members.sort_by(|left, right| {
+            right.1.weight.partial_cmp(&left.1.weight).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (member, edge) in members.into_iter().take(member_limit.saturating_sub(expanded_members)) {
+            if is_knowledge_pack_node(&member) {
+                continue;
+            }
+            let member_entry = ranked.entry(member.id.clone()).or_insert_with(|| (member.clone(), 0.0, Vec::new()));
+            let expansion_score = (edge.weight.clamp(0.1, 1.0) * 0.18 + *pack_score * 0.16).min(0.48);
+            member_entry.1 += expansion_score;
+            member_entry.2.push("knowledge_pack_member_expansion".into());
+            member_entry.2.push(format!("knowledge_pack_anchor:{}", pack.source.clone().unwrap_or_else(|| pack.id.clone())));
+            expanded_members += 1;
+            if expanded_members >= member_limit {
+                break;
+            }
+        }
+        if expanded_members >= member_limit {
+            break;
+        }
+    }
+
+    Ok(Some(KnowledgePackRetrievalBoostStats {
+        enabled: true,
+        matched_packs: pack_matches.len(),
+        expanded_members,
+        skipped_reason: None,
+    }))
+}
+
+fn knowledge_pack_retrieval_boost_enabled() -> bool {
+    !matches!(
+        std::env::var("ASTRA_MEMORY_KNOWLEDGE_PACK_RETRIEVAL_BOOST")
+            .unwrap_or_else(|_| "true".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no" | "disabled"
+    )
+}
+
+fn is_knowledge_pack_node(node: &MemoryNode) -> bool {
+    node.source
+        .as_deref()
+        .map(|source| source.starts_with("astra://knowledge-pack/"))
+        .unwrap_or(false)
+        || node
+            .metadata
+            .get("source")
+            .and_then(|value| value.as_str())
+            .map(|value| value == "knowledge_pack_builder")
+            .unwrap_or(false)
+}
+
+fn score_knowledge_pack_match(node: &MemoryNode, query_tokens: &[String]) -> f32 {
+    let domain_slug = node
+        .metadata
+        .get("domain_slug")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let searchable = format!(
+        "{} {} {} {} {} {}",
+        node.title,
+        node.summary,
+        node.content.as_deref().unwrap_or(""),
+        node.tags.join(" "),
+        node.source.as_deref().unwrap_or(""),
+        domain_slug
+    )
+    .to_ascii_lowercase();
+    let mut score = 0.0f32;
+    for token in query_tokens {
+        if searchable.contains(token) {
+            score += 0.12;
+        }
+        if !domain_slug.is_empty() && domain_slug.contains(token) {
+            score += 0.18;
+        }
+    }
+    if query_tokens.iter().any(|token| node.tags.iter().any(|tag| tag.to_ascii_lowercase().contains(token))) {
+        score += 0.10;
+    }
+    score += node.confidence.clamp(0.0, 1.0) * 0.05;
+    score += node.salience.clamp(0.0, 1.0) * 0.05;
+    score.min(1.35)
 }
 
 fn build_memory_context_packet_from_probes(
@@ -619,6 +935,7 @@ fn build_memory_context_packet_from_probes(
     }
 
     append_cognitive_working_memory_backfill(store, root_query, &mut ranked, bounded_limit)?;
+    let knowledge_pack_boost = append_knowledge_pack_retrieval_boost(store, root_query, &mut ranked, bounded_limit)?;
 
     if ranked.is_empty() {
         return Ok(None);
@@ -694,7 +1011,9 @@ fn build_memory_context_packet_from_probes(
             "query_embedding_model": provider.default_model(),
             "llm_probe_count": probes.len(),
             "llm_first_retrieval": true,
+            "self_context_memory_query": is_self_context_memory_query(root_query),
             "metadata_only": true,
+            "knowledge_pack_boost": knowledge_pack_boost,
         }),
     }))
 }

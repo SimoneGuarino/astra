@@ -9,6 +9,8 @@ import {
 import { useVoiceInput } from "./useVoiceInput";
 import { useVoiceSession } from "./useVoiceSession";
 import type {
+    AssistantActivityEvent,
+    AssistantDeepSearchActivityEvent,
     AssistantErrorEvent,
     AssistantInterruptedEvent,
     AssistantOrchestratorDiagnostic,
@@ -17,6 +19,7 @@ import type {
     AssistantRequestStartedEvent,
     AssistantRouterDiagnostic,
     AssistantStatus,
+    AssistantDeepSearchOptions,
     AssistantToolSynthesisDiagnostic,
     ChatMessage,
     RequestMetricsSnapshot,
@@ -40,6 +43,8 @@ const INITIAL_MESSAGES: ChatMessage[] = [
 const EMPTY_RESPONSE_FALLBACK =
     "Non ho ricevuto una risposta testuale dal modello. Riprova o cambia modello.";
 
+const DEEP_SEARCH_STORAGE_KEY = "astra.assistant.deepSearch.enabled";
+
 export function useAssistantSession() {
     const [messages, setMessages] = useState<ChatMessage[]>(INITIAL_MESSAGES);
     const [inputValue, setInputValue] = useState("");
@@ -47,6 +52,13 @@ export function useAssistantSession() {
     const [activeModel, setActiveModel] = useState("unknown");
     const [isLoading, setIsLoading] = useState(false);
     const [autoSubmitVoice, setAutoSubmitVoice] = useState(true); // default to false to prevent unexpected behavior, can be toggled by user
+    const [deepSearchEnabled, setDeepSearchEnabledState] = useState(() => {
+        try {
+            return window.localStorage.getItem(DEEP_SEARCH_STORAGE_KEY) === "true";
+        } catch {
+            return false;
+        }
+    });
     const [lastMetrics, setLastMetrics] = useState<RequestMetricsSnapshot | null>(null);
     const [lastVoiceMetrics, setLastVoiceMetrics] = useState<VoiceTurnMetricsSnapshot | null>(null);
     const [lastVoiceTranscript, setLastVoiceTranscript] =
@@ -66,6 +78,15 @@ export function useAssistantSession() {
     const isStreamingRef = useRef(false);
     const isAudioSpeakingRef = useRef(false);
     const voiceRestStatusRef = useRef<AssistantStatus | null>(null);
+
+    const setDeepSearchEnabled = useCallback((enabled: boolean) => {
+        setDeepSearchEnabledState(enabled);
+        try {
+            window.localStorage.setItem(DEEP_SEARCH_STORAGE_KEY, String(enabled));
+        } catch (error) {
+            console.debug("Unable to persist Astra Deep Search toggle:", error);
+        }
+    }, []);
 
     const completeAudioSession = useCallback(async (requestId: string) => {
         if (completedAudioSessionsRef.current.has(requestId)) return;
@@ -233,12 +254,43 @@ export function useAssistantSession() {
     const submitMessage = useCallback(
         async (
             messageOverride?: string,
-            options: { inputModality?: "typed" | "voice"; audioResponse?: "auto" | "enabled" | "disabled" } = {}
+            options: { inputModality?: "typed" | "voice"; audioResponse?: "auto" | "enabled" | "disabled"; deepSearch?: boolean } = {}
         ) => {
             const trimmed = (messageOverride ?? inputValue).trim();
             if (!trimmed) return;
             const inputModality = options.inputModality ?? "typed";
             const audioResponse = options.audioResponse ?? "auto";
+            const deepSearchForTurn = options.deepSearch ?? deepSearchEnabled;
+            const deepSearchPayload: AssistantDeepSearchOptions = {
+                enabled: deepSearchForTurn,
+                enable_web_discovery: true,
+                include_general_web: true,
+                include_academic_sources: true,
+                document_ingestion: true,
+                prefer_academic_landing_pages: false,
+                enable_pdf_text_extraction: true,
+                autonomous_loop: true,
+                max_research_passes: 3,
+                min_research_passes: 2,
+                max_sources_per_pass: 4,
+                min_new_information_gain: 0.12,
+                min_coverage_score: 0.58,
+                min_supported_claim_ratio: 0.5,
+                enable_claim_graph: true,
+                min_independent_sources_for_claim: 2,
+                enable_contradiction_detection: true,
+                enable_memory_promotion_policy: true,
+                auto_promote_supported_claims: true,
+                require_user_confirmation_for_system_verified: true,
+                min_promotion_confidence: 0.62,
+                min_promotion_independent_sources: 2,
+                enable_source_reliability_scoring: true,
+                min_reliable_source_score_for_promotion: 0.5,
+                max_sources: 8,
+                max_discovery_results_per_provider: 6,
+                max_discovered_sources: 96,
+                require_cross_source_verification: true,
+            };
 
             stopAllAudio();
             startedAudioSessionRequestIdsRef.current.clear();
@@ -252,14 +304,30 @@ export function useAssistantSession() {
                 content: trimmed,
             };
             const assistantMessageId = crypto.randomUUID();
+            const clientRequestId = crypto.randomUUID();
             const assistantPlaceholder: ChatMessage = {
                 id: assistantMessageId,
                 role: "assistant",
                 content: "",
+                activity: {
+                    current: {
+                        id: `${clientRequestId}:queued`,
+                        stage: deepSearchForTurn ? "deep_search_queued" : "queued",
+                        title: deepSearchForTurn ? "Preparing Deep Search" : "Preparing response",
+                        detail: deepSearchForTurn
+                            ? "Astra is preparing governed web and memory research."
+                            : "Astra is preparing the response pipeline.",
+                        timestamp_ms: Date.now(),
+                        metadata: { local: true },
+                    },
+                    steps: [],
+                },
             };
 
             activeAssistantMessageId.current = assistantMessageId;
             pendingAssistantMessageIdRef.current = assistantMessageId;
+            activeRequestIdRef.current = clientRequestId;
+            bindRequestToAssistantMessage(clientRequestId, assistantMessageId);
 
             setMessages((prev) => [...prev, userMessage, assistantPlaceholder]);
             setInputValue("");
@@ -269,9 +337,11 @@ export function useAssistantSession() {
             try {
                 const started = await invoke<StartChatResponse>("start_chat_message_stream", {
                     payload: {
+                        client_request_id: clientRequestId,
                         message: trimmed,
                         input_modality: inputModality,
                         audio_response: audioResponse,
+                        deep_search: deepSearchPayload,
                     },
                 });
 
@@ -309,7 +379,7 @@ export function useAssistantSession() {
                 settleVisualStatus();
             }
         },
-        [bindRequestToAssistantMessage, inputValue, settleVisualStatus, startAudioSessionOnce, stopAllAudio]
+        [bindRequestToAssistantMessage, deepSearchEnabled, inputValue, settleVisualStatus, startAudioSessionOnce, stopAllAudio]
     );
 
     const handleTranscript = useCallback(
@@ -559,6 +629,72 @@ export function useAssistantSession() {
         setLastVoiceTranscript(event);
     }, []);
 
+    const appendAssistantActivity = useCallback((requestId: string, step: Omit<NonNullable<ChatMessage["activity"]>["steps"][number], "id">) => {
+        const assistantId =
+            assistantMessageByRequestRef.current.get(requestId) ??
+            (activeRequestIdRef.current === requestId ? activeAssistantMessageId.current : null);
+        if (!assistantId) return;
+
+        const normalizedStep = {
+            id: `${requestId}:${step.stage}:${step.timestamp_ms ?? Date.now()}:${Math.random().toString(36).slice(2, 7)}`,
+            ...step,
+        };
+
+        setMessages((prev) =>
+            prev.map((msg) => {
+                if (msg.id !== assistantId) return msg;
+                const previousSteps = msg.activity?.steps ?? [];
+                const steps = [...previousSteps, normalizedStep].slice(-24);
+                return {
+                    ...msg,
+                    activity: {
+                        current: normalizedStep,
+                        steps,
+                        expanded: msg.activity?.expanded ?? false,
+                    },
+                };
+            })
+        );
+    }, []);
+
+    const handleAssistantActivity = useCallback(
+        (event: AssistantActivityEvent) => {
+            appendAssistantActivity(event.request_id, {
+                stage: event.stage,
+                title: event.title,
+                detail: event.detail,
+                timestamp_ms: event.timestamp_ms ?? Date.now(),
+                metadata: event.metadata ?? null,
+            });
+        },
+        [appendAssistantActivity]
+    );
+
+    const handleDeepSearchActivity = useCallback(
+        (event: AssistantDeepSearchActivityEvent) => {
+            const detailParts = [
+                typeof event.sources_accepted === "number" ? `${event.sources_accepted} sources accepted` : null,
+                typeof event.candidate_sources_discovered === "number" ? `${event.candidate_sources_discovered} candidates` : null,
+                typeof event.extracted_claims === "number" ? `${event.extracted_claims} claims` : null,
+                typeof event.promoted_claims === "number" ? `${event.promoted_claims} promoted` : null,
+                event.error ? `error: ${event.error}` : null,
+            ].filter(Boolean);
+            appendAssistantActivity(event.request_id, {
+                stage: `deep_search_${event.status}`,
+                title:
+                    event.status === "started"
+                        ? "Deep Search is exploring sources"
+                        : event.status === "failed"
+                          ? "Deep Search failed"
+                          : "Deep Search updated",
+                detail: detailParts.length ? detailParts.join(" · ") : "Astra updated the governed Deep Search pipeline.",
+                timestamp_ms: Date.now(),
+                metadata: event as unknown as Record<string, unknown>,
+            });
+        },
+        [appendAssistantActivity]
+    );
+
     const handleRouteDiagnostic = useCallback((event: ConversationRouteDiagnostic) => {
         console.info("Astra route diagnostic:", event);
     }, []);
@@ -614,6 +750,8 @@ export function useAssistantSession() {
         onRequestFinished: handleRequestFinished,
         onRequestSettled: handleRequestSettled,
         onAssistantError: handleAssistantError,
+        onAssistantActivity: handleAssistantActivity,
+        onDeepSearchActivity: handleDeepSearchActivity,
         onStatus: handleStatus,
         onModel: setActiveModel,
         onMetrics: setLastMetrics,
@@ -630,6 +768,7 @@ export function useAssistantSession() {
     return {
         activeModel,
         autoSubmitVoice,
+        deepSearchEnabled,
         inputValue,
         isLoading,
         lastMetrics,
@@ -637,6 +776,7 @@ export function useAssistantSession() {
         lastVoiceTranscript,
         messages,
         setAutoSubmitVoice,
+        setDeepSearchEnabled,
         setInputValue,
         status,
         stopAllAudio,

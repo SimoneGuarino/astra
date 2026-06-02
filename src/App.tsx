@@ -306,9 +306,11 @@ function App() {
                                 autoSubmitVoice={session.autoSubmitVoice}
                                 inputValue={session.inputValue}
                                 isLoading={session.isLoading}
+                                deepSearchEnabled={session.deepSearchEnabled}
                                 lastVoiceTranscript={session.lastVoiceTranscript}
                                 onSubmit={() => session.submitMessage()}
                                 setAutoSubmitVoice={session.setAutoSubmitVoice}
+                                setDeepSearchEnabled={session.setDeepSearchEnabled}
                                 setInputValue={session.setInputValue}
                                 voiceInput={session.voiceInput}
                                 voiceSession={session.voiceSession}

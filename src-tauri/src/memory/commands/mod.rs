@@ -4,11 +4,15 @@ use crate::memory::{
         ResearchMemoryConsolidationReceipt,
         MemoryReconsolidationCandidate, MemoryReconsolidationRequest, MemoryReconsolidationReceipt,
     },
+    deep_search::{run_deep_search_foundation, DeepSearchReceipt, DeepSearchRequest},
+    knowledge_packs::{build_local_knowledge_packs, KnowledgePackBuildReceipt, KnowledgePackBuildRequest},
+    learning::{run_deep_search_knowledge_autopilot, run_deep_search_knowledge_refresh, DeepSearchKnowledgeAutopilotReceipt, DeepSearchKnowledgeAutopilotRequest, DeepSearchKnowledgeRefreshReceipt, DeepSearchKnowledgeRefreshRequest},
     embeddings::{build_embedding_provider, EmbeddingProvider, EmbeddingRequest, StableHashEmbeddingProvider},
     store::MemoryGraphStore,
+    canonical_cleanup::run_legacy_canonical_memory_cleanup,
     types::{
         now_ms, CreateMemoryEdgeRequest, CreateMemoryNodeRequest, MemoryActivation,
-        MemoryActivationRequest, MemoryCanonicalReviewCandidate, MemoryCanonicalReviewRequest, MemoryCanonicalReviewApplyRequest, MemoryDuplicateCandidate, MemoryDuplicateCandidateRequest, MemoryEdge, MemoryEmbeddingIndexStatus,
+        MemoryActivationRequest, MemoryCanonicalReviewCandidate, MemoryCanonicalReviewRequest, MemoryCanonicalReviewApplyRequest, MemoryDuplicateCandidate, MemoryDuplicateCandidateRequest, LegacyCanonicalMemoryCleanupReceipt, LegacyCanonicalMemoryCleanupRequest, MemoryEdge, MemoryEmbeddingIndexStatus,
         MemoryEmbeddingMaintenanceReceipt, MemoryEmbeddingMaintenanceRequest,
         MemoryEmbeddingRebuildReceipt, MemoryEmbeddingRebuildRequest, MemoryEmbeddingRecord,
         MemoryGovernancePolicySnapshot, MemoryGraphSnapshot, MemoryHybridQueryRequest, MemoryMergeNodesReceipt, MemoryMergeNodesRequest,
@@ -21,6 +25,14 @@ use sha2::{Digest, Sha256};
 
 pub fn status(store: &MemoryGraphStore) -> Value {
     store.status()
+}
+
+
+pub fn run_legacy_canonical_cleanup(
+    store: &MemoryGraphStore,
+    request: LegacyCanonicalMemoryCleanupRequest,
+) -> Result<LegacyCanonicalMemoryCleanupReceipt, String> {
+    run_legacy_canonical_memory_cleanup(store, request).map_err(|error| error.to_string())
 }
 
 
@@ -322,7 +334,7 @@ pub fn run_embedding_maintenance(
             failed_chunks: 0,
             pending_before: status.pending_chunks,
             pending_after: status.pending_chunks,
-            model: status.provider,
+            model: status.model,
             dimensions: status.dimensions,
             sample_node_ids: Vec::new(),
             metadata: json!({
@@ -343,7 +355,7 @@ pub fn run_embedding_maintenance(
             failed_chunks: 0,
             pending_before: 0,
             pending_after: 0,
-            model: before.provider,
+            model: before.model,
             dimensions: before.dimensions,
             sample_node_ids: Vec::new(),
             metadata: json!({
@@ -421,6 +433,40 @@ pub fn update_skill_candidate(
     request: MemorySkillCandidateUpdateRequest,
 ) -> Result<MemorySkillCandidateUpdateReceipt, String> {
     crate::memory::skills::update_skill_candidate(store, request).map_err(|error| error.to_string())
+}
+
+
+
+pub fn run_deep_search(
+    store: &MemoryGraphStore,
+    request: DeepSearchRequest,
+) -> Result<DeepSearchReceipt, String> {
+    run_deep_search_foundation(store, request).map_err(|error| error.to_string())
+}
+
+
+
+pub fn run_knowledge_autopilot(
+    store: &MemoryGraphStore,
+    request: DeepSearchKnowledgeAutopilotRequest,
+) -> Result<DeepSearchKnowledgeAutopilotReceipt, String> {
+    run_deep_search_knowledge_autopilot(store, request).map_err(|error| error.to_string())
+}
+
+
+pub fn run_knowledge_refresh(
+    store: &MemoryGraphStore,
+    request: DeepSearchKnowledgeRefreshRequest,
+) -> Result<DeepSearchKnowledgeRefreshReceipt, String> {
+    run_deep_search_knowledge_refresh(store, request).map_err(|error| error.to_string())
+}
+
+
+pub fn build_knowledge_packs(
+    store: &MemoryGraphStore,
+    request: KnowledgePackBuildRequest,
+) -> Result<KnowledgePackBuildReceipt, String> {
+    build_local_knowledge_packs(store, request).map_err(|error| error.to_string())
 }
 
 pub fn consolidate_research_bundle(

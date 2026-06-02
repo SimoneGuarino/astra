@@ -109,9 +109,9 @@ export function stepBrainForceLayout(
       const distanceSquared = Math.max(64, dx * dx + dy * dy);
       const distance = Math.sqrt(distanceSquared);
       const sameCluster = p.cluster === other.cluster;
-      const range = sameCluster ? 240 : 150;
+      const range = sameCluster ? 320 : 210;
       if (distance > range) continue;
-      const strength = ((sameCluster ? 34 : 12) * settings.repulsion) / Math.max(1, Math.sqrt(nodeCount));
+      const strength = ((sameCluster ? 78 : 26) * settings.repulsion) / Math.max(1, Math.pow(nodeCount, 0.36));
       const force = strength / distanceSquared;
       fx += dx * force;
       fy += dy * force;
@@ -123,8 +123,8 @@ export function stepBrainForceLayout(
       const dx = other.x - p.x;
       const dy = other.y - p.y;
       const distance = Math.max(1, Math.sqrt(dx * dx + dy * dy));
-      const target = (draggedNodeId === link.id ? 128 : 72 + Math.max(0, 1 - link.weight) * 52) * settings.linkDistance;
-      const force = (distance - target) * (0.0065 + link.weight * 0.006);
+      const target = (draggedNodeId === link.id ? 180 : 118 + Math.max(0, 1 - link.weight) * 68) * settings.linkDistance;
+      const force = (distance - target) * (0.0048 + link.weight * 0.0045);
       fx += (dx / distance) * force;
       fy += (dy / distance) * force;
     }
@@ -217,46 +217,65 @@ export function computeLocalGraphNodeIds(rootIds: string[], edges: MemoryEdge[],
 }
 
 export function buildGraphClusters(nodes: MemoryNode[], edges: MemoryEdge[]): GraphCluster[] {
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  const adjacency = new Map<string, string[]>();
-  for (const node of nodes) adjacency.set(node.id, []);
-  for (const edge of edges) {
-    if (!nodeIds.has(edge.from_node_id) || !nodeIds.has(edge.to_node_id)) continue;
-    adjacency.get(edge.from_node_id)?.push(edge.to_node_id);
-    adjacency.get(edge.to_node_id)?.push(edge.from_node_id);
-  }
-
-  const seen = new Set<string>();
-  const components: string[][] = [];
+  const semanticGroups = new Map<string, MemoryNode[]>();
   for (const node of nodes) {
-    if (seen.has(node.id)) continue;
-    const stack = [node.id];
-    const component: string[] = [];
-    seen.add(node.id);
-    while (stack.length) {
-      const current = stack.pop()!;
-      component.push(current);
-      for (const next of adjacency.get(current) ?? []) {
-        if (seen.has(next)) continue;
-        seen.add(next);
-        stack.push(next);
-      }
-    }
-    components.push(component);
+    const key = memoryNodeSemanticClusterKey(node);
+    semanticGroups.set(key, [...(semanticGroups.get(key) ?? []), node]);
   }
 
-  components.sort((left, right) => right.length - left.length);
-  return components.map((nodeIds, index) => {
-    if (index === 0) return { id: index, nodeIds, x: GRAPH_CENTER_X, y: GRAPH_CENTER_Y };
-    const angle = index * 2.399963229728653;
-    const radius = Math.min(260, 105 + Math.sqrt(index) * 72);
-    return {
-      id: index,
-      nodeIds,
+  const groups = [...semanticGroups.entries()]
+    .map(([key, groupNodes]) => ({ key, nodes: groupNodes, weight: groupNodes.reduce((sum, node) => sum + memoryNodeVisualWeight(node), 0) }))
+    .sort((left, right) => right.weight - left.weight || right.nodes.length - left.nodes.length || left.key.localeCompare(right.key));
+
+  if (groups.length === 0) return [];
+
+  const anchors = semanticClusterAnchors(groups.length);
+  return groups.map((group, index) => ({
+    id: index,
+    nodeIds: group.nodes.map((node) => node.id),
+    x: anchors[index]?.x ?? GRAPH_CENTER_X,
+    y: anchors[index]?.y ?? GRAPH_CENTER_Y,
+  }));
+}
+
+function memoryNodeSemanticClusterKey(node: MemoryNode): string {
+  const tags = node.tags.map((tag) => tag.toLowerCase());
+  const source = (node.source ?? "").toLowerCase();
+  const title = `${node.title} ${node.summary}`.toLowerCase();
+  if (tags.some((tag) => ["user_profile", "profile_fact", "identity", "canonical_memory", "schema_first_memory"].includes(tag)) || source.includes("/profile/")) return "identity_profile";
+  if (tags.some((tag) => tag.includes("knowledge_pack") || tag.includes("domain_brain")) || source.includes("knowledge-pack")) return "domain_brain";
+  if (node.kind === "source_document" || source.startsWith("http") || tags.includes("source") || tags.includes("document")) return "sources_documents";
+  if (node.kind === "research_topic" || node.kind === "research_finding" || tags.includes("deep_search") || tags.includes("research")) return "research";
+  if (node.kind === "claim" || title.includes("claim graph") || tags.includes("claim")) return "claims";
+  if (node.kind === "procedure" || node.kind === "workflow" || tags.includes("procedural_memory") || tags.includes("workflow")) return "procedural";
+  if (node.kind === "tool_use" || node.kind === "fix" || node.kind === "error" || tags.includes("tool") || tags.includes("runtime")) return "runtime_tools";
+  if (node.kind === "conversation_turn" || node.kind === "transcript_segment" || tags.includes("conversation") || tags.includes("episode")) return "episodes";
+  if (node.kind === "concept" || node.kind === "entity" || node.kind === "summary") return "concepts_summaries";
+  if (node.kind === "user_preference" || tags.includes("preference")) return "preferences";
+  return `kind_${node.kind}`;
+}
+
+function semanticClusterAnchors(count: number): { x: number; y: number }[] {
+  const anchors = [
+    { x: GRAPH_CENTER_X - 360, y: GRAPH_CENTER_Y - 210 },
+    { x: GRAPH_CENTER_X + 360, y: GRAPH_CENTER_Y - 210 },
+    { x: GRAPH_CENTER_X - 390, y: GRAPH_CENTER_Y + 210 },
+    { x: GRAPH_CENTER_X + 390, y: GRAPH_CENTER_Y + 210 },
+    { x: GRAPH_CENTER_X, y: GRAPH_CENTER_Y - 340 },
+    { x: GRAPH_CENTER_X, y: GRAPH_CENTER_Y + 340 },
+    { x: GRAPH_CENTER_X - 560, y: GRAPH_CENTER_Y },
+    { x: GRAPH_CENTER_X + 560, y: GRAPH_CENTER_Y },
+    { x: GRAPH_CENTER_X, y: GRAPH_CENTER_Y },
+  ];
+  for (let index = anchors.length; index < count; index += 1) {
+    const angle = (index - anchors.length) * 2.399963229728653;
+    const radius = 620 + Math.floor((index - anchors.length) / 8) * 190;
+    anchors.push({
       x: GRAPH_CENTER_X + Math.cos(angle) * radius,
       y: GRAPH_CENTER_Y + Math.sin(angle) * radius * 0.72,
-    };
-  });
+    });
+  }
+  return anchors;
 }
 
 export function seededPosition(
@@ -267,11 +286,15 @@ export function seededPosition(
   index = hashString(id) % Math.max(1, count),
   cluster = 0,
 ): GraphPosition {
-  const angle = ((index / Math.max(1, count)) * Math.PI * 2) + ((hashString(id) % 97) / 97) * 0.75;
-  const radius = 24 + Math.sqrt(Math.max(1, count)) * 10 + ((hashString(`${id}:r`) % 100) / 100) * 54;
+  const safeCount = Math.max(1, count);
+  const ring = Math.floor(Math.sqrt(index));
+  const slot = Math.max(1, ring * 8);
+  const angle = (((index % slot) / slot) * Math.PI * 2) + ((hashString(id) % 113) / 113) * 0.38;
+  const baseRadius = safeCount > 120 ? 110 : safeCount > 64 ? 82 : 54;
+  const radius = baseRadius + ring * 30 + ((hashString(`${id}:r`) % 100) / 100) * 28;
   return {
     x: clusterX + Math.cos(angle) * radius,
-    y: clusterY + Math.sin(angle) * radius * 0.82,
+    y: clusterY + Math.sin(angle) * radius * 0.78,
     vx: 0,
     vy: 0,
     cluster,
@@ -358,8 +381,8 @@ export function projectGraphPointToScreen(x: number, y: number, surface: GraphSu
 }
 
 export function graphLabelWidth(label: string, prominent: boolean): number {
-  const charWidth = prominent ? 9.8 : 8.7;
-  return clampNumber(label.length * charWidth + 24, prominent ? 92 : 72, prominent ? 460 : 340);
+  const charWidth = prominent ? 7.2 : 6.4;
+  return clampNumber(label.length * charWidth + 18, prominent ? 72 : 56, prominent ? 260 : 190);
 }
 
 export function truncate(value: string, max: number): string {
